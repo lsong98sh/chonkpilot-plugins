@@ -9,8 +9,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/chonkpilot/chonkpilot-lib/mq"
-	"github.com/chonkpilot/chonkpilot-plugin"
+	mq "github.com/lsong98sh/chonkpilot-plugin-framework/runtime/bus"
+	plugin "github.com/lsong98sh/chonkpilot-plugin-framework/runtime/hook"
 )
 
 // reply 模拟 persist 的应答：向请求同主题 Emit {req_id, ok, result}。

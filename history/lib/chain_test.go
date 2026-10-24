@@ -18,8 +18,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/chonkpilot/chonkpilot-lib/mq"
-	"github.com/chonkpilot/chonkpilot-plugin"
+	mq "github.com/lsong98sh/chonkpilot-plugin-framework/runtime/bus"
+	plugin "github.com/lsong98sh/chonkpilot-plugin-framework/runtime/hook"
 )
 
 // ─── 基础工具 ───────────────────────────────────────────────

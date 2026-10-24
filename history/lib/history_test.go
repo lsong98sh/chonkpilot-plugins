@@ -14,8 +14,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/chonkpilot/chonkpilot-lib/mq"
-	"github.com/chonkpilot/chonkpilot-plugin"
+	mq "github.com/lsong98sh/chonkpilot-plugin-framework/runtime/bus"
+	plugin "github.com/lsong98sh/chonkpilot-plugin-framework/runtime/hook"
 )
 
 // TestGateFromValue 值 → 开关判定：**仅 "true" 为真**（缺失/""/false/大小写/数字 一律假）。

@@ -44,10 +44,10 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/chonkpilot/chonkpilot-lib/mq"
-	"github.com/chonkpilot/chonkpilot-plugin"
-	"github.com/chonkpilot/chonkpilot-plugin/dataclient"
-	"github.com/chonkpilot/chonkpilot-plugin/instance"
+	mq "github.com/lsong98sh/chonkpilot-plugin-framework/runtime/bus"
+	"github.com/lsong98sh/chonkpilot-plugin-framework/runtime/dataclient"
+	plugin "github.com/lsong98sh/chonkpilot-plugin-framework/runtime/hook"
+	"github.com/lsong98sh/chonkpilot-plugin-framework/runtime/instance"
 )
 
 // 订阅主题（相对主题；chonk. 前缀在 mq 初始化 Options.Prefix 注入一次，业务层不出现 chonk. 字面）。

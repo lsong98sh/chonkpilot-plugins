@@ -12,8 +12,8 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/chonkpilot/chonkpilot-lib/mq"
-	"github.com/chonkpilot/chonkpilot-plugin"
+	mq "github.com/lsong98sh/chonkpilot-plugin-framework/runtime/bus"
+	plugin "github.com/lsong98sh/chonkpilot-plugin-framework/runtime/hook"
 )
 
 // llmSystemByCategory 在 llm-simple 请求里按 prompt 的「【类别】X」行取该类的 system 提示词。

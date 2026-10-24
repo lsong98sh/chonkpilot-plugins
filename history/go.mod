@@ -3,8 +3,6 @@ module github.com/chonkpilot/chonkpilot-history-plugin
 go 1.26.0
 
 require (
-	github.com/chonkpilot/chonkpilot-lib v0.0.0
-	github.com/chonkpilot/chonkpilot-plugin v0.0.0
 	github.com/chonkpilot/chonkpilot-plugin-history v0.0.0
 	github.com/lsong98sh/chonkpilot-plugin-framework v0.0.0
 )
@@ -22,9 +20,5 @@ require (
 )
 
 replace github.com/lsong98sh/chonkpilot-plugin-framework => ../../chonkpilot-plugin-framework
-
-replace github.com/chonkpilot/chonkpilot-lib => ../../chonkpilot/src/lib/core
-
-replace github.com/chonkpilot/chonkpilot-plugin => ../../chonkpilot/src/plugins/plugin
 
 replace github.com/chonkpilot/chonkpilot-plugin-history => ./lib

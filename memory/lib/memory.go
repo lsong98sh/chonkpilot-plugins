@@ -54,17 +54,17 @@ import (
 	"sync"
 	"time"
 
-	"github.com/chonkpilot/chonkpilot-data"
-	"github.com/chonkpilot/chonkpilot-lib/mq"
-	"github.com/chonkpilot/chonkpilot-lib/msgkeys"
-	"github.com/chonkpilot/chonkpilot-plugin"
-	"github.com/chonkpilot/chonkpilot-plugin/instance"
+	mq "github.com/lsong98sh/chonkpilot-plugin-framework/runtime/bus"
+	data "github.com/lsong98sh/chonkpilot-plugin-framework/runtime/datafmt"
+	plugin "github.com/lsong98sh/chonkpilot-plugin-framework/runtime/hook"
+	"github.com/lsong98sh/chonkpilot-plugin-framework/runtime/instance"
+	"github.com/lsong98sh/chonkpilot-plugin-framework/runtime/topics"
 )
 
 // 订阅/请求主题（相对主题；chonk. 前缀在 mq 初始化注入一次）。
 const (
 	// turnEndSubject 每轮终态事件（server.finish 终态落库后发；与压缩无关，不新增消息面）。
-	turnEndSubject = msgkeys.TopicSessionComplete
+	turnEndSubject = topics.TopicSessionComplete
 	// flushSubject 手动触发一次沉淀（点分相对主题；桥/服务端「点分直通总线」分支受理 →
 	// 不属 data-* 数据面，故由本插件订阅应答）。payload `{instance_id, session}`
 	// （instance_id 由前端 mq / 桥统一注入）；作用域 = 当前 instance 的**指定会话**，
@@ -357,7 +357,7 @@ func (p *Plugin) emitMemoryNotice(instanceID, session, lastTurn, notice, message
 	if p.deps.Bus == nil || instanceID == "" {
 		return
 	}
-	p.deps.Bus.Emit(context.Background(), msgkeys.TopicToolNotify, map[string]any{
+	p.deps.Bus.Emit(context.Background(), topics.TopicToolNotify, map[string]any{
 		"instance_id": instanceID,
 		"session_id":  session,
 		"turn_id":     lastTurn,

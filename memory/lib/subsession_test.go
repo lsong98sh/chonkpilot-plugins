@@ -11,8 +11,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/chonkpilot/chonkpilot-lib/mq"
-	"github.com/chonkpilot/chonkpilot-plugin"
+	mq "github.com/lsong98sh/chonkpilot-plugin-framework/runtime/bus"
+	plugin "github.com/lsong98sh/chonkpilot-plugin-framework/runtime/hook"
 )
 
 // stubSubsessionDistill 桩齐沉淀回路最小应答集（parentID 决定主/子会话），返回保存计数。

@@ -21,8 +21,8 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/chonkpilot/chonkpilot-lib/winproc"
-	"github.com/chonkpilot/chonkpilot-plugin/dataclient"
+	"github.com/lsong98sh/chonkpilot-plugin-framework/protocol"
+	"github.com/lsong98sh/chonkpilot-plugin-framework/runtime/dataclient"
 )
 
 // chainRec 链上一个检查点的原始信息（重建保留段时复用 tree/message/时间）。
@@ -107,7 +107,7 @@ func (h *History) gitRun(ws *workState, extra []string, args ...string) (string,
 	cmd.Env = append(os.Environ(), gitBaseEnv(ws.index)...)
 	cmd.Env = append(cmd.Env, extra...)
 	// 宿主为 windowsgui 无控制台：隐藏 git.exe 的控制台窗口。
-	cmd.SysProcAttr = winproc.SysProcAttr()
+	cmd.SysProcAttr = protocol.SysProcAttr()
 	out, err := cmd.CombinedOutput()
 	s := string(out)
 	if err != nil {
@@ -151,7 +151,7 @@ func (h *History) gitRaw(ws *workState, maxBytes int, args ...string) ([]byte, b
 	all := append([]string{"-C", ws.workDir}, args...)
 	cmd := exec.CommandContext(ctx, "git", all...)
 	cmd.Env = append(os.Environ(), gitBaseEnv(ws.index)...)
-	cmd.SysProcAttr = winproc.SysProcAttr()
+	cmd.SysProcAttr = protocol.SysProcAttr()
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	out := &cappedBuffer{limit: maxBytes}

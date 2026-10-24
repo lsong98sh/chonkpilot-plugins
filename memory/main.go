@@ -28,10 +28,10 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/chonkpilot/chonkpilot-lib/mq"
-	"github.com/chonkpilot/chonkpilot-plugin"
-	"github.com/chonkpilot/chonkpilot-plugin/bridgebus"
 	memory "github.com/chonkpilot/chonkpilot-plugin-memory"
+	"github.com/lsong98sh/chonkpilot-plugin-framework/runtime/bridgebus"
+	mq "github.com/lsong98sh/chonkpilot-plugin-framework/runtime/bus"
+	plugin "github.com/lsong98sh/chonkpilot-plugin-framework/runtime/hook"
 	"github.com/lsong98sh/chonkpilot-plugin-framework/sdk"
 )
 

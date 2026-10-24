@@ -13,7 +13,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/chonkpilot/chonkpilot-lib/mq"
+	mq "github.com/lsong98sh/chonkpilot-plugin-framework/runtime/bus"
 )
 
 // gatewayTool 注册到 gateway 的文件历史工具定义。

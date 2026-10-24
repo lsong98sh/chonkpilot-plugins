@@ -18,8 +18,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/chonkpilot/chonkpilot-lib/mq"
-	"github.com/chonkpilot/chonkpilot-plugin"
+	mq "github.com/lsong98sh/chonkpilot-plugin-framework/runtime/bus"
+	plugin "github.com/lsong98sh/chonkpilot-plugin-framework/runtime/hook"
 )
 
 // flushStub 记录一次手动沉淀链路里各数据面/LLM 的调用次数与载荷。
@@ -281,7 +281,7 @@ func TestManualFlushLocksOnInstanceWorkDir(t *testing.T) {
 	if err := p.Start(plugin.Deps{Bus: bus, Logf: t.Logf}); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
-	manual := turnEvent{InstanceID: "ins-1", Session: "s1"}                  // 手动载荷：无 work_dir
+	manual := turnEvent{InstanceID: "ins-1", Session: "s1"}                 // 手动载荷：无 work_dir
 	auto := turnEvent{InstanceID: "ins-1", WorkDir: `C:\ws`, Session: "s1"} // 自动载荷：带 work_dir
 
 	// 未登记实例：手动载荷无 work_dir → 解析为空（与自动路径不同锁 = 缺陷场景）。
