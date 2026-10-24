@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>知识库状态</title>
+  <link rel="stylesheet" href="/shared/ck-theme.css" />
+  <link rel="stylesheet" href="/themes.css" />
+  <script src="/shared/ck-theme.js"></script>
+  <!-- 受控 mq 入口（PLUGIN-UI-1）：宿主在 iframe load 后注入 on/off/emit，插件页直接用 ckMq。 -->
+  <script src="/shared/ck-mq.js"></script>
+  <style>
+    body { margin: 0; padding: 16px 18px; font: 13px/1.5 var(--ck-font-sans); color: var(--ck-text); background: var(--ck-bg); }
+    h1 { font-size: 15px; margin: 0 0 12px; }
+    .kv { display: grid; grid-template-columns: 120px 1fr; gap: 6px 12px; font-size: 12px; }
+    .kv b { font-weight: 600; color: var(--ck-text-muted); }
+    ul { margin: 6px 0 0; padding-left: 18px; font-size: 12px; }
+    .row { display: flex; gap: 8px; margin-top: 14px; }
+    input[type=text] { flex: 1; padding: 6px 8px; border: 1px solid var(--ck-border); border-radius: 6px; font: inherit; background: transparent; color: inherit; }
+    button { padding: 6px 12px; border-radius: 6px; border: 1px solid var(--ck-border); background: var(--ck-surface); color: inherit; font: inherit; cursor: pointer; }
+    pre { margin-top: 12px; padding: 10px; max-height: 240px; overflow: auto; border-radius: 6px; background: var(--ck-surface); font-size: 11px; }
+    .err { color: var(--ck-danger); font-size: 12px; }
+  </style>
+</head>
+<body>
+  <h1>代码知识库状态</h1>
+  <div class="kv">
+    <b>插件</b><span id="s-id">-</span>
+    <b>版本</b><span id="s-ver">-</span>
+    <b>引擎</b><span id="s-eng">-</span>
+  </div>
+  <ul id="s-tools"></ul>
+
+  <div class="row">
+    <input type="text" id="workdir" placeholder="项目根目录（绝对路径，可选）" autocomplete="off" />
+    <button id="refresh">查询工作区</button>
+  </div>
+  <div id="err" class="err"></div>
+  <pre id="out" hidden></pre>
+
+  <script src="/plugin-ui/_sdk/plugin.js"></script>
+  <script>
+    const err = document.getElementById('err');
+    const out = document.getElementById('out');
+    let timer = null;
+
+    async function loadPlugin() {
+      try {
+        const r = await ckPlugin.call('rpc', { method: 'status', params: {} });
+        const v = r && Object.prototype.hasOwnProperty.call(r, 'result') ? r.result : r;
+        document.getElementById('s-id').textContent = 'codebase';
+        document.getElementById('s-ver').textContent = (v && v.version) || '-';
+        document.getElementById('s-eng').textContent = ((v && v.engines) || []).join(' + ') || '-';
+        const ul = document.getElementById('s-tools');
+        ul.innerHTML = '';
+        for (const t of (v && v.tools) || []) {
+          const li = document.createElement('li');
+          li.textContent = t;
+          ul.appendChild(li);
+        }
+        err.textContent = '';
+      } catch (e) { err.textContent = '插件状态读取失败: ' + e.message; }
+    }
+
+    async function queryWorkdir() {
+      const wd = document.getElementById('workdir').value.trim();
+      if (!wd) { err.textContent = '请填写项目根目录'; return; }
+      try {
+        const r = await ckPlugin.call('rpc', {
+          method: 'tool.call',
+          params: { name: 'codegraph_status', args: { workdir: wd } },
+        });
+        const v = r && Object.prototype.hasOwnProperty.call(r, 'result') ? r.result : r;
+        out.hidden = false;
+        out.textContent = JSON.stringify(v, null, 2);
+        err.textContent = '';
+      } catch (e) { err.textContent = '查询失败: ' + e.message; }
+    }
+
+    document.getElementById('refresh').onclick = queryWorkdir;
+    loadPlugin();
+    timer = setInterval(loadPlugin, 5000);
+    window.addEventListener('beforeunload', () => timer && clearInterval(timer));
+  </script>
+</body>
+</html>

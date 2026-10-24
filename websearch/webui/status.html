@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>联网能力状态</title>
+  <link rel="stylesheet" href="/shared/ck-theme.css" />
+  <link rel="stylesheet" href="/themes.css" />
+  <script src="/shared/ck-theme.js"></script>
+  <style>
+    body { margin: 0; padding: 16px 18px; font: 13px/1.6 var(--ck-font-sans); color: var(--ck-text); background: var(--ck-bg); }
+    h1 { font-size: 16px; margin: 0 0 12px; }
+    .kv { display: grid; grid-template-columns: 130px 1fr; gap: 6px 12px; font-size: 12px; }
+    .k { color: var(--ck-text-muted); }
+    .v { word-break: break-all; }
+    .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; background: var(--ck-text-muted); }
+    .dot.ok { background: var(--ck-success); }
+    .dot.err { background: var(--ck-danger); }
+  </style>
+</head>
+<body>
+  <h1>联网能力状态</h1>
+  <div class="kv">
+    <div class="k">配置</div><div class="v" id="configured">—</div>
+    <div class="k">Base URL</div><div class="v" id="base">—</div>
+    <div class="k">最近调用</div><div class="v" id="lastAt">—</div>
+    <div class="k">最近条数</div><div class="v" id="lastN">—</div>
+    <div class="k">最近错误</div><div class="v" id="lastErr">—</div>
+  </div>
+  <script src="/plugin-ui/_sdk/plugin.js"></script>
+  <script>
+    async function refresh() {
+      try {
+        const r = await ckPlugin.call('rpc', { method: 'status', params: {} });
+        const v = (r && r.result) ? r.result : (r || {});
+        const configured = document.getElementById('configured');
+        configured.innerHTML = '<span class="dot ' + (v.configured ? 'ok' : 'err') + '"></span>' + (v.configured ? '已配置' : '未配置');
+        document.getElementById('base').textContent = v.base_url || '—';
+        document.getElementById('lastAt').textContent = v.last_at || '—';
+        document.getElementById('lastN').textContent = v.last_count == null ? '—' : String(v.last_count);
+        document.getElementById('lastErr').textContent = v.last_error || '—';
+      } catch (e) {
+        document.getElementById('lastErr').textContent = e.message;
+      }
+    }
+    refresh();
+    setInterval(refresh, 5000);
+  </script>
+</body>
+</html>
