@@ -230,7 +230,7 @@ func TestHandleSaveValidationRejects(t *testing.T) {
 		{"高度越界", KeyHeight, "9999", "240–2160"},
 		{"截图目录 NUL", KeyScreenshotDir, "a\x00b", "NUL"},
 		{"未知键（旧键名）", "headless", "true", "未知配置键"},
-		{"未知键（别家命名空间）", "plugins.codebase.vfts.enabled", "true", "未知配置键"},
+		{"未知键（别家命名空间）", "plugins.codegraph.vfts.enabled", "true", "未知配置键"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
