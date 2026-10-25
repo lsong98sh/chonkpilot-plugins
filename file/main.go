@@ -1,10 +1,12 @@
 // chonkpilot-file —— 文件工具插件（file 系列 11 个工具）。
 //
-// 契约唯一源仍是 `src/initdata/capability/tools/file/*.tool.md`（构建期拷到
-// `<pluginRoot>/tools/file/`）。本插件只写业务分派：
-//   - 契约解析/注册/参数封装 → pluginsdk/contract（复用层）
+// 契约源 = 本仓 `file/tools/file/*.tool.md`（构建期拷到 `<pluginRoot>/tools/file/`）。
+// 本插件写法：
+//   - 契约解析/注册/参数封装 → framework `contract`（复用层）
 //   - 默认参数（purpose / encoding / targets 上限）→ 本文件
-//   - 执行 → 公开包 toolset（与 core 执行器同一实现，行为不变）
+//   - 执行 → 同仓 `file/lib/toolset`（工具实现随插件，2026-10-25 PLUGIN-SPLIT-1）
+//
+// 主仓不再持有 file 工具实现：`file_*` 由 gateway 调用本插件的 MCP server 执行。
 package main
 
 import (
@@ -13,10 +15,12 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 
-	"github.com/chonkpilot/chonkpilot-mcp-tools/toolset"
 	"github.com/lsong98sh/chonkpilot-plugin-framework/contract"
 	"github.com/lsong98sh/chonkpilot-plugin-framework/sdk"
+	"github.com/lsong98sh/chonkpilot-plugins/file/lib/paths"
+	"github.com/lsong98sh/chonkpilot-plugins/file/lib/toolset"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
@@ -83,11 +87,27 @@ func main() {
 // call 是业务分派：补默认参数 → toolset 进程内执行。
 func (f *filePlugin) call(ctx context.Context, name string, args map[string]any) (string, bool, error) {
 	f.applyDefaults(args)
+	f.applyCallMeta(ctx)
 	res, ok := toolset.Dispatch(ctx, name, args)
 	if !ok {
 		return "未知工具: " + name, true, nil
 	}
 	return res.Text, res.IsError, nil
+}
+
+// applyCallMeta 用协议 _meta（`chonkpilot.instance_id`）初始化调用上下文：
+// `!/` 前缀的落地根 = <temp>/chonkpilot/<instance>/（与主仓 builtin 调用口径一致）。
+func (f *filePlugin) applyCallMeta(ctx context.Context) {
+	meta := contract.Meta(ctx)
+	if meta == nil {
+		return
+	}
+	ns, _ := meta["chonkpilot"].(map[string]any)
+	inst, _ := ns["instance_id"].(string)
+	if inst = strings.TrimSpace(inst); inst == "" {
+		return
+	}
+	_, _ = paths.SetTempRoot(inst)
 }
 
 // applyDefaults 用插件配置补默认参数（显式入参优先；LLM 可逐次覆盖）。
