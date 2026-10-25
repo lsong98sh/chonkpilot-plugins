@@ -4,7 +4,7 @@ go 1.26.0
 
 require (
 	github.com/chonkpilot/chonkpilot-plugin-history v0.0.0
-	github.com/lsong98sh/chonkpilot-plugin-framework v0.0.0
+	github.com/lsong98sh/chonkpilot-plugin-framework v0.1.1
 )
 
 require (
@@ -18,7 +18,5 @@ require (
 	golang.org/x/sys v0.47.0 // indirect
 	golang.org/x/time v0.15.0 // indirect
 )
-
-replace github.com/lsong98sh/chonkpilot-plugin-framework => ../../chonkpilot-plugin-framework
 
 replace github.com/chonkpilot/chonkpilot-plugin-history => ./lib

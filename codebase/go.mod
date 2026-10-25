@@ -3,7 +3,7 @@ module github.com/chonkpilot/chonkpilot-codebase-plugin
 go 1.26.0
 
 require (
-	github.com/lsong98sh/chonkpilot-plugin-framework v0.0.0
+	github.com/lsong98sh/chonkpilot-plugin-framework v0.1.1
 	github.com/lsong98sh/chonkpilot-plugins/codebase/engines/codegraph v0.0.0
 	github.com/lsong98sh/chonkpilot-plugins/codebase/engines/vfts v0.0.0
 	github.com/modelcontextprotocol/go-sdk v1.7.0
@@ -31,8 +31,6 @@ require (
 	golang.org/x/sys v0.41.0 // indirect
 	golang.org/x/time v0.15.0 // indirect
 )
-
-replace github.com/lsong98sh/chonkpilot-plugin-framework => ../../chonkpilot-plugin-framework
 
 replace github.com/lsong98sh/chonkpilot-plugins/shared => ../shared
 

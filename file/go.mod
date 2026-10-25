@@ -3,7 +3,7 @@ module github.com/chonkpilot/chonkpilot-file-plugin
 go 1.26.0
 
 require (
-	github.com/lsong98sh/chonkpilot-plugin-framework v0.0.0
+	github.com/lsong98sh/chonkpilot-plugin-framework v0.1.1
 	github.com/lsong98sh/chonkpilot-plugins/file/lib v0.0.0
 	github.com/modelcontextprotocol/go-sdk v1.7.0
 )
@@ -20,7 +20,5 @@ require (
 	golang.org/x/text v0.43.0 // indirect
 	golang.org/x/time v0.15.0 // indirect
 )
-
-replace github.com/lsong98sh/chonkpilot-plugin-framework => ../../chonkpilot-plugin-framework
 
 replace github.com/lsong98sh/chonkpilot-plugins/file/lib => ./lib
