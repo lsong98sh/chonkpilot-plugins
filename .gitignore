@@ -2,3 +2,6 @@
 *.exe
 *.dll
 dist/
+
+# 例外：zvec 运行库随源码入库（clean clone 即可 CGO 构建/运行，与主仓同口径）
+!codebase/engines/vfts/third_party/zvec/windows_amd64/zvec_c_api.dll

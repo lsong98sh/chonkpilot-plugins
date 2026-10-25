@@ -18,8 +18,8 @@ import (
 	"strings"
 	"time"
 
-	codegraph "github.com/chonkpilot/chonkpilot-codegraph-mcp-server/server"
-	vfts "github.com/chonkpilot/chonkpilot-vfts-mcp-server/server"
+	codegraph "github.com/lsong98sh/chonkpilot-plugins/codebase/engines/codegraph/server"
+	vfts "github.com/lsong98sh/chonkpilot-plugins/codebase/engines/vfts/server"
 	"github.com/lsong98sh/chonkpilot-plugin-framework/sdk"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
