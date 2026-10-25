@@ -87,17 +87,25 @@ func main() {
 // call 是业务分派：补默认参数 → toolset 进程内执行。
 func (f *filePlugin) call(ctx context.Context, name string, args map[string]any) (string, bool, error) {
 	f.applyDefaults(args)
-	f.applyCallMeta(ctx)
+	text, isErr := dispatch(ctx, name, args)
+	return text, isErr, nil
+}
+
+// dispatch 执行一次工具调用（默认参数由调用方补齐）：_meta 落地根 + toolset 分派。
+//
+// 抽成包级函数是为了让进程内 MCP 面测试（tools_mcp_test.go）复用同一条分派链，不重复实现。
+func dispatch(ctx context.Context, name string, args map[string]any) (string, bool) {
+	applyCallMeta(ctx)
 	res, ok := toolset.Dispatch(ctx, name, args)
 	if !ok {
-		return "未知工具: " + name, true, nil
+		return "未知工具: " + name, true
 	}
-	return res.Text, res.IsError, nil
+	return res.Text, res.IsError
 }
 
 // applyCallMeta 用协议 _meta（`chonkpilot.instance_id`）初始化调用上下文：
 // `!/` 前缀的落地根 = <temp>/chonkpilot/<instance>/（与主仓 builtin 调用口径一致）。
-func (f *filePlugin) applyCallMeta(ctx context.Context) {
+func applyCallMeta(ctx context.Context) {
 	meta := contract.Meta(ctx)
 	if meta == nil {
 		return

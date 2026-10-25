@@ -265,6 +265,64 @@ func wndproc(hwnd, msg, wp, lp uintptr) uintptr {
 	return r
 }
 
+// WindowHit 是 frameless 窗口的非客户区命中方位（取值与前端 `gui.window.resize.hit` 一致）。
+//
+// 该映射与「进入系统 move/resize 模态循环」同属本包封装：宿主只传方位名，
+// 无需知道 Win32 WM_NCHITTEST 命中码。
+type WindowHit = string
+
+const (
+	HitLeft        WindowHit = "left"
+	HitRight       WindowHit = "right"
+	HitTop         WindowHit = "top"
+	HitBottom      WindowHit = "bottom"
+	HitTopLeft     WindowHit = "topleft"
+	HitTopRight    WindowHit = "topright"
+	HitBottomLeft  WindowHit = "bottomleft"
+	HitBottomRight WindowHit = "bottomright"
+	// HitCaption 进入系统**移动**模态循环（frameless 自绘顶栏拖拽；
+	// WebView2 app-region 在 WM_NCCALCSIZE=0 的窗口上实测不生效，故显式走 HTCAPTION）。
+	HitCaption WindowHit = "caption"
+)
+
+// Win32 WM_NCHITTEST 命中码（HT*）。
+const (
+	htCaption     uintptr = 2
+	htLeft        uintptr = 10
+	htRight       uintptr = 11
+	htTop         uintptr = 12
+	htTopLeft     uintptr = 13
+	htTopRight    uintptr = 14
+	htBottom      uintptr = 15
+	htBottomLeft  uintptr = 16
+	htBottomRight uintptr = 17
+)
+
+// HitCode 把命中方位映射为 Win32 HT* 命中码；未知方位返回 (0, false)。
+func HitCode(hit string) (uintptr, bool) {
+	switch hit {
+	case HitLeft:
+		return htLeft, true
+	case HitRight:
+		return htRight, true
+	case HitTop:
+		return htTop, true
+	case HitBottom:
+		return htBottom, true
+	case HitTopLeft:
+		return htTopLeft, true
+	case HitTopRight:
+		return htTopRight, true
+	case HitBottomLeft:
+		return htBottomLeft, true
+	case HitBottomRight:
+		return htBottomRight, true
+	case HitCaption:
+		return htCaption, true
+	}
+	return 0, false
+}
+
 // WindowResizer exposes the ability to start a native window resize drag.
 // The frontend performs edge hit-testing (hover cursor + mousedown on a
 // resize handle) and calls StartResize with the matching HT* code; the
