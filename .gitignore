@@ -4,4 +4,5 @@
 dist/
 
 # 例外：zvec 运行库随源码入库（clean clone 即可 CGO 构建/运行，与主仓同口径）
-!codegraph/engines/vfts/third_party/zvec/windows_amd64/zvec_c_api.dll
+# TOPO-1（2026-10-29）：引擎源码已迁 `<id>/src/engines/...`。
+!codegraph/src/engines/vfts/third_party/zvec/windows_amd64/zvec_c_api.dll

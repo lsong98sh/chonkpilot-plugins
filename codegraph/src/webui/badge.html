@@ -1,0 +1,108 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>索引进度</title>
+  <link rel="stylesheet" href="/shared/ck-theme.css" />
+  <link rel="stylesheet" href="/themes.css" />
+  <script src="/shared/ck-theme.js"></script>
+  <!-- 受控 mq 入口（宿主在 iframe load 后注入 on/off/emit）→ 点击开完整状态页 -->
+  <script src="/shared/ck-mq.js"></script>
+  <style>
+    /* 栏内紧凑徽标（PLUGIN-UI-2）：固定 200×20，透明底、不滚动、单行省略。 */
+    html, body { margin: 0; padding: 0; background: transparent; overflow: hidden; }
+    body {
+      height: 20px;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 0 6px;
+      box-sizing: border-box;
+      font: 11px/20px var(--ck-font-sans);
+      color: var(--ck-text-muted);
+      white-space: nowrap;
+      cursor: pointer;
+      user-select: none;
+    }
+    body:hover { color: var(--ck-text); }
+    .eng { display: inline-flex; align-items: center; gap: 4px; min-width: 0; }
+    .eng .txt { overflow: hidden; text-overflow: ellipsis; }
+    .dot { width: 6px; height: 6px; border-radius: 50%; flex-shrink: 0; background: var(--ck-border); }
+    .eng.is-progress .dot { background: var(--ck-accent, #4b7bec); }
+    .eng.is-ready .dot { background: var(--ck-ok, #27ae60); }
+    .eng.is-error .dot { background: var(--ck-danger, #e74c3c); }
+    .eng.is-disabled { color: var(--ck-text-muted); opacity: .7; }
+  </style>
+</head>
+<body id="badge" title="代码知识库索引进度（点击查看详情）">
+  <script src="/plugin-ui/_sdk/plugin.js"></script>
+  <script>
+    (function () {
+      var box = document.getElementById('badge');
+      var instanceId = new URLSearchParams(location.search).get('instance_id') || '';
+      var timer = null;
+      var polls = 0;
+
+      function seg(e) {
+        var s = document.createElement('span');
+        s.className = 'eng is-' + (e.tone || 'disabled');
+        s.setAttribute('data-engine', e.engine || '');
+        var d = document.createElement('span');
+        d.className = 'dot';
+        var t = document.createElement('span');
+        t.className = 'txt';
+        t.textContent = e.text || '';
+        s.appendChild(d);
+        s.appendChild(t);
+        return s;
+      }
+
+      function render(items) {
+        box.innerHTML = '';
+        if (!items || !items.length) {
+          var ph = document.createElement('span');
+          ph.className = 'eng is-disabled';
+          ph.textContent = '未打开项目';
+          box.appendChild(ph);
+          return;
+        }
+        for (var i = 0; i < items.length; i++) box.appendChild(seg(items[i]));
+      }
+
+      async function refresh() {
+        polls += 1;
+        box.setAttribute('data-poll', String(polls));
+        try {
+          var r = await ckPlugin.call('rpc', { method: 'badge', params: { instance_id: instanceId } });
+          var v = r && Object.prototype.hasOwnProperty.call(r, 'result') ? r.result : r;
+          render(v && v.engines);
+          box.setAttribute('data-ts', String(Date.now()));
+        } catch (e) {
+          box.setAttribute('data-err', String((e && e.message) || e));
+          render([{ engine: '', text: '状态不可用', tone: 'error' }]);
+        }
+      }
+
+      // 点击 → 打开插件完整状态页（既有主题 preview-tab-open；与 pluginBar 同一路径）。
+      box.addEventListener('click', function () {
+        try {
+          ckMq.emit('preview-tab-open', {
+            kind: 'plugin-page',
+            plugin: 'codegraph',
+            page: 'status',
+            title: '知识库状态',
+          });
+        } catch (e) { /* 未注入 mq（独立打开）→ 无动作 */ }
+      });
+
+      refresh();
+      timer = setInterval(refresh, 2000);
+      document.addEventListener('visibilitychange', function () {
+        if (!document.hidden) refresh();
+      });
+      window.addEventListener('beforeunload', function () { if (timer) clearInterval(timer); });
+    })();
+  </script>
+</body>
+</html>

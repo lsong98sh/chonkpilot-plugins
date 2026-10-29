@@ -1,7 +1,6 @@
-// Package ignore 实现 gitignore(5) 语义的路径排除匹配。
-//
-// 单一实现，供 codegraph / vfts 两个索引引擎与 vfts 插件的清单扫描共用——
-// 三处过滤口径必然一致（引擎排除集与插件 file_list 清单不会出现两套判定）。
+// Package ignore 是 gitignore(5) 语义排除的**I/O 外壳**：
+// 纯解析/匹配内核已抽到 chonkpilot-util/ignore，本包只保留读盘、逐级 .gitignore
+// 叠加、目录遍历（WalkDir）与按 instance 的规则缓存。
 //
 // 规则来源与优先级（低 → 高，最后一条匹配的规则决定，「!」= 取消忽略）：
 //
@@ -25,30 +24,28 @@ import (
 	"errors"
 	"io/fs"
 	"os"
-	"path"
 	"path/filepath"
-	"regexp"
 	"strings"
+
+	uignore "github.com/lsong98sh/chonkpilot-util/ignore"
+	"github.com/lsong98sh/chonkpilot-util/strlist"
 )
 
-// builtinPatterns 内置强制排除（不可反选）：VCS 元数据 + ChonkPilot 自身索引目录。
-// 反选它们会导致索引 VCS 内部对象或索引自身产物（自指反馈）。
-var builtinPatterns = []string{
-	".git/", ".svn/", ".hg/", ".chonkpilot/",
-}
+// Rule 是已编译的 gitignore 规则（别名到纯内核，字段不导出）。
+type Rule = uignore.Rule
 
-// defaultPatterns 默认排除（可被用户 '!' 反选）。
-var defaultPatterns = []string{
-	"node_modules/", "__pycache__/", ".venv/", "venv/", ".trae/",
-	"dist/", "build/", ".next/", ".nuxt/", "out/", "target/", "vendor/",
-}
+// Parse 解析一段 gitignore 语法文本为有序规则列表（空行 / 注释 / 无效行丢弃）。
+func Parse(content, base string) []Rule { return uignore.Parse(content, base) }
 
-// Rule 单条编译后的 gitignore 规则（不可变）。
-type Rule struct {
-	negate  bool           // '!' 取反（取消忽略）
-	dirOnly bool           // 尾 '/'：仅匹配目录
-	base    string         // 规则来源目录（相对 root，'/' 分隔，"" = root）
-	re      *regexp.Regexp // 相对 base 的匹配式（已含锚定与 glob 展开）
+// BuiltinRules 内置强制排除规则（不可被 '!' 反选）。
+func BuiltinRules() []Rule { return uignore.BuiltinRules() }
+
+// DefaultRules 默认排除规则（可被 '!' 反选）。
+func DefaultRules() []Rule { return uignore.DefaultRules() }
+
+// Match 按「最后一条匹配的规则决定」判定 rel 是否被忽略（forced 恒优先且不可反选）。
+func Match(forced, ordered []Rule, rel string, isDir bool) bool {
+	return uignore.Match(forced, ordered, rel, isDir)
 }
 
 // Options 遍历排除配置。
@@ -67,10 +64,7 @@ type Options struct {
 	rs *ruleSet
 }
 
-// Keys 是一次「配置 → 排除规则」读取所用的**显式键名**（由调用方给出）。
-//
-// 语义（PLUGIN-UI-1 第三段起键命名不再由本库硬编码：插件配置已迁入
-// `plugins.<id>.*` 命名空间，本库只按调用方给的键取值）：
+// Keys 是一次「配置 → 排除规则」读取所用的显式键名（由调用方给出）。
 //
 //	Enabled        == "true" → enabled
 //	SkipDirs                 → UserRules（逗号/分号/换行分隔，保序不去重，空串 = 无规则）
@@ -83,12 +77,10 @@ type Keys struct {
 	StackGitignore string
 }
 
-// ConfigOptions 由「配置读取器」构造遍历排除配置（键名由 keys 指定）：
+// ConfigOptions 由「配置读取器」构造遍历排除配置：
 //
 //	get 返回 (值, 是否命中)；workdir 为规则根。仅当 workdir 为空（配置错误）→ 返回 err
-//
-// （opts / enabled 仍按已读到的配置填充）；workdir 不存在不报错（逐级 .gitignore 读取本就
-// 静默容忍缺失，判定自然降级为「不排除」）。
+//	（opts / enabled 仍按已读到的配置填充）；workdir 不存在不报错。
 func ConfigOptions(keys Keys, get func(key string) (string, bool), workdir string) (*Options, bool, error) {
 	enabled := false
 	if keys.Enabled != "" {
@@ -113,23 +105,12 @@ func ConfigOptions(keys Keys, get func(key string) (string, bool), workdir strin
 	return opts, enabled, nil
 }
 
-// splitRules 解析用户排除规则文本：按逗号/分号/换行分隔，去空白；
-// **保序且保留重复项**（gitignore 语义下顺序有意义：'!' 取反 + 后一条覆盖前一条）。空串 → nil。
+// splitRules 解析用户排除规则文本（逗号/分号/换行分隔、去空白、保序保重复）。
 func splitRules(s string) []string {
-	var out []string
-	for _, part := range strings.FieldsFunc(s, func(r rune) bool {
-		return r == ',' || r == ';' || r == '\n' || r == '\r'
-	}) {
-		if part = strings.TrimSpace(part); part == "" {
-			continue
-		}
-		out = append(out, part)
-	}
-	return out
+	return strlist.Split(s)
 }
 
-// WalkDir 深度优先遍历 root：跳过被忽略的目录（不下降）与文件，其余交给 fn
-// （语义同 filepath.WalkDir / fs.WalkDirFunc）。
+// WalkDir 深度优先遍历 root：跳过被忽略的目录（不下降）与文件，其余交给 fn。
 // root 自身恒不被忽略（始终以 rel="" 调用 fn）。
 func WalkDir(root string, opts Options, fn fs.WalkDirFunc) error {
 	rootAbs := filepath.Clean(root)
@@ -150,14 +131,10 @@ func WalkDir(root string, opts Options, fn fs.WalkDirFunc) error {
 }
 
 // Ignored 判定 rel（相对 o.Root，'/' 分隔）是否被排除：
-// = **该路径自身命中**（按库内既有有序求值口径，'!' 反选在自身层级仍生效）
-// **或任一祖先目录按「目录剪枝」命中**（git 语义：父目录被排除 → 其后代也不会被索引；
-// 祖先剪枝不可被后代 '!' 救回）。根自身恒不排除。
-//
-// 与 WalkDir 严格同源：两者共用 ruleSet.decide，故 Ignored(p) ⇔ WalkDir 会跳过 p。
-// 路径的目录性取磁盘真实类型（不存在 → 按文件；仅影响尾斜杠目录规则的匹配）。
+// = 该路径自身命中，或任一祖先目录按「目录剪枝」命中。根自身恒不排除。
+// 与 WalkDir 严格同源（共用 ruleSet.decide）。
 func (o *Options) Ignored(rel string) bool {
-	rel = normalizeRel(rel)
+	rel = uignore.NormalizeRel(rel)
 	if rel == "" || rel == ".." || strings.HasPrefix(rel, "../") {
 		return false
 	}
@@ -170,7 +147,7 @@ func (o *Options) Ignored(rel string) bool {
 	if fi, err := os.Stat(filepath.Join(root, filepath.FromSlash(rel))); err == nil {
 		isDir = fi.IsDir()
 	}
-	for _, anc := range ancestorDirs(rel) {
+	for _, anc := range uignore.AncestorDirs(rel) {
 		if rs.decide(anc, true) {
 			return true // 祖先目录被剪枝
 		}
@@ -189,23 +166,22 @@ func (o *Options) rules() *ruleSet {
 	return o.rs
 }
 
-// ruleSet 是 WalkDir 与 Ignored 共用的规则求值上下文（同一份实现保证剪枝语义严格一致）。
+// ruleSet 是 WalkDir 与 Ignored 共用的规则求值上下文。
 type ruleSet struct {
 	stack  bool
 	root   string
 	forced []Rule            // 内置强制（不可反选）
 	base   []Rule            // 默认排除 + 全局 ignore + info/exclude（低 → 高优先级）
 	user   []Rule            // 用户规则（最高优先级）
-	own    map[string][]Rule // 各目录 .gitignore 规则（rel 目录 → 规则；惰性加载）
+	own    map[string][]Rule // 各目录 .gitignore 规则（惰性加载）
 	loaded map[string]bool   // own 已加载标记（含空规则 → 不重复读盘）
 }
 
-// newRuleSet 组装规则集：低 → 高 = 内置强制 → 默认排除 → 全局 ignore → info/exclude
-// → 各级 .gitignore（规则集内以 base 目录区分优先级）→ 用户规则。
+// newRuleSet 组装规则集：内置强制 → 默认排除 → 全局 ignore → info/exclude
+// → 各级 .gitignore（按 base 目录区分优先级）→ 用户规则。
 func newRuleSet(root string, opts Options) *ruleSet {
 	base := DefaultRules()
 	if opts.StackGitignore {
-		// 全局 ignore 与 info/exclude 位于默认排除**之后**（优先级更高），但仍在各级 .gitignore 之前。
 		base = append(base, GlobalRules()...)
 		base = append(base, ExcludeRules(root)...)
 	}
@@ -235,48 +211,25 @@ func (rs *ruleSet) loadOwn(dirRel string) {
 	}
 }
 
-// decide 判定 rel（相对 root，'/' 分隔）是否被忽略：从最高优先级来源反向扫描，首个匹配者决定。
+// decide 判定 rel 是否被忽略：从最高优先级来源反向扫描，首个匹配者决定。
 func (rs *ruleSet) decide(rel string, isDir bool) bool {
-	if matchesAny(rs.forced, rel, isDir) {
+	if uignore.MatchesAny(rs.forced, rel, isDir) {
 		return true // 强制排除：不可被 '!' 反选
 	}
-	if m, ok := lastMatch(rs.user, rel, isDir); ok {
+	if m, ok := uignore.LastMatch(rs.user, rel, isDir); ok {
 		return m
 	}
 	for dir := dirOf(rel); ; dir = dirOf(dir) {
 		rs.loadOwn(dir)
-		if m, ok := lastMatch(rs.own[dir], rel, isDir); ok {
+		if m, ok := uignore.LastMatch(rs.own[dir], rel, isDir); ok {
 			return m
 		}
 		if dir == "" {
 			break
 		}
 	}
-	m, _ := lastMatch(rs.base, rel, isDir)
+	m, _ := uignore.LastMatch(rs.base, rel, isDir)
 	return m
-}
-
-// Match 判定 rel（相对 root，'/' 分隔）是否被忽略。
-// forced 命中即忽略（不可反选）；否则 ordered 按「低 → 高」有序求值，最后一条匹配的规则决定。
-// 供单测与外部按源分组的判定复用；WalkDir 内部按逐级目录分组，语义与之一致。
-func Match(forced, ordered []Rule, rel string, isDir bool) bool {
-	if matchesAny(forced, rel, isDir) {
-		return true
-	}
-	m, _ := lastMatch(ordered, rel, isDir)
-	return m
-}
-
-// Parse 解析一段 gitignore 语法文本为规则列表（保序；空行/注释/无效行丢弃）。
-// base = 规则来源目录相对 root 的 '/' 路径（"" = root）——含 '/' 的规则相对 base 锚定。
-func Parse(content, base string) []Rule {
-	var out []Rule
-	for _, line := range strings.Split(content, "\n") {
-		if r, ok := parseLine(line, base); ok {
-			out = append(out, r)
-		}
-	}
-	return out
 }
 
 // FileRules 读取 path 并按 gitignore 语法解析（base 语义同 Parse）。
@@ -288,12 +241,6 @@ func FileRules(path, base string) []Rule {
 	}
 	return Parse(string(b), base)
 }
-
-// BuiltinRules 内置强制排除规则（恒先生效，不可被 '!' 反选）。
-func BuiltinRules() []Rule { return parsePatterns(builtinPatterns) }
-
-// DefaultRules 默认排除规则（可被用户 '!' 反选）。
-func DefaultRules() []Rule { return parsePatterns(defaultPatterns) }
 
 // GlobalRules 全局 ignore 规则：$XDG_CONFIG_HOME/git/ignore 或 ~/.config/git/ignore（缺失 → nil）。
 // 刻意不解析 ~/.gitconfig 的 core.excludesFile（已知差异，见包注释）。
@@ -318,183 +265,6 @@ func ExcludeRules(root string) []Rule {
 
 const gitignoreName = ".gitignore"
 
-func parsePatterns(patterns []string) []Rule {
-	out := make([]Rule, 0, len(patterns))
-	for _, p := range patterns {
-		if r, ok := parseLine(p, ""); ok {
-			out = append(out, r)
-		}
-	}
-	return out
-}
-
-// parseLine 解析单行 gitignore 规则；非规则行（空行/注释/无效）→ ok=false。
-func parseLine(raw, base string) (Rule, bool) {
-	line := trimTrailingSpace(strings.TrimSuffix(raw, "\r"))
-	if line == "" {
-		return Rule{}, false
-	}
-	if strings.HasPrefix(line, `\#`) {
-		line = line[1:] // 转义 '#' = 字面 '#'
-	} else if strings.HasPrefix(line, "#") {
-		return Rule{}, false // 注释
-	}
-	negate := false
-	if strings.HasPrefix(line, `\!`) {
-		line = line[1:] // 转义 '!' = 字面 '!'
-	} else if strings.HasPrefix(line, "!") {
-		negate = true
-		line = line[1:]
-	}
-	dirOnly := false
-	if strings.HasSuffix(line, "/") {
-		dirOnly = true
-		line = strings.TrimRight(line, "/")
-	}
-	if line == "" {
-		return Rule{}, false
-	}
-	anchored := false
-	if strings.HasPrefix(line, "/") {
-		line = strings.TrimPrefix(line, "/")
-		anchored = true
-	}
-	if line == "" {
-		return Rule{}, false
-	}
-	if strings.Contains(line, "/") {
-		anchored = true // 含 '/'（非仅尾斜杠）= 相对 base 锚定
-	}
-	return Rule{negate: negate, dirOnly: dirOnly, base: base, re: compile(line, anchored)}, true
-}
-
-// trimTrailingSpace 去掉行尾未被 '\' 转义的空白（' ' / '\t'）；`\ ` 保留为字面空格。
-func trimTrailingSpace(s string) string {
-	i := len(s)
-	for i > 0 && (s[i-1] == ' ' || s[i-1] == '\t') {
-		bs := 0
-		for j := i - 2; j >= 0 && s[j] == '\\'; j-- {
-			bs++
-		}
-		if bs%2 == 1 {
-			break // 被转义 → 字面空白
-		}
-		i--
-	}
-	return s[:i]
-}
-
-// compile 把（去锚点/去目录标记后的）pattern 编译为相对 base 的匹配式。
-// anchored=false → 可匹配任意层级（前缀 (?:[^/]+/)*）。
-func compile(pattern string, anchored bool) *regexp.Regexp {
-	parts := strings.Split(pattern, "/")
-	var b strings.Builder
-	b.WriteString(`\A`)
-	if !anchored {
-		b.WriteString(`(?:[^/]+/)*`)
-	}
-	for i, p := range parts {
-		if i > 0 && parts[i-1] != "**" {
-			b.WriteString("/")
-		}
-		if p == "**" {
-			if len(parts) == 1 || i == len(parts)-1 {
-				b.WriteString(`.*`) // 尾随 '**'（或整条 '**'）：匹配其下全部
-			} else {
-				b.WriteString(`(?:[^/]+/)*`) // 前导/中间 '**'：匹配零或多个目录层
-			}
-			continue
-		}
-		b.WriteString(globSegment(p))
-	}
-	b.WriteString(`\z`)
-	return regexp.MustCompile(b.String())
-}
-
-// globSegment 把单个路径段（不含 '/'）的 glob 转为正则片段：
-// '*' / '?' 不跨 '/'；'[...]' 字符类（'!' / '^' 取反）；'\x' 转义为字面 x。
-func globSegment(seg string) string {
-	var b strings.Builder
-	for i := 0; i < len(seg); i++ {
-		switch c := seg[i]; c {
-		case '\\':
-			if i+1 < len(seg) {
-				b.WriteString(regexp.QuoteMeta(string(seg[i+1])))
-				i++
-			} else {
-				b.WriteString(`\\`)
-			}
-		case '*':
-			b.WriteString(`[^/]*`)
-		case '?':
-			b.WriteString(`[^/]`)
-		case '[':
-			j := i + 1
-			if j < len(seg) && (seg[j] == '!' || seg[j] == '^') {
-				j++
-			}
-			if j < len(seg) && seg[j] == ']' {
-				j++
-			}
-			for j < len(seg) && seg[j] != ']' {
-				j++
-			}
-			if j >= len(seg) { // 未闭合 → 字面 '['
-				b.WriteString(`\[`)
-				break
-			}
-			cls := seg[i+1 : j]
-			if strings.HasPrefix(cls, "!") {
-				cls = "^" + cls[1:]
-			}
-			cls = strings.ReplaceAll(cls, `\`, `\\`)
-			b.WriteString("[")
-			b.WriteString(cls)
-			b.WriteString("]")
-			i = j
-		default:
-			b.WriteString(regexp.QuoteMeta(string(c)))
-		}
-	}
-	return b.String()
-}
-
-// match 判定单条规则是否匹配 rel（相对 root，'/' 分隔）。
-func (r Rule) match(rel string, isDir bool) bool {
-	if r.dirOnly && !isDir {
-		return false
-	}
-	sub := rel
-	if r.base != "" {
-		if !strings.HasPrefix(rel, r.base+"/") {
-			return false // 规则不适用于其来源目录本身及外部路径
-		}
-		sub = rel[len(r.base)+1:]
-	}
-	return r.re.MatchString(sub)
-}
-
-// matchesAny forced 规则中任一命中即忽略（不可反选）。
-func matchesAny(rules []Rule, rel string, isDir bool) bool {
-	for i := range rules {
-		if rules[i].match(rel, isDir) {
-			return true
-		}
-	}
-	return false
-}
-
-// lastMatch 从后往前取首个命中规则（= 有序列表中最后一条匹配）：
-// 命中负向规则 → 忽略；命中 '!' 规则 → 不忽略；无命中 → (false, false)。
-func lastMatch(rules []Rule, rel string, isDir bool) (ignored, matched bool) {
-	for i := len(rules) - 1; i >= 0; i-- {
-		if rules[i].match(rel, isDir) {
-			return !rules[i].negate, true
-		}
-	}
-	return false, false
-}
-
 // relOf root → p 的相对路径（'/' 分隔；root 自身 → ""）。
 func relOf(root, p string) string {
 	r, err := filepath.Rel(root, p)
@@ -514,28 +284,4 @@ func dirOf(rel string) string {
 		return rel[:i]
 	}
 	return ""
-}
-
-// normalizeRel 归一「相对 root」路径：'\\' → '/'，去首 '/' 与 './'，折叠 '.' 段与多余分隔；
-// "."（= root 自身）→ ""。
-func normalizeRel(rel string) string {
-	rel = strings.TrimSpace(rel)
-	rel = strings.ReplaceAll(rel, "\\", "/")
-	rel = path.Clean(strings.TrimPrefix(rel, "/"))
-	if rel == "." {
-		return ""
-	}
-	return rel
-}
-
-// ancestorDirs 返回 rel 的全部祖先目录（自浅至深，'/' 分隔；根 "" 不含）。
-// 例："a/b/c.go" → ["a", "a/b"]；"a" → nil。
-func ancestorDirs(rel string) []string {
-	var out []string
-	for i := 0; i < len(rel); i++ {
-		if rel[i] == '/' {
-			out = append(out, rel[:i])
-		}
-	}
-	return out
 }

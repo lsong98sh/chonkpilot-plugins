@@ -22,7 +22,7 @@ func parseOne(t *testing.T, line string) Rule {
 
 func matchOne(t *testing.T, line, rel string, isDir bool) bool {
 	t.Helper()
-	return parseOne(t, line).match(rel, isDir)
+	return parseOne(t, line).Match(rel, isDir)
 }
 
 func writeFileT(t *testing.T, path, content string) {
@@ -92,7 +92,7 @@ func TestParseEscapes(t *testing.T) {
 	}
 	// '!' 取反：取消忽略
 	r := parseOne(t, "!keep.log")
-	if !r.negate || r.match("keep.log", false) == false {
+	if !r.Negate() || r.Match("keep.log", false) == false {
 		t.Error("'!keep.log' 应为取反规则且匹配 keep.log")
 	}
 	// 行尾空格忽略；`\ ` 保留为字面空格
