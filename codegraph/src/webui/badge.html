@@ -7,8 +7,9 @@
   <link rel="stylesheet" href="/shared/ck-theme.css" />
   <link rel="stylesheet" href="/themes.css" />
   <script src="/shared/ck-theme.js"></script>
-  <!-- 受控 mq 入口（宿主在 iframe load 后注入 on/off/emit）→ 点击开完整状态页 -->
-  <script src="/shared/ck-mq.js"></script>
+  <!-- 受控 mq 入口（PLUGIN-UI-1 / 2026-10-30）：ckMq 由宿主窗口挂载，插件页注册自己（路由键 = 本 frame 的 window）。
+       非宿主子 frame（直接打开页面）时 `new()` 会抛错——降级选 A（不兜底），由插件自己决定是否退避。 -->
+  <script>var ckMq = window.top.ckMq.new(window);</script>
   <style>
     /* 栏内紧凑徽标（PLUGIN-UI-2）：固定 200×20，透明底、不滚动、单行省略。 */
     html, body { margin: 0; padding: 0; background: transparent; overflow: hidden; }
