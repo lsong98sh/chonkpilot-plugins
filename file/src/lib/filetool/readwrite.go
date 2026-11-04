@@ -9,6 +9,7 @@ import (
 
 	"github.com/lsong98sh/chonkpilot-plugins/file/lib/cli"
 	"github.com/lsong98sh/chonkpilot-plugins/file/lib/fileops"
+	"github.com/lsong98sh/chonkpilot-util/encodingx"
 )
 
 // maxFullReadBytes 全文读取上限（超过只允许 infoOnly / tail / start+limit）。
@@ -363,28 +364,25 @@ func writeOne(path string, t map[string]any) map[string]any {
 
 // autoEncodeNameOf 检测已有文件的编码名（用于 encoding=auto 的原编码回写）。
 func autoEncodeNameOf(data []byte) string {
-	if _, ok := utf16OrderOf(data); ok {
-		if data[0] == 0xFE && data[1] == 0xFF {
-			return "utf-16be"
-		}
-		return "utf-16le"
+	switch encodingx.BOMName(data) {
+	case encodingx.UTF16LE:
+		return encodingx.UTF16LE
+	case encodingx.UTF16BE:
+		return encodingx.UTF16BE
 	}
 	if looksLikeUTF8(data) {
-		return "utf-8"
+		return encodingx.UTF8
 	}
 	det := detectEncoding(data)
 	if det.Encoding != "" && det.Confidence != "low" {
 		return normalizeEncoding(det.Encoding)
 	}
-	return "utf-8"
+	return encodingx.UTF8
 }
 
 // hasBOM 判断数据是否带 BOM。
 func hasBOM(data []byte) bool {
-	if _, ok := utf16OrderOf(data); ok {
-		return true
-	}
-	return len(data) >= 3 && data[0] == 0xEF && data[1] == 0xBB && data[2] == 0xBF
+	return encodingx.BOMName(data) != ""
 }
 
 // encodeWithEncoding 按编码编码并控制 BOM。
@@ -398,11 +396,7 @@ func encodeWithEncoding(s, encName string, wantBOM bool) ([]byte, bool, error) {
 		return b, false, nil
 	}
 	if n == "utf-16le" || n == "utf-16be" {
-		order := unicodeLE
-		if n == "utf-16be" {
-			order = unicodeBE
-		}
-		b, err := encodeUTF16(s, order, wantBOM)
+		b, err := encodeUTF16(s, n, wantBOM)
 		return b, wantBOM, err
 	}
 	b, err := encodeByName(s, n)

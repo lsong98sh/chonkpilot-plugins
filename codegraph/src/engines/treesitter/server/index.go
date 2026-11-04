@@ -9,8 +9,8 @@ import (
 	"strings"
 	"time"
 
-	ignore "github.com/lsong98sh/chonkpilot-plugins/shared/ignore"
 	"github.com/lsong98sh/chonkpilot-util/extx"
+	ignore "github.com/lsong98sh/chonkpilot-util/ignore"
 )
 
 var maxFileBytes = 8 << 20 // 8MB
@@ -163,11 +163,12 @@ func (w *Workspace) collectSourceFiles() ([]srcEntry, error) {
 
 func (w *Workspace) parseEntry(e srcEntry) (*FileInfo, error) {
 	abs := filepath.FromSlash(joinPath(w.Dir, e.path))
-	src, err := os.ReadFile(abs)
+	raw, err := os.ReadFile(abs)
 	if err != nil {
 		return nil, err
 	}
-	fi, err := parseFile(e.lang, e.path, src)
+	// 交给 tree-sitter 前统一转 UTF-8（编码识别实现 = chonkpilot-util/encodingx）。
+	fi, err := parseFile(e.lang, e.path, indexSource(raw))
 	if err != nil {
 		return nil, err
 	}

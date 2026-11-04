@@ -19,9 +19,9 @@ import (
 	"strings"
 	"time"
 
+	"github.com/lsong98sh/chonkpilot-plugin-framework/sdk"
 	codegraph "github.com/lsong98sh/chonkpilot-plugins/codegraph/engines/treesitter/server"
 	vfts "github.com/lsong98sh/chonkpilot-plugins/codegraph/engines/vfts/server"
-	"github.com/lsong98sh/chonkpilot-plugin-framework/sdk"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
@@ -57,13 +57,21 @@ func main() {
 	}
 	defer p.Close()
 
+	// 配置面（PLUGIN-UI-1 第三段）：`load` / `save` 动作 + 一次性键迁移 + 配置变化下发引擎。
+	// 先建（MCP 工具注册时 vfts_query 需要它解析 workdir 与会话 id）。
+	cfg := newConfigManager(p)
+
 	p.OnMCPServer(func(srv *mcp.Server) error {
 		if err := codegraph.RegisterTools(srv); err != nil {
 			return fmt.Errorf("codegraph 注册失败: %w", err)
 		}
-		if err := vfts.RegisterTools(srv); err != nil {
+		// 管理工具（hot=false）由引擎原样注册（带 workdir，LLM 不可见）；
+		// vfts_query 由插件自己注册 —— 工具表面**不带 workdir**（2B §3.5），由插件按
+		// `_meta.chonkpilot.work_dir` 注入。
+		if err := vfts.RegisterManagementTools(srv); err != nil {
 			return fmt.Errorf("vfts 注册失败: %w", err)
 		}
+		registerVftsQuery(srv, cfg)
 		return nil
 	})
 	p.MCPHot(hotTools...)
@@ -90,9 +98,6 @@ func main() {
 		return map[string]any{"ok": true}, nil
 	})
 	// 配置面（PLUGIN-UI-1 第三段）：`load` / `save` 动作 + 一次性键迁移 + 配置变化下发引擎。
-	cfg := newConfigManager(p)
-
-	// 配置页直调引擎管理工具（codegraph_status / codegraph_initialize / vfts_status / vfts_index …）。
 	// 注意：配置写入口**不在此**——配置统一走 `load` / `save` 动作（prj 键为唯一源，见 config.go）。
 	p.OnRequest("tool.call", func(ctx context.Context, payload map[string]any) (any, error) {
 		name, _ := payload["name"].(string)
@@ -109,7 +114,7 @@ func main() {
 			// PLUGIN-UI-2：不再回写 `*.status` 运行时键（宿主零引用）——状态经本插件 `status` /
 			// `badge` 动作现取。
 			if wd, ok := args["workdir"].(string); ok && name == "vfts_index" {
-				writeVftsManifest(cfg.logf, wd, out)
+				writeVftsManifest(cfg.logfFor(wd), wd, out)
 			}
 		}
 		return out, err
@@ -136,6 +141,54 @@ func main() {
 			cfg.migrateAll(ctx)
 		}()
 	})
+
+	// 工作区变更 → 自动重建索引（G-84，2026-10-31：D-71 后内嵌 hook 退场，改由插件自管）。
+	// 订阅 `filesys.changed`（编辑文件）/ `session-complete`（轮末同步）→ 按该 workdir 的
+	// **已保存配置**去抖全量重建启用中的引擎（零新增消息主题，61 不变）。
+	onWorkdirPayload := func(payload []byte) {
+		var m map[string]any
+		if json.Unmarshal(payload, &m) != nil {
+			return
+		}
+		wd := pluginsdk.Str(m["work_dir"])
+		if wd == "" {
+			return
+		}
+		go cfg.onWorkspaceEvent(context.Background(), wd, "")
+	}
+	p.Subscribe("filesys.changed", func(_ context.Context, _ string, payload []byte) {
+		onWorkdirPayload(payload)
+	})
+	p.Subscribe("session-complete", func(_ context.Context, _ string, payload []byte) {
+		onWorkdirPayload(payload)
+		// 会话内容索引（SESSION-FTS）：轮末增量写该轮消息（主会话才处理；去抖合并）。
+		cfg.sessions.onSessionComplete(payload)
+	})
+	// `vfts.session.query` / `vfts.session.reindex`（2B §3.5 / 61 §4.3 点分直通）：
+	// 会话内查找（同步回执）与全量重建（立即回执，后台逐会话执行）。
+	p.OnRequest("vfts.session.query", func(ctx context.Context, payload map[string]any) (any, error) {
+		return cfg.sessions.handleSessionQuery(ctx, payload)
+	})
+	p.OnRequest("vfts.session.reindex", func(ctx context.Context, payload map[string]any) (any, error) {
+		return cfg.sessions.handleSessionReindex(ctx, payload)
+	})
+	// `vfts.reindex`（61 §4.3）：手动全量重建 vfts。**立即回执** `{ok, started:true}`，
+	// 重建在后台去抖合并；缺省 instance_id → 全部已登记 workdir。
+	p.OnRequest("vfts.reindex", func(_ context.Context, payload map[string]any) (any, error) {
+		inst := strings.TrimSpace(pluginsdk.Str(payload["instance_id"]))
+		if inst != "" {
+			go cfg.onWorkspaceEvent(context.Background(), cfg.workdirOf(inst), "vfts")
+		} else {
+			for _, wd := range cfg.allWorkdirs() {
+				go cfg.onWorkspaceEvent(context.Background(), wd, "vfts")
+			}
+		}
+		return map[string]any{"ok": true, "started": true}, nil
+	})
+
+	// 会话内容索引的**后台对账同步**（D-74，2026-11-04）：零新增 MQ —— 单协程低优先级，
+	// 启动后延迟首轮、之后定期核对「漏索引 / 已删除 / 内容变更（sha256 指纹）」并当场修差异。
+	cfg.sessions.startReconcileLoop(context.Background())
 
 	if err := p.Run(context.Background()); err != nil {
 		slog.Error("codegraph: 运行结束", "err", err)

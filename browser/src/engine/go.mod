@@ -4,15 +4,14 @@ go 1.26.0
 
 require (
 	github.com/jchv/go-webview2 v0.0.0
-	github.com/lsong98sh/chonkpilot-plugins/shared v0.0.0
+	github.com/lsong98sh/chonkpilot-plugin-framework v0.1.1
+	github.com/lsong98sh/chonkpilot-util v0.0.0
 )
 
 require (
 	github.com/jchv/go-winloader v0.0.0-20250406163304-c1995be93bd1 // indirect
 	golang.org/x/sys v0.41.0 // indirect
 )
-
-replace github.com/lsong98sh/chonkpilot-plugins/shared => ../../../shared
 
 // WebView2 绑定 = 独立 fork 仓 `chonkpilot-webview2`（唯一源；2026-10-30 删除插件仓
 // third_party 内嵌副本）。该 fork 提供 EvalWithResult / Screenshot / DevTools / ScriptEval

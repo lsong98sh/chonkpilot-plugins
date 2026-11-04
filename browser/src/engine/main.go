@@ -22,9 +22,9 @@ import (
 	"os/signal"
 	"path/filepath"
 
+	"github.com/lsong98sh/chonkpilot-plugin-framework/sdk/enginehost"
 	"github.com/lsong98sh/chonkpilot-plugins/browser/engine/internal/browserplugin"
-	"github.com/lsong98sh/chonkpilot-plugins/shared/pluginhost"
-	"github.com/lsong98sh/chonkpilot-plugins/shared/trayconsole"
+	"github.com/lsong98sh/chonkpilot-util/trayconsole"
 )
 
 func main() { os.Exit(run()) }
@@ -37,10 +37,11 @@ func run() int {
 	logger := buildLogger()
 	logf := func(format string, args ...any) { logger.Info(fmt.Sprintf(format, args...)) }
 
-	srv := pluginhost.New(pluginhost.Options{
+	srv := enginehost.New(enginehost.Options{
 		SocketPath: *socket,
+		EngineName: "webview2",
 		Logf:       logf,
-		NewEngine: func(opts pluginhost.ContextOptions) (pluginhost.Engine, error) {
+		NewEngine: func(opts enginehost.ContextOptions) (enginehost.Engine, error) {
 			if *debug {
 				opts.Debug = true
 			}

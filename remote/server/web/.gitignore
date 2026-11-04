@@ -1,0 +1,5 @@
+node_modules/
+.vite/
+
+# 本目录 dist 是 Server go:embed 的必要产物，需随源码入库（上级 .gitignore 的 dist/ 在此例外）
+!dist/

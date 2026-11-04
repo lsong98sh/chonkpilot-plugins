@@ -16,6 +16,9 @@ import (
 	"testing"
 
 	"github.com/lsong98sh/chonkpilot-plugins/codegraph/engines/vfts/third_party/jieba"
+	"golang.org/x/text/encoding/simplifiedchinese"
+	"golang.org/x/text/encoding/unicode"
+	"golang.org/x/text/transform"
 )
 
 func writeText(t *testing.T, dir, name, content string) {
@@ -285,5 +288,58 @@ func TestSystemDictMaterializeAndTools(t *testing.T) {
 	}
 	if wc := got2.(map[string]any)["word_count"]; wc != 2 {
 		t.Fatalf("词条数应为 2（注释/空行不计）：got=%v", wc)
+	}
+}
+
+// TestIndexLegacyEncodedText：编码识别接入索引链路——
+// GBK 与 UTF-16LE(BOM) 文本先转 UTF-8 再切块，中文词应能检索命中（此前 GBK 切出乱码、UTF-16 被当二进制跳过）。
+func TestIndexLegacyEncodedText(t *testing.T) {
+	dir := t.TempDir()
+	gbkText := "全文检索 索引分词 中文编码\n"
+	gbk, _, err := transform.Bytes(simplifiedchinese.GBK.NewEncoder(), []byte(gbkText))
+	if err != nil {
+		t.Fatalf("gbk encode: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "gbk.txt"), gbk, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	u16Text := "配置文件 读取 服务\n"
+	u16, _, err := transform.Bytes(unicode.UTF16(unicode.LittleEndian, unicode.UseBOM).NewEncoder(), []byte(u16Text))
+	if err != nil {
+		t.Fatalf("utf16 encode: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "u16.txt"), u16, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	w, err := Open(dir)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer func() { Drop(dir); CloseAll() }()
+
+	res, err := w.Initialize(nil, nil, nil)
+	if err != nil {
+		t.Fatalf("initialize: %v", err)
+	}
+	if res.Added != 2 {
+		t.Fatalf("应索引 2 文件（GBK + UTF-16 均不再被跳过）：%+v", res)
+	}
+	for _, f := range res.Indexed {
+		if len(f.DocIDs) == 0 {
+			t.Fatalf("%s 应有块：%+v", f.Path, f)
+		}
+	}
+
+	for _, c := range []struct{ query, path string }{
+		{"检索", "gbk.txt"},
+		{"全文", "gbk.txt"},
+		{"配置", "u16.txt"},
+		{"读取", "u16.txt"},
+	} {
+		hits, err := w.Query(c.query, "", 20, c.path)
+		if err != nil || len(hits) != 1 {
+			t.Fatalf("中文词 %q 应在 %s 命中 1 处：hits=%d err=%v", c.query, c.path, len(hits), err)
+		}
 	}
 }

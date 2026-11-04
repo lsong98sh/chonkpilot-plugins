@@ -20,9 +20,9 @@ import (
 	"os/signal"
 	"path/filepath"
 
+	"github.com/lsong98sh/chonkpilot-plugin-framework/sdk/enginehost"
 	"github.com/lsong98sh/chonkpilot-plugins/desktop/engine/internal/desktopplugin"
-	"github.com/lsong98sh/chonkpilot-plugins/shared/pluginhost"
-	"github.com/lsong98sh/chonkpilot-plugins/shared/trayconsole"
+	"github.com/lsong98sh/chonkpilot-util/trayconsole"
 )
 
 func main() { os.Exit(run()) }
@@ -34,8 +34,9 @@ func run() int {
 	logger := buildLogger()
 	logf := func(format string, args ...any) { logger.Info(fmt.Sprintf(format, args...)) }
 
-	srv := pluginhost.New(pluginhost.Options{
+	srv := enginehost.New(enginehost.Options{
 		SocketPath: *socket,
+		EngineName: "win32",
 		Logf:       logf,
 		NewEngine:  desktopplugin.New,
 	})

@@ -1,0 +1,162 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>远程接入设置</title>
+  <link rel="stylesheet" href="/shared/ck-theme.css" />
+  <link rel="stylesheet" href="/themes.css" />
+  <script src="/shared/ck-theme.js"></script>
+  <style>
+    body { margin: 0; padding: 16px 18px; font: 13px/1.5 var(--ck-font-sans); color: var(--ck-text); background: var(--ck-bg); }
+    h1 { font-size: 16px; margin: 0 0 4px; }
+    p.sub { margin: 0 0 16px; color: var(--ck-text-muted); font-size: 12px; }
+    .card { border: 1px solid var(--ck-border); border-radius: 8px; padding: 14px; margin-bottom: 14px; }
+    .row { display: flex; flex-direction: column; gap: 6px; margin-bottom: 12px; }
+    label { font-weight: 600; font-size: 12px; }
+    input[type=text], input[type=password] {
+      width: 100%; box-sizing: border-box; padding: 7px 9px; border: 1px solid var(--ck-border);
+      border-radius: 6px; font: inherit; background: transparent; color: inherit;
+    }
+    .hint { color: var(--ck-text-muted); font-size: 11px; overflow-wrap: anywhere; }
+    .actions { display: flex; gap: 8px; flex-wrap: wrap; }
+    button { padding: 6px 12px; border-radius: 6px; border: 1px solid var(--ck-border); background: var(--ck-surface); color: inherit; font: inherit; cursor: pointer; }
+    button.primary { background: var(--ck-accent); border-color: var(--ck-accent); color: var(--ck-accent-fg); }
+    .msg { font-size: 12px; white-space: pre-wrap; overflow-wrap: anywhere; margin-top: 8px; }
+    .msg.err { color: var(--ck-danger); } .msg.ok { color: var(--ck-success); }
+    .status { font-weight: 600; }
+    .status.connected { color: var(--ck-success); }
+    .status.error { color: var(--ck-danger); }
+    .status.connecting { color: var(--ck-warning, #d08b00); }
+  </style>
+</head>
+<body>
+  <h1>远程接入设置</h1>
+  <p class="sub">Remote 插件配置（用户级插件配置）。保存后立即用新配置重连；密码不回显。</p>
+
+  <div class="card">
+    <div class="row">
+      <label for="f_serverUrl">服务器地址</label>
+      <input id="f_serverUrl" type="text" autocomplete="off" placeholder="wss://host/tunnel（也接受 ws://）" />
+      <div class="hint">Remote Server 的隧道地址，例如 wss://example.com/tunnel</div>
+    </div>
+    <div class="row">
+      <label for="f_username">用户名</label>
+      <input id="f_username" type="text" autocomplete="off" placeholder="Remote Server 账号" />
+    </div>
+    <div class="row">
+      <label for="f_password">密码</label>
+      <input id="f_password" type="password" autocomplete="new-password" placeholder="留空 = 保持原密码" />
+      <div class="hint" id="pwHint">未设置密码</div>
+    </div>
+    <div class="actions">
+      <button class="primary" id="save">保存</button>
+      <button id="test">测试连接</button>
+      <button id="reset">恢复默认</button>
+      <button id="refresh">刷新状态</button>
+    </div>
+    <div class="msg" id="msg"></div>
+  </div>
+
+  <div class="card">
+    <div class="row">
+      <label>连接状态</label>
+      <div class="status" id="status">-</div>
+      <div class="hint" id="statusDetail"></div>
+    </div>
+  </div>
+
+  <script src="/plugin-ui/_sdk/plugin.js"></script>
+  <script>
+    var STATE_TEXT = { connected: '已连接', connecting: '连接中', unconfigured: '未配置', error: '异常' };
+    var msgEl = document.getElementById('msg');
+
+    function show(text, err) {
+      msgEl.textContent = text || '';
+      msgEl.className = 'msg ' + (text ? (err ? 'err' : 'ok') : '');
+    }
+
+    async function api(action, payload) {
+      var res = await fetch('/plugins/remote/api/' + encodeURIComponent(action), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-CK-Plugin-Id': 'remote' },
+        body: JSON.stringify(payload || {}),
+      });
+      var body = null;
+      try { body = await res.json(); } catch (_) { /* 非 JSON */ }
+      if (!res.ok) {
+        var errors = (body && Array.isArray(body.errors) && body.errors) || ['HTTP ' + res.status];
+        throw new Error(errors.join('; '));
+      }
+      return body;
+    }
+
+    function renderStatus(v) {
+      var state = (v && v.state) || 'unconfigured';
+      var el = document.getElementById('status');
+      el.textContent = STATE_TEXT[state] || state;
+      el.className = 'status ' + state;
+      document.getElementById('statusDetail').textContent = (v && v.detail) || '';
+    }
+
+    async function load() {
+      try {
+        var r = await api('load', {});
+        var values = r.values || {};
+        document.getElementById('f_serverUrl').value = values.serverUrl || '';
+        document.getElementById('f_username').value = values.username || '';
+        document.getElementById('f_password').value = '';
+        document.getElementById('pwHint').textContent = r.hasPassword ? '已设置密码（留空则不修改）' : '未设置密码';
+        show('');
+        await refresh();
+      } catch (e) { show('读取失败: ' + e.message, true); }
+    }
+
+    async function refresh() {
+      try {
+        var v = await api('status', {});
+        renderStatus(v);
+      } catch (e) { show('读取状态失败: ' + e.message, true); }
+    }
+
+    function collect() {
+      return {
+        serverUrl: document.getElementById('f_serverUrl').value,
+        username: document.getElementById('f_username').value,
+        password: document.getElementById('f_password').value,
+      };
+    }
+
+    document.getElementById('save').onclick = async function () {
+      try {
+        var r = await api('save', { entries: collect() });
+        show('已保存：' + ((r && r.keys) || []).join(', '));
+        document.getElementById('f_password').value = '';
+        await load();
+      } catch (e) { show('保存失败: ' + e.message, true); }
+    };
+
+    document.getElementById('test').onclick = async function () {
+      try {
+        var r = await api('test', collect());
+        show('测试连接成功：' + ((r && r.detail) || 'ok'));
+      } catch (e) { show('测试连接失败: ' + e.message, true); }
+    };
+
+    document.getElementById('reset').onclick = async function () {
+      try { await api('reset', {}); await load(); show('已恢复默认'); }
+      catch (e) { show('恢复失败: ' + e.message, true); }
+    };
+
+    document.getElementById('refresh').onclick = refresh;
+
+    try {
+      ckPlugin.onEvent(function (_topic, payload) {
+        if (payload && payload.kind === 'remote-status') renderStatus(payload);
+      });
+    } catch (_) { /* 无 event 通道 */ }
+
+    load();
+  </script>
+</body>
+</html>

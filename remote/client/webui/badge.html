@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>远程接入</title>
+  <link rel="stylesheet" href="/shared/ck-theme.css" />
+  <link rel="stylesheet" href="/themes.css" />
+  <script src="/shared/ck-theme.js"></script>
+  <script>var ckMq = window.top.ckMq.new(window);</script>
+  <style>
+    html, body { margin: 0; padding: 0; background: transparent; overflow: hidden; }
+    body {
+      width: 104px; height: 20px; display: flex; align-items: center; gap: 5px;
+      padding: 0 6px; box-sizing: border-box; font: 11px/20px var(--ck-font-sans);
+      color: var(--ck-text-muted); white-space: nowrap; cursor: pointer; user-select: none;
+    }
+    body:hover { color: var(--ck-text); }
+    .dot { width: 6px; height: 6px; border-radius: 50%; flex-shrink: 0; background: var(--ck-border); }
+    body.state-connected .dot { background: var(--ck-ok, #27ae60); }
+    body.state-connecting .dot { background: var(--ck-warning, #d08b00); }
+    body.state-error .dot { background: var(--ck-danger, #c0392b); }
+    .txt { overflow: hidden; text-overflow: ellipsis; }
+  </style>
+</head>
+<body id="badge" title="远程接入（点击查看设置）">
+  <span class="dot"></span><span class="txt" id="txt">远程 未配置</span>
+  <script src="/plugin-ui/_sdk/plugin.js"></script>
+  <script>
+    (function () {
+      var box = document.getElementById('badge');
+      var txt = document.getElementById('txt');
+      var instanceId = new URLSearchParams(location.search).get('instance_id') || '';
+      var STATE_TEXT = { connected: '已连接', connecting: '连接中', unconfigured: '未配置', error: '异常' };
+
+      function render(v) {
+        var state = (v && v.state) || 'unconfigured';
+        box.className = 'state-' + state;
+        box.setAttribute('data-state', state);
+        txt.textContent = '远程 ' + (STATE_TEXT[state] || state);
+        if (v && v.detail) box.title = '远程接入：' + v.detail;
+      }
+
+      async function refresh() {
+        try {
+          var r = await ckPlugin.call('rpc', { method: 'badge', params: { instance_id: instanceId } });
+          var v = r && Object.prototype.hasOwnProperty.call(r, 'result') ? r.result : r;
+          render(v);
+        } catch (e) {
+          box.setAttribute('data-err', String((e && e.message) || e));
+          txt.textContent = '远程 -';
+        }
+      }
+
+      box.addEventListener('click', function () {
+        try {
+          ckMq.emit('preview-tab-open', { kind: 'plugin-page', plugin: 'remote', page: 'config', title: '远程接入' });
+        } catch (e) { /* 独立打开 → 无动作 */ }
+      });
+
+      try {
+        ckPlugin.onEvent(function (_topic, payload) {
+          if (payload && payload.kind === 'remote-status') render(payload);
+        });
+      } catch (e) { /* 无 event 通道 */ }
+
+      refresh();
+    })();
+  </script>
+</body>
+</html>

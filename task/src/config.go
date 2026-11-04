@@ -38,13 +38,12 @@ const (
 	KeyMaxOutputKB       = "plugins.task.max-output-kb"
 	KeyStatusLimit       = "plugins.task.status-limit"
 
-	// 解释器路径（2026-10-28 P2-3：原宿主 pythonPath/nodePath/javaPath/goPath/rustPath
-	// 收归 task 插件；解析顺序 = interpreter 参数 > 本配置 > CHONKPILOT_INTERPRETERS > 系统默认）。
+	// 解释器路径（2026-10-28 P2-3：原宿主 pythonPath/nodePath/javaPath 收归 task 插件；
+	// 解析顺序 = interpreter 参数 > 本配置 > CHONKPILOT_INTERPRETERS > 系统默认）。
+	// 2026-10-31 审查：移除 go/rust 两项 —— scriptrun 白名单不含这两个 runtime，配置无法生效。
 	KeyInterpreterPython = "plugins.task.interpreter-python"
 	KeyInterpreterNode   = "plugins.task.interpreter-node"
 	KeyInterpreterJava   = "plugins.task.interpreter-java"
-	KeyInterpreterGo     = "plugins.task.interpreter-go"
-	KeyInterpreterRust   = "plugins.task.interpreter-rust"
 )
 
 // 校验区间（与旧 manifest 声明一致）。
@@ -61,7 +60,7 @@ const (
 // allKeys 是本插件的用户配置键全集（稳定序；load 恒回显这些键的有效值）。
 var allKeys = []string{
 	KeyDefaultTimeoutSec, KeyDefaultCwd, KeyShell, KeyMaxOutputKB, KeyStatusLimit,
-	KeyInterpreterPython, KeyInterpreterNode, KeyInterpreterJava, KeyInterpreterGo, KeyInterpreterRust,
+	KeyInterpreterPython, KeyInterpreterNode, KeyInterpreterJava,
 }
 
 // legacyKeyMap 旧宿主键 → 新命名空间键（**迁移专用**；除 migrateLocked 外不得读旧键）。
@@ -74,8 +73,6 @@ var legacyKeyMap = []struct{ Old, New string }{
 	{"pythonPath", KeyInterpreterPython},
 	{"nodePath", KeyInterpreterNode},
 	{"javaPath", KeyInterpreterJava},
-	{"goPath", KeyInterpreterGo},
-	{"rustPath", KeyInterpreterRust},
 }
 
 // configFields 是配置页字段声明（页面据 type/min/max/secret 动态渲染）。
@@ -88,8 +85,6 @@ var configFields = []fieldSpec{
 	{Key: KeyInterpreterPython, Type: "string", Label: "python 解释器（runtime=python；绝对路径或命令名）"},
 	{Key: KeyInterpreterNode, Type: "string", Label: "node 解释器（runtime=js；绝对路径或命令名）"},
 	{Key: KeyInterpreterJava, Type: "string", Label: "java 解释器（runtime=java；绝对路径或命令名）"},
-	{Key: KeyInterpreterGo, Type: "string", Label: "go 解释器（预留：暂无 go runtime）"},
-	{Key: KeyInterpreterRust, Type: "string", Label: "rust 解释器（预留：暂无 rust runtime）"},
 }
 
 // fieldSpec 是配置页字段（JSON 形状与旧 manifest config.fields 兼容）。
@@ -115,8 +110,6 @@ type settings struct {
 	PythonPath string
 	NodePath   string
 	JavaPath   string
-	GoPath     string
-	RustPath   string
 }
 
 // defaultSettings 缺键兜底（与实际生效值一致）。
@@ -141,8 +134,6 @@ func settingsOf(values map[string]string) settings {
 	s.PythonPath = strings.TrimSpace(values[KeyInterpreterPython])
 	s.NodePath = strings.TrimSpace(values[KeyInterpreterNode])
 	s.JavaPath = strings.TrimSpace(values[KeyInterpreterJava])
-	s.GoPath = strings.TrimSpace(values[KeyInterpreterGo])
-	s.RustPath = strings.TrimSpace(values[KeyInterpreterRust])
 	return s
 }
 
@@ -157,8 +148,6 @@ func (s settings) values() map[string]string {
 		KeyInterpreterPython: s.PythonPath,
 		KeyInterpreterNode:   s.NodePath,
 		KeyInterpreterJava:   s.JavaPath,
-		KeyInterpreterGo:     s.GoPath,
-		KeyInterpreterRust:   s.RustPath,
 	}
 }
 
@@ -177,12 +166,6 @@ func (s settings) interpreterMap() map[string]string {
 	}
 	if s.JavaPath != "" {
 		m["java"] = s.JavaPath
-	}
-	if s.GoPath != "" {
-		m["go"] = s.GoPath
-	}
-	if s.RustPath != "" {
-		m["rust"] = s.RustPath
 	}
 	return m
 }
@@ -498,7 +481,7 @@ func normalizeValue(key string, raw any) (string, error) {
 			return "", fmt.Errorf("config_invalid: %s 必须是绝对路径（收到 %q）", key, s)
 		}
 		return filepath.Clean(s), nil
-	case KeyInterpreterPython, KeyInterpreterNode, KeyInterpreterJava, KeyInterpreterGo, KeyInterpreterRust:
+	case KeyInterpreterPython, KeyInterpreterNode, KeyInterpreterJava:
 		return normalizeInterpPath(key, raw)
 	case KeyShell:
 		s := strings.TrimSpace(pluginsdk.Str(raw))

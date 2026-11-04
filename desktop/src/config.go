@@ -375,6 +375,10 @@ func normalizeValue(key string, raw any) (string, error) {
 		if strings.ContainsRune(s, 0) {
 			return "", fmt.Errorf("config_invalid: %s 含非法字符 NUL", key)
 		}
+		// 相对路径会被引擎按进程 cwd 解析（不可预期）→ 只接受绝对路径 / ~/。
+		if s != "" && !filepath.IsAbs(s) && !strings.HasPrefix(s, "~/") && !strings.HasPrefix(s, `~\`) {
+			return "", fmt.Errorf("config_invalid: %s 必须是绝对路径或以 ~/ 开头（收到 %q）", key, s)
+		}
 		return s, nil
 	}
 	return "", fmt.Errorf("config_invalid: 未知配置键 %s", key)

@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>定时任务</title>
+  <link rel="stylesheet" href="/shared/ck-theme.css" />
+  <link rel="stylesheet" href="/themes.css" />
+  <script src="/shared/ck-theme.js"></script>
+  <script>var ckMq = window.top.ckMq.new(window);</script>
+  <style>
+    html, body { margin: 0; padding: 0; background: transparent; overflow: hidden; }
+    body {
+      width: 96px; height: 20px; display: flex; align-items: center; gap: 5px;
+      padding: 0 6px; box-sizing: border-box; font: 11px/20px var(--ck-font-sans);
+      color: var(--ck-text-muted); white-space: nowrap; cursor: pointer; user-select: none;
+    }
+    body:hover { color: var(--ck-text); }
+    .dot { width: 6px; height: 6px; border-radius: 50%; flex-shrink: 0; background: var(--ck-border); }
+    body.has-task .dot { background: var(--ck-ok, #27ae60); }
+    .txt { overflow: hidden; text-overflow: ellipsis; }
+  </style>
+</head>
+<body id="badge" title="定时任务（点击查看）">
+  <span class="dot"></span><span class="txt" id="txt">定时 0</span>
+  <script src="/plugin-ui/_sdk/plugin.js"></script>
+  <script>
+    (function () {
+      var box = document.getElementById('badge');
+      var txt = document.getElementById('txt');
+      var instanceId = new URLSearchParams(location.search).get('instance_id') || '';
+
+      function render(v) {
+        var n = (v && v.count) || 0;
+        var on = (v && v.enabled) || 0;
+        txt.textContent = '定时 ' + n + (n ? '（' + on + '）' : '');
+        box.classList.toggle('has-task', n > 0);
+        box.setAttribute('data-count', String(n));
+      }
+
+      async function refresh() {
+        try {
+          var r = await ckPlugin.call('rpc', { method: 'badge', params: { instance_id: instanceId } });
+          var v = r && Object.prototype.hasOwnProperty.call(r, 'result') ? r.result : r;
+          render(v);
+        } catch (e) {
+          box.setAttribute('data-err', String((e && e.message) || e));
+          txt.textContent = '定时 -';
+        }
+      }
+
+      box.addEventListener('click', function () {
+        try {
+          ckMq.emit('preview-tab-open', { kind: 'plugin-page', plugin: 'crontab', page: 'tasks', title: '定时任务' });
+        } catch (e) { /* 独立打开 → 无动作 */ }
+      });
+
+      try {
+        ckPlugin.onEvent(function (topic, payload) {
+          if (payload && payload.kind === 'crontab-changed') render({ count: payload.count, enabled: payload.enabled });
+        });
+      } catch (e) { /* 无 event 通道 */ }
+
+      refresh();
+    })();
+  </script>
+</body>
+</html>

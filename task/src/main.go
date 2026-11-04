@@ -8,7 +8,7 @@
 //
 // 契约源（2026-10-28 P2-3）：本仓 `task/tools/task/*.tool.md`，经 `//go:embed` 打进插件二进制
 // （**不**放主仓 `capability/`，也不依赖宿主扫描；本插件自己是 MCP server）。
-// 执行实现：`task/lib/scriptrun`（由主仓 `mcp-tools/internal/scriptrun` 迁入）。
+// 执行实现：`chonkpilot-util/scriptrun`（2026-10-31 由本插件 lib 上收 util）。
 //
 // 配置（插件自身，不分四级）：默认超时 / 默认工作目录 / shell / 输出上限 / 解释器路径。
 package main
@@ -25,9 +25,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/chonkpilot/chonkpilot-task-plugin/lib/scriptrun"
 	"github.com/lsong98sh/chonkpilot-plugin-framework/contract"
 	"github.com/lsong98sh/chonkpilot-plugin-framework/sdk"
+	"github.com/lsong98sh/chonkpilot-util/scriptrun"
 )
 
 const pluginVersion = "1.0.0"
@@ -201,6 +201,8 @@ func (t *taskPlugin) run(ctx context.Context, args map[string]any, cx pluginsdk.
 		Interpreters: cfg.interpreterMap(),
 		Timeout:      time.Duration(timeout) * time.Second,
 		MaxOutput:    maxKB << 10,
+		// C5（2026-11-03）：进程级写隔离（Low IL + Job），白名单来自 `_meta.chonkpilot.sandbox`。
+		Sandbox: sandboxOptions(cx, cwd),
 	})
 	if err != nil {
 		return nil, err

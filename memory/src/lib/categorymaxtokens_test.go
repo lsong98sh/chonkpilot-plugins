@@ -57,7 +57,8 @@ func TestCategoryMaxTokensWarnsNotTruncates(t *testing.T) {
 		return map[string]any{"list": map[string]any{
 			memoryEnabledKey:           "true",
 			memoryMinTokensKey:         "1",
-			memoryCategoryMaxTokensKey: "1", // 极小阈值 → 必然超限
+			memoryTriggerKey:           "every-turn", // 验证轮末沉淀路径（默认 compress 不提取）
+			memoryCategoryMaxTokensKey: "1",          // 极小阈值 → 必然超限
 		}}
 	})
 	reply(t, bus, sessionLoadSubject, func(map[string]any) map[string]any {

@@ -8,18 +8,11 @@
 package fileops
 
 import (
-	"bytes"
 	"encoding/base64"
 	"strings"
-	"unicode/utf8"
 
+	"github.com/lsong98sh/chonkpilot-util/encodingx"
 	"github.com/lsong98sh/chonkpilot-util/textx"
-	"golang.org/x/text/encoding/japanese"
-	"golang.org/x/text/encoding/korean"
-	"golang.org/x/text/encoding/simplifiedchinese"
-	"golang.org/x/text/encoding/traditionalchinese"
-	"golang.org/x/text/encoding/unicode"
-	"golang.org/x/text/transform"
 )
 
 // ResolvePath 解析并强校验文件操作参数路径（R-11，file_read/file_find/file_diff/filesys_run
@@ -99,89 +92,34 @@ func IsBinaryBytes(data []byte) bool {
 }
 
 // DecodeText 按 BOM/UTF-8 自动解码文本；UTF-16 BOM 优先，其次 UTF-8 校验，
-// 再依次尝试 GBK / Shift-JIS / Big5 / EUC-KR。
+// 再依次尝试 GBK / Shift-JIS / Big5 / EUC-KR（薄封装 → chonkpilot-util/encodingx）。
 func DecodeText(data []byte) string {
-	if HasUTF16BOM(data) {
-		dec := unicode.UTF16(unicode.LittleEndian, unicode.UseBOM).NewDecoder()
-		if s, _, err := transform.String(dec, string(data)); err == nil {
-			return s
-		}
-	}
-	if utf8.Valid(data) {
-		return string(data)
-	}
-	for _, dec := range []transform.Transformer{
-		simplifiedchinese.GBK.NewDecoder(),
-		japanese.ShiftJIS.NewDecoder(),
-		traditionalchinese.Big5.NewDecoder(),
-		korean.EUCKR.NewDecoder(),
-	} {
-		s, _, err := transform.String(dec, string(data))
-		if err == nil && hasVisible(s) {
-			return s
-		}
-	}
-	return string(data)
-}
-
-func hasVisible(s string) bool {
-	return strings.Count(s, "\uFFFD") < len(s)/2
+	s, _ := encodingx.DecodeAuto(data)
+	return s
 }
 
 // encodeFor 返回把文本按 data 的原始编码回写的编码函数（nil = 原样 UTF-8 写回）。
-// 与 DecodeText 的识别顺序一致，保证「解码→修改→编码」往返不改变文件编码，
-// 避免 GBK/Shift-JIS/Big5/EUC-KR/UTF-16 文件被静默写成 UTF-8（R7-C-12）。
+// 识别顺序与 DecodeText 一致，保证「解码→修改→编码」往返不改变文件编码（R7-C-12）。
 func encodeFor(data []byte) func(string) []byte {
-	if HasUTF16BOM(data) {
-		order := unicode.LittleEndian
-		if data[0] == 0xFE && data[1] == 0xFF {
-			order = unicode.BigEndian
+	name := encodingx.AutoName(data)
+	if name == "" {
+		return nil
+	}
+	return func(s string) []byte {
+		b, err := encodingx.Encode(name, s, true)
+		if err != nil {
+			return []byte(s)
 		}
-		enc := unicode.UTF16(order, unicode.UseBOM).NewEncoder()
-		return func(s string) []byte { b, _, _ := transform.Bytes(enc, []byte(s)); return b }
+		return b
 	}
-	if utf8.Valid(data) {
-		return nil // 已是 UTF-8（或纯 ASCII）→ 原样写回
-	}
-	for _, c := range []struct {
-		dec transform.Transformer
-		enc transform.Transformer
-	}{
-		{simplifiedchinese.GBK.NewDecoder(), simplifiedchinese.GBK.NewEncoder()},
-		{japanese.ShiftJIS.NewDecoder(), japanese.ShiftJIS.NewEncoder()},
-		{traditionalchinese.Big5.NewDecoder(), traditionalchinese.Big5.NewEncoder()},
-		{korean.EUCKR.NewDecoder(), korean.EUCKR.NewEncoder()},
-	} {
-		if s, _, err := transform.String(c.dec, string(data)); err == nil && hasVisible(s) {
-			enc := c.enc
-			return func(str string) []byte { b, _, _ := transform.Bytes(enc, []byte(str)); return b }
-		}
-	}
-	return nil // 无法识别编码 → 保持既有 UTF-8 行为
 }
 
-// EncodingName 返回显示用编码名（UTF-16LE/BE / UTF-8 / GBK …）。
+// EncodingName 返回显示用编码名（UTF-16LE/BE / UTF-8 / binary）。
 func EncodingName(data []byte) string {
-	if HasUTF16BOM(data) {
-		if data[0] == 0xFF && data[1] == 0xFE {
-			return "UTF-16LE"
-		}
-		return "UTF-16BE"
-	}
-	if !bytes.Contains(data[:min(len(data), 1024)], []byte{0}) {
-		return "UTF-8"
-	}
-	return "binary"
+	return encodingx.DisplayName(data)
 }
 
 // DataURI 将二进制编码为 data URI（base64）。
 func DataURI(data []byte) string {
 	return "data:application/octet-stream;base64," + base64.StdEncoding.EncodeToString(data)
-}
-
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
 }

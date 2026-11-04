@@ -79,7 +79,10 @@ func stubRewriteReplies(t *testing.T, bus mq.Bus) (*llmPromptCollector, *int32) 
 func TestExtractCrossTurnIncludesSkipped(t *testing.T) {
 	bus := newTestBus(t)
 	reply(t, bus, prjConfigListSubject, func(map[string]any) map[string]any {
-		return map[string]any{"list": map[string]any{memoryEnabledKey: "true", memoryMinTokensKey: "10"}}
+		return map[string]any{"list": map[string]any{
+			memoryEnabledKey: "true", memoryMinTokensKey: "10",
+			memoryTriggerKey: "every-turn", // 验证轮末沉淀路径（默认 compress 不提取）
+		}}
 	})
 	stubSessionGet(t, bus, "")
 	stubSessionHistory(t, bus, []any{
@@ -126,7 +129,10 @@ func TestExtractCrossTurnIncludesSkipped(t *testing.T) {
 func TestCumulativeGateAccumulates(t *testing.T) {
 	bus := newTestBus(t)
 	reply(t, bus, prjConfigListSubject, func(map[string]any) map[string]any {
-		return map[string]any{"list": map[string]any{memoryEnabledKey: "true", memoryMinTokensKey: "80"}}
+		return map[string]any{"list": map[string]any{
+			memoryEnabledKey: "true", memoryMinTokensKey: "80",
+			memoryTriggerKey: "every-turn", // 验证轮末累计门控（默认 compress 轮末不提取）
+		}}
 	})
 	stubSessionGet(t, bus, "")
 	stubProgress(t, bus, map[string]string{epKey("s1", "项目概要"): "t1"})
@@ -202,7 +208,10 @@ func TestProjectCategoriesSubSessionUserPrefMainOnly(t *testing.T) {
 		t.Helper()
 		bus := newTestBus(t)
 		reply(t, bus, prjConfigListSubject, func(map[string]any) map[string]any {
-			list := map[string]any{memoryEnabledKey: "true", memoryMinTokensKey: "10"}
+			list := map[string]any{
+				memoryEnabledKey: "true", memoryMinTokensKey: "10",
+				memoryTriggerKey: "every-turn", // 验证轮末沉淀路径（默认 compress 不提取）
+			}
 			if subsessionOn {
 				list[memorySubsessionKey] = "true" // DSL-4「提取子会话记忆」开启
 			}
@@ -254,7 +263,10 @@ func TestProjectCategoriesSubSessionUserPrefMainOnly(t *testing.T) {
 func TestConcurrentRewriteSerializedPerCategory(t *testing.T) {
 	bus := newTestBus(t)
 	reply(t, bus, prjConfigListSubject, func(map[string]any) map[string]any {
-		return map[string]any{"list": map[string]any{memoryEnabledKey: "true", memoryMinTokensKey: "10"}}
+		return map[string]any{"list": map[string]any{
+			memoryEnabledKey: "true", memoryMinTokensKey: "10",
+			memoryTriggerKey: "every-turn", // 验证轮末沉淀路径（默认 compress 不提取）
+		}}
 	})
 	stubSessionGet(t, bus, "")
 	stubSessionHistory(t, bus, []any{map[string]any{"turn_id": "t1", "full_tokens": 100}})

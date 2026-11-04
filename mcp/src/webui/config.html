@@ -16,12 +16,12 @@
     label { font-weight: 600; font-size: 12px; }
     input[type=text], input[type=number] { width: 100%; box-sizing: border-box; padding: 7px 9px; border: 1px solid var(--ck-border); border-radius: 6px; font: inherit; background: transparent; color: inherit; }
     .inline { display: flex; align-items: center; gap: 8px; margin-bottom: 12px; }
-    .hint { color: var(--ck-text-muted); font-size: 11px; }
+    .hint { color: var(--ck-text-muted); font-size: 11px; overflow-wrap: anywhere; }
     .actions { display: flex; gap: 8px; flex-wrap: wrap; }
     button { padding: 6px 12px; border-radius: 6px; border: 1px solid var(--ck-border); background: var(--ck-surface); color: inherit; font: inherit; cursor: pointer; }
     button.primary { background: var(--ck-accent); border-color: var(--ck-accent); color: var(--ck-accent-fg); }
     pre { margin-top: 10px; padding: 10px; max-height: 220px; overflow: auto; border-radius: 6px; background: var(--ck-surface); font-size: 11px; }
-    .msg { font-size: 12px; white-space: pre-wrap; margin-top: 8px; }
+    .msg { font-size: 12px; white-space: pre-wrap; overflow-wrap: anywhere; margin-top: 8px; }
     .msg.err { color: var(--ck-danger); } .msg.ok { color: var(--ck-success); }
   </style>
 </head>

@@ -29,6 +29,7 @@ import (
 
 	"github.com/lsong98sh/chonkpilot-plugin-framework/sdk"
 	"github.com/lsong98sh/chonkpilot-util/configkit"
+	"github.com/lsong98sh/chonkpilot-util/encodingx"
 	"github.com/lsong98sh/chonkpilot-util/pathx"
 	"github.com/lsong98sh/chonkpilot-util/strlist"
 )
@@ -46,6 +47,9 @@ const (
 	KeyVftsStackGitignore = "plugins.codegraph.vfts.stack-gitignore"
 	KeyVftsDocs           = "plugins.codegraph.vfts.docs"
 	KeyVftsDocMaxMB       = "plugins.codegraph.vfts.doc-max-mb"
+	KeyVftsEncoding       = "plugins.codegraph.vfts.encoding"
+	// KeyVftsSessions 会话内容检索（SESSION-FTS，2B §3.5）："true"/"false"，缺省关闭。
+	KeyVftsSessions = "plugins.codegraph.vfts.sessions"
 )
 
 // defaultVftsDocMaxMB / maxVftsDocMaxMB 与引擎默认（50MiB）及输入校验区间一致。
@@ -57,12 +61,17 @@ const (
 	// 与旧内嵌 hook 的 400ms 同口径）。rebuildTimeout 覆盖大项目全量索引耗时。
 	rebuildDebounce = 400 * time.Millisecond
 	rebuildTimeout  = 15 * time.Minute
+	// eventDebounce 是「工作区变更」事件（filesys.changed / session-complete / vfts.reindex）
+	// 触发的全量重建去抖窗口（G-84，2026-10-31）：比配置保存长得多，把一次编辑风暴 /
+	// 连续多轮合并成一次重建（代价 = 变更后最长约 5s 才可见索引）。
+	eventDebounce = 5 * time.Second
 )
 
 // allKeys 是本插件的用户配置键全集（稳定序；load 恒回显这些键的有效值）。
 var allKeys = []string{
 	KeyCodegraphEnabled, KeyCodegraphExts, KeyCodegraphSkipDirs, KeyCodegraphStackGitignore,
 	KeyVftsEnabled, KeyVftsExts, KeyVftsSkipDirs, KeyVftsStackGitignore, KeyVftsDocs, KeyVftsDocMaxMB,
+	KeyVftsEncoding, KeyVftsSessions,
 }
 
 // legacyKeyMap 旧宿主键 → 新命名空间键（**迁移专用**；除 migrateOne 外任何代码不得读旧键）。
@@ -99,6 +108,10 @@ type codegraphSettings struct {
 	Vfts         engineSettings
 	VftsDocs     bool
 	VftsDocMaxMB int
+	// VftsEncoding 遗留文本编码（D-73）："" = auto；其余为规范编码名。
+	VftsEncoding string
+	// VftsSessions 会话内容检索（SESSION-FTS）：默认关。
+	VftsSessions bool
 }
 
 // defaultSettings 缺键兜底（与实际生效值保持一致：引擎开关默认关、扩展名/排除规则空 = 引擎默认集、
@@ -119,6 +132,8 @@ func settingsOf(values map[string]string) codegraphSettings {
 	s.Vfts.SkipDirs = values[KeyVftsSkipDirs]
 	s.Vfts.StackGitignore = values[KeyVftsStackGitignore] == "true"
 	s.VftsDocs = values[KeyVftsDocs] == "true"
+	s.VftsSessions = values[KeyVftsSessions] == "true"
+	s.VftsEncoding = normalizeVftsEncoding(values[KeyVftsEncoding])
 	if raw := strings.TrimSpace(values[KeyVftsDocMaxMB]); raw != "" {
 		if n, err := strconv.Atoi(raw); err == nil && n >= 1 && n <= maxVftsDocMaxMB {
 			s.VftsDocMaxMB = n
@@ -146,7 +161,21 @@ func (s codegraphSettings) values() map[string]string {
 		KeyVftsStackGitignore:      b(s.Vfts.StackGitignore),
 		KeyVftsDocs:                b(s.VftsDocs),
 		KeyVftsDocMaxMB:            strconv.Itoa(s.VftsDocMaxMB),
+		KeyVftsEncoding:            s.VftsEncoding,
+		KeyVftsSessions:            b(s.VftsSessions),
 	}
+}
+
+// normalizeVftsEncoding 归一遗留编码配置：空 / auto → ""（自动识别）；
+// 仅接受引擎支持的编码名（utf-8 / gb18030 / gbk / shift_jis / big5 / euc-kr），
+// 其余按未配置处理（宁可不猜，D-73）。
+func normalizeVftsEncoding(raw string) string {
+	switch n := encodingx.Normalize(raw); n {
+	case encodingx.UTF8, encodingx.UTF16LE, encodingx.UTF16BE, encodingx.GBK,
+		encodingx.GB18030, encodingx.ShiftJIS, encodingx.Big5, encodingx.EUCKR:
+		return n
+	}
+	return ""
 }
 
 // canonical 规范化 JSON（配置变化比对用；同值重复保存不下发引擎）。
@@ -241,11 +270,16 @@ type configManager struct {
 	probeMu  sync.Mutex
 	probeAt  time.Time
 	probeSvc *docService
+
+	// sessions 会话内容索引编排（SESSION-FTS）：增量/全量/查询/清理 + 进度（内存态）。
+	sessions *sessionIndexer
+	// sessionActive 记录各 workdir 是否处于「会话检索开启」态（只对开关跳变执行重建/清空）。
+	sessionActive map[string]bool
 }
 
 // newConfigManager 构造配置管理器（store / engine 走生产实现）。
 func newConfigManager(p *pluginsdk.Plugin) *configManager {
-	return &configManager{
+	m := &configManager{
 		p:     p,
 		store: hostPrjStore{p: p},
 		engine: func(ctx context.Context, name string, args map[string]any) (any, error) {
@@ -257,7 +291,19 @@ func newConfigManager(p *pluginsdk.Plugin) *configManager {
 		workdirs:      map[string]string{},
 		applied:       map[string]string{},
 		rebuildTimers: map[string]*time.Timer{},
+		sessionActive: map[string]bool{},
 	}
+	m.sessions = newSessionIndexer(m)
+	return m
+}
+
+// logfFor 返回**绑定 workdir** 的日志函数（PLUGIN-LOG-1）：走 SDK 出口，行尾自动带
+// `wd=<workdir>`，宿主据此把该行镜像到项目日志。未装配插件（单测）→ 回落 m.logf。
+func (m *configManager) logfFor(wd string) func(string, ...any) {
+	if m.p != nil {
+		return func(format string, args ...any) { m.p.Logf(wd, format, args...) }
+	}
+	return m.logf
 }
 
 // Actions 返回本插件承担 UI 动作名（宿主 `POST /plugins/codegraph/api/<action>`）。
@@ -318,10 +364,54 @@ func (m *configManager) handleStatus(ctx context.Context, payload map[string]any
 					}
 				}
 			}
+			// 会话内容检索段（SESSION-FTS）：引擎 state/sessions/docs + 插件内存进度（不回写 prj 键）。
+			if b, err := json.Marshal(v); err == nil {
+				var obj map[string]any
+				if json.Unmarshal(b, &obj) == nil {
+					obj["session"] = m.sessionStatusPayload(ctx, wd)
+					v = obj
+				}
+			}
 		}
 		out[eng] = v
 	}
 	return out, nil
+}
+
+// sessionStatusPayload 组装 vfts 状态里的 `session` 段（SESSION-FTS）：
+// 引擎 `vfts_session_status` 的 state/sessions/docs/lastIndexedAt + 插件内存进度
+// （state 在全量重建期间为 indexing；doneSessions/totalSessions/doneTurns/totalTurns）。
+func (m *configManager) sessionStatusPayload(ctx context.Context, workdir string) map[string]any {
+	out := map[string]any{
+		"state": "", "sessions": 0, "docs": 0, "lastIndexedAt": int64(0),
+		"doneSessions": 0, "totalSessions": 0, "doneTurns": 0, "totalTurns": 0,
+	}
+	if v, err := m.engine(ctx, "vfts_session_status", map[string]any{"workdir": workdir}); err == nil {
+		if b, jerr := json.Marshal(v); jerr == nil {
+			var obj map[string]any
+			if json.Unmarshal(b, &obj) == nil {
+				for _, k := range []string{"state", "sessions", "docs", "lastIndexedAt"} {
+					if val, ok := obj[k]; ok {
+						out[k] = val
+					}
+				}
+			}
+		}
+	}
+	if m.sessions != nil {
+		p := m.sessions.progressOf(workdir)
+		out["doneSessions"] = p.DoneSessions
+		out["totalSessions"] = p.TotalSessions
+		out["doneTurns"] = p.DoneTurns
+		out["totalTurns"] = p.TotalTurns
+		if p.State == "indexing" || p.State == "error" {
+			out["state"] = p.State
+		}
+		if p.Err != "" {
+			out["err"] = p.Err
+		}
+	}
+	return out
 }
 
 // ─── 动作：badge（状态栏紧凑视图，PLUGIN-UI-2）────────────────────
@@ -335,6 +425,8 @@ type badgeEngine struct {
 	Total   int    `json:"total"`
 	Text    string `json:"text"`
 	Tone    string `json:"tone"`
+	// Session 会话内容检索段（仅 vfts；SESSION-FTS 进度）。
+	Session map[string]any `json:"session,omitempty"`
 }
 
 // handleBadge 供 badge 视图（状态栏 iframe）拉取紧凑进度。
@@ -379,6 +471,9 @@ func (m *configManager) handleBadge(ctx context.Context, payload map[string]any)
 		be.State = statusString(v, "state")
 		be.Done = statusInt(v, "progressDone")
 		be.Total = statusInt(v, "progressTotal")
+		if e.name == "vfts" {
+			be.Session = m.sessionStatusPayload(ctx, wd)
+		}
 		be.Text, be.Tone = badgeText(be)
 		list = append(list, be)
 	}
@@ -468,7 +563,7 @@ func (m *configManager) handleClear(ctx context.Context, payload map[string]any)
 	}
 	// PLUGIN-UI-2：不再回写 `codegraph.status`（宿主零引用；状态由本插件 `engine-status` / `badge`
 	// 动作现取，见 handleStatus / handleBadge）。
-	m.logf("codegraph: 已清除 codegraph 索引（instance=%s，workdir=%s）", inst, workdir)
+	m.logfFor(workdir)("codegraph: 已清除 codegraph 索引（instance=%s）", inst)
 	return map[string]any{"ok": true, "instance_id": inst, "workdir": workdir}, nil
 }
 
@@ -581,7 +676,7 @@ func isKnownKey(key string) bool {
 // normalizeValue 校验并归一单个配置值（非法 → 明确错误，不静默截断）。
 func normalizeValue(key string, raw any) (string, error) {
 	switch key {
-	case KeyCodegraphEnabled, KeyCodegraphStackGitignore, KeyVftsEnabled, KeyVftsStackGitignore, KeyVftsDocs:
+	case KeyCodegraphEnabled, KeyCodegraphStackGitignore, KeyVftsEnabled, KeyVftsStackGitignore, KeyVftsDocs, KeyVftsSessions:
 		s := strings.ToLower(strings.TrimSpace(pluginsdk.Str(raw)))
 		switch s {
 		case "true", "false":
@@ -616,6 +711,19 @@ func normalizeValue(key string, raw any) (string, error) {
 			return "", fmt.Errorf("config_invalid: %s 必须是 1–%d 的整数（收到 %q）", key, maxVftsDocMaxMB, pluginsdk.Str(raw))
 		}
 		return strconv.Itoa(n), nil
+	case KeyVftsEncoding:
+		rawStr := strings.TrimSpace(pluginsdk.Str(raw))
+		if rawStr == "" {
+			return "", nil
+		}
+		n := normalizeVftsEncoding(rawStr)
+		if n == "" {
+			return "", fmt.Errorf("config_invalid: %s 只允许 auto / utf-8 / gb18030 / gbk / shift_jis / big5 / euc-kr（收到 %q）", key, rawStr)
+		}
+		if n == encodingx.UTF16LE || n == encodingx.UTF16BE {
+			return "", fmt.Errorf("config_invalid: %s 不支持 utf-16（请保留 BOM 由引擎识别）", key)
+		}
+		return n, nil
 	}
 	return "", fmt.Errorf("config_invalid: 未知配置键 %s", key)
 }
@@ -732,6 +840,22 @@ func (m *configManager) workdirOf(inst string) string {
 	return m.workdirs[inst]
 }
 
+// allWorkdirs 返回当前已登记实例的 workdir 去重集（`vfts.reindex` 缺省 instance_id 时用）。
+func (m *configManager) allWorkdirs() []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	seen := map[string]bool{}
+	out := make([]string, 0, len(m.workdirs))
+	for _, wd := range m.workdirs {
+		if wd == "" || seen[wd] {
+			continue
+		}
+		seen[wd] = true
+		out = append(out, wd)
+	}
+	return out
+}
+
 // normalizeWorkdir 归一工作区路径（空 → ""；否则 Clean）。
 func normalizeWorkdir(raw string) string {
 	s := strings.TrimSpace(raw)
@@ -806,12 +930,13 @@ func (m *configManager) apply(ctx context.Context, inst, workdir string, s codeg
 			"doc_max_bytes":      int64(s.VftsDocMaxMB) << 20,
 			"doc_text_max_bytes": docTextMaxBytes,
 			"doc_cache_dir":      filepath.Join(workdir, ".chonkpilot", "vfts", "doc_text"),
+			"encoding":           s.VftsEncoding,
 		}
 		if docSvc != nil {
 			vargs["doc_endpoint"] = docSvc.baseURL()
 			vargs["doc_token"] = docSvc.Token
 		} else if s.VftsDocs {
-			m.logf("codegraph: %s 文档索引已开启但转换服务未运行 → 本次整批跳过文档类", workdir)
+			m.logfFor(workdir)("codegraph: 文档索引已开启但转换服务未运行 → 本次整批跳过文档类")
 		}
 		if _, err := m.engine(ctx, "vfts_configure", vargs); err != nil {
 			return applied, fmt.Errorf("vfts_configure: %w", err)
@@ -821,7 +946,32 @@ func (m *configManager) apply(ctx context.Context, inst, workdir string, s codeg
 	m.mu.Lock()
 	m.applied[inst] = canon
 	m.mu.Unlock()
+	// 会话内容检索（SESSION-FTS）：只在开关**跳变**时动作（打开 → 后台补齐；关闭 → 清集合）。
+	m.applySessionToggle(workdir, s.Vfts.Enabled && s.VftsSessions)
 	return applied, nil
+}
+
+// applySessionToggle 处理「会话内容检索」开关跳变：打开 → 后台全量重建补齐；关闭 → 清空会话集合。
+// 同状态重复应用幂等（不重复触发）。
+func (m *configManager) applySessionToggle(workdir string, on bool) {
+	if m.sessions == nil || workdir == "" {
+		return
+	}
+	m.mu.Lock()
+	prev := m.sessionActive[workdir]
+	if m.sessionActive == nil {
+		m.sessionActive = map[string]bool{}
+	}
+	m.sessionActive[workdir] = on
+	m.mu.Unlock()
+	if on == prev {
+		return
+	}
+	if on {
+		go m.sessions.fullRebuild(workdir, m.instForWorkdir(workdir))
+		return
+	}
+	go m.sessions.clear(workdir)
 }
 
 // ─── 配置生效后的自动重建（D-71：主仓内嵌 hook 退场后归插件）──────────
@@ -831,13 +981,18 @@ func (m *configManager) apply(ctx context.Context, inst, workdir string, s codeg
 // SRCH-004-S01「开启开关 → 自动开始索引」/ SRCH-005-S01「启用且未索引 → 全量索引」：
 // 旧内嵌 hook 的 `ensureWorkspace` 承担该职责，D-71 后必须由插件补齐。
 func (m *configManager) scheduleRebuild(engines []string, workdir string) {
+	m.scheduleRebuildAfter(engines, workdir, rebuildDebounce)
+}
+
+// scheduleRebuildAfter 同 scheduleRebuild，但可指定去抖窗口（G-84：文件变更 / 轮末事件用更长窗口）。
+func (m *configManager) scheduleRebuildAfter(engines []string, workdir string, delay time.Duration) {
 	for _, eng := range engines {
 		key := eng + "|" + workdir
 		m.rebuildMu.Lock()
 		if old := m.rebuildTimers[key]; old != nil {
 			old.Stop()
 		}
-		m.rebuildTimers[key] = time.AfterFunc(rebuildDebounce, func() {
+		m.rebuildTimers[key] = time.AfterFunc(delay, func() {
 			m.rebuildMu.Lock()
 			delete(m.rebuildTimers, key)
 			m.rebuildMu.Unlock()
@@ -845,6 +1000,44 @@ func (m *configManager) scheduleRebuild(engines []string, workdir string) {
 		})
 		m.rebuildMu.Unlock()
 	}
+}
+
+// onWorkspaceEvent 处理「工作区变更」类事件（G-84，2026-10-31）：
+// `filesys.changed`（编辑文件）/ `session-complete`（轮末）/ `vfts.reindex`（手动重建）。
+//
+// 能力自管（28 §1）：按该 workdir 的**已保存配置**判定启用中的引擎，只看 `only` 指定者
+// （空 = 全部启用引擎）；配置读不到 / 均未启用 → 不重建。以**长窗口去抖全量重建**兜底
+// （旧 hook 的清单 md5 增量 diff 已随内嵌 hook 退场，暂不重做）。
+func (m *configManager) onWorkspaceEvent(ctx context.Context, workdir, only string) {
+	wd := normalizeWorkdir(workdir)
+	if wd == "" {
+		return
+	}
+	inst, err := m.resolveInstance(ctx, map[string]any{"workdir": wd})
+	if err != nil {
+		return // 无归属实例（窗口未开 / 未知 workdir）→ 不重建
+	}
+	m.applyMu.Lock()
+	stored, err := m.readValues(ctx, inst)
+	m.applyMu.Unlock()
+	if err != nil {
+		m.logfFor(wd)("codegraph: 工作区事件读取配置失败（instance=%s）：%v", inst, err)
+		return
+	}
+	engines := enabledEngines(settingsOf(stored))
+	if only != "" {
+		filtered := make([]string, 0, len(engines))
+		for _, e := range engines {
+			if e == only {
+				filtered = append(filtered, e)
+			}
+		}
+		engines = filtered
+	}
+	if len(engines) == 0 {
+		return
+	}
+	m.scheduleRebuildAfter(engines, wd, eventDebounce)
 }
 
 // rebuild 全量重建某引擎索引 → 回写清单（vfts）与运行时状态键。
@@ -858,11 +1051,11 @@ func (m *configManager) rebuild(eng, workdir string) {
 	}
 	out, err := m.engine(ctx, name, map[string]any{"workdir": workdir})
 	if err != nil {
-		m.logf("codegraph: 配置生效后自动重建失败（%s %s）：%v", eng, workdir, err)
+		m.logfFor(workdir)("codegraph: 配置生效后自动重建失败（引擎=%s）：%v", eng, err)
 		return
 	}
 	if eng == "vfts" {
-		writeVftsManifest(m.logf, workdir, out)
+		writeVftsManifest(m.logfFor(workdir), workdir, out)
 	}
 }
 
@@ -1018,11 +1211,11 @@ func (m *configManager) onInstanceRegister(payload []byte) {
 		defer m.applyMu.Unlock()
 		stored, err := m.readValues(ctx, ev.InstanceID)
 		if err != nil {
-			m.logf("codegraph: 读项目配置失败（instance=%s）：%v", ev.InstanceID, err)
+			m.logfFor(wd)("codegraph: 读项目配置失败（instance=%s）：%v", ev.InstanceID, err)
 			return
 		}
 		if _, err := m.apply(ctx, ev.InstanceID, wd, settingsOf(stored)); err != nil {
-			m.logf("codegraph: 项目 %s 配置下发引擎失败：%v", wd, err)
+			m.logfFor(wd)("codegraph: 项目配置下发引擎失败：%v", err)
 			return
 		}
 		// SRCH-005-S01：启用且未索引（未初始化 / 中断）→ 后台全量索引。

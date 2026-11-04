@@ -14,20 +14,23 @@
     p.sub { margin: 0 0 16px; color: var(--ck-text-muted); font-size: 12px; }
     .card { border: 1px solid var(--ck-border); border-radius: 8px; padding: 14px; margin-bottom: 14px; }
     .row { display: flex; flex-direction: column; gap: 6px; margin-bottom: 12px; }
-    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(200px, 100%), 1fr)); gap: 12px; }
     label { font-weight: 600; font-size: 12px; }
     input[type=text] { width: 100%; box-sizing: border-box; padding: 7px 9px; border: 1px solid var(--ck-border); border-radius: 6px; font: inherit; background: transparent; color: inherit; }
     .inline { display: flex; align-items: center; gap: 8px; }
-    .hint { color: var(--ck-text-muted); font-size: 11px; }
+    .hint { color: var(--ck-text-muted); font-size: 11px; overflow-wrap: anywhere; }
     .actions { display: flex; gap: 8px; flex-wrap: wrap; }
     button { padding: 6px 12px; border-radius: 6px; border: 1px solid var(--ck-border); background: var(--ck-surface); color: inherit; font: inherit; cursor: pointer; }
     button.primary { background: var(--ck-accent); border-color: var(--ck-accent); color: var(--ck-accent-fg); }
     button:disabled { opacity: .55; cursor: default; }
     pre { margin: 10px 0 0; padding: 10px; max-height: 220px; overflow: auto; border-radius: 6px; background: var(--ck-surface); font-size: 11px; }
-    .msg { font-size: 12px; white-space: pre-wrap; margin-top: 8px; }
+    .msg { font-size: 12px; white-space: pre-wrap; overflow-wrap: anywhere; margin-top: 8px; }
     .msg.err { color: var(--ck-danger); }
     .msg.ok { color: var(--ck-success); }
     .kv { color: var(--ck-text-muted); font-size: 11px; }
+    /* 会话索引进度条（SESSION-FTS） */
+    .bar { height: 6px; border-radius: 3px; background: var(--ck-surface); overflow: hidden; margin: 2px 0 10px; }
+    .bar > i { display: block; height: 100%; width: 0; background: var(--ck-accent); transition: width .2s ease; }
   </style>
 </head>
 <body>
@@ -102,6 +105,19 @@
       <label>文档单文件上限（MB）</label>
       <input type="text" id="vfDocMaxMB" placeholder="50（1–4096）" autocomplete="off" />
     </div>
+    <div class="row" style="max-width:320px">
+      <label>遗留文本编码</label>
+      <input type="text" id="vfEncoding" placeholder="auto（utf-8 / gb18030 / gbk / shift_jis / big5 / euc-kr）" autocomplete="off" />
+    </div>
+    <div class="inline" style="margin-bottom:6px">
+      <input type="checkbox" id="vfSessions" />
+      <span class="hint">会话内容检索（主会话 user/assistant 正文进全文索引，可在会话内查找）</span>
+    </div>
+    <div class="inline" style="margin-bottom:6px">
+      <button id="vfSessionRebuild">重建会话索引</button>
+      <span class="hint" id="vfSessionState">—</span>
+    </div>
+    <div class="bar"><i id="vfSessionBar"></i></div>
     <div class="actions">
       <button class="primary" id="vfSave">保存并应用</button>
       <button id="vfStatus">引擎状态</button>
@@ -123,9 +139,13 @@
     const KEY_VF_STACK = 'plugins.codegraph.vfts.stack-gitignore';
     const KEY_VF_DOCS = 'plugins.codegraph.vfts.docs';
     const KEY_VF_DOC_MB = 'plugins.codegraph.vfts.doc-max-mb';
+    const KEY_VF_ENCODING = 'plugins.codegraph.vfts.encoding';
+    const KEY_VF_SESSIONS = 'plugins.codegraph.vfts.sessions';
 
     const msg = document.getElementById('msg');
     const out = document.getElementById('out');
+    // 最近一次 load 回显的实例 id（会话索引重建按实例定位工作区）。
+    let lastInstanceId = '';
 
     function show(text, err) {
       msg.textContent = text || '';
@@ -179,12 +199,15 @@
       document.getElementById('vfGitignore').checked = bool(values[KEY_VF_STACK]);
       document.getElementById('vfDocs').checked = bool(values[KEY_VF_DOCS]);
       document.getElementById('vfDocMaxMB').value = values[KEY_VF_DOC_MB] || '';
+      document.getElementById('vfEncoding').value = values[KEY_VF_ENCODING] || '';
+      document.getElementById('vfSessions').checked = bool(values[KEY_VF_SESSIONS]);
     }
 
     /** 读取有效配置（缺键 = 插件内置默认）。 */
     async function loadConfig(silent) {
       try {
         const r = await api('load', { workdir: document.getElementById('workdir').value.trim() });
+        lastInstanceId = r.instance_id || '';
         fill(r.values || {});
         if (!document.getElementById('workdir').value.trim() && r.workdir) {
           document.getElementById('workdir').value = r.workdir;
@@ -253,6 +276,8 @@
           [KEY_VF_STACK]: document.getElementById('vfGitignore').checked ? 'true' : 'false',
           [KEY_VF_DOCS]: document.getElementById('vfDocs').checked ? 'true' : 'false',
           [KEY_VF_DOC_MB]: document.getElementById('vfDocMaxMB').value.trim(),
+          [KEY_VF_ENCODING]: document.getElementById('vfEncoding').value.trim(),
+          [KEY_VF_SESSIONS]: document.getElementById('vfSessions').checked ? 'true' : 'false',
         });
       } catch (e) { show('保存失败: ' + e.message, true); }
     };
@@ -264,7 +289,71 @@
       } catch (e) { show('读取失败: ' + e.message, true); }
     };
 
-    loadConfig(true);
+    // ── 会话内容检索（SESSION-FTS）────────────────────────────────
+    // 重建：点分主题 vfts.session.reindex（立即回执 {ok,started}，后台逐会话执行）。
+    document.getElementById('vfSessionRebuild').onclick = async () => {
+      try {
+        const wd = workdir();
+        const r = await ckPlugin.call('rpc', {
+          method: 'vfts.session.reindex',
+          params: lastInstanceId ? { instance_id: lastInstanceId } : { workdir: wd },
+        });
+        const v = r && Object.prototype.hasOwnProperty.call(r, 'result') ? r.result : r;
+        if (v && v.ok) {
+          show('会话索引重建已开始（后台执行，可继续操作）。');
+          pollSessionStatus();
+        } else {
+          show('重建未启动：' + ((v && v.reason) || '未知原因'), true);
+        }
+      } catch (e) { show('重建失败: ' + e.message, true); }
+    };
+
+    let sessionTimer = null;
+
+    /** 轮询 engine-status 的 session 段（进度条 + 文案）。 */
+    async function pollSessionStatus() {
+      const wd = document.getElementById('workdir').value.trim();
+      if (!wd) return;
+      try {
+        const r = await api('engine-status', {
+          workdir: wd,
+          engine: 'vfts',
+          instance_id: lastInstanceId || undefined,
+        });
+        const s = (r && r.vfts && r.vfts.session) || {};
+        renderSession(s);
+      } catch (e) { /* 轮询失败静默（下次再试） */ }
+    }
+
+    function renderSession(s) {
+      const state = s.state || '';
+      const done = Number(s.doneTurns || 0);
+      const total = Number(s.totalTurns || 0);
+      const ds = Number(s.doneSessions || 0);
+      const ts = Number(s.totalSessions || 0);
+      let text;
+      if (state === 'indexing') {
+        text = '会话索引中… 会话 ' + ds + '/' + (ts || '?') + '　轮次 ' + done + '/' + (total || '?');
+      } else if (state === 'error') {
+        text = '会话索引失败：' + (s.err || '未知错误');
+      } else if (state === 'ready') {
+        text = '会话索引就绪（会话 ' + Number(s.sessions || 0) + '　消息 ' + Number(s.docs || 0) + '）';
+      } else {
+        text = '会话索引未建立';
+      }
+      document.getElementById('vfSessionState').textContent = text;
+      const pct = total > 0 ? Math.min(100, Math.round((done / total) * 100)) : (state === 'ready' ? 100 : 0);
+      document.getElementById('vfSessionBar').style.width = pct + '%';
+    }
+
+    function startSessionPolling() {
+      if (sessionTimer) clearInterval(sessionTimer);
+      sessionTimer = setInterval(() => {
+        if (!document.hidden) pollSessionStatus();
+      }, 2000);
+    }
+
+    loadConfig(true).then(() => { pollSessionStatus(); startSessionPolling(); });
   </script>
 </body>
 </html>

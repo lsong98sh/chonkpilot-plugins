@@ -10,8 +10,9 @@ import (
 	"strings"
 	"time"
 
-	ignore "github.com/lsong98sh/chonkpilot-plugins/shared/ignore"
 	"github.com/lsong98sh/chonkpilot-util/extx"
+	ignore "github.com/lsong98sh/chonkpilot-util/ignore"
+	"github.com/lsong98sh/chonkpilot-util/textx"
 	zvec "github.com/zvec-ai/zvec-go"
 )
 
@@ -33,7 +34,7 @@ var ErrNotInitialized = fmt.Errorf("全文索引未初始化（请先 vfts_index
 //	docs 各字段 = 指针语义「键存在即覆盖（含空串/零值）」：Endpoint 下发空串即清空旧值
 //	（服务不可用 → docsAvailable() 为 false），Token 下发空串即清空内存 token；
 //	token 仅内存持有、不落 meta.json）。
-func (w *Workspace) Configure(enabled *bool, exts, skipDirs []string, stackGitignore *bool, docs *DocsConfig) error {
+func (w *Workspace) Configure(enabled *bool, exts, skipDirs []string, stackGitignore *bool, docs *DocsConfig, encoding ...string) error {
 	w.mu.Lock()
 	if enabled != nil {
 		w.meta.Enabled = *enabled
@@ -46,6 +47,9 @@ func (w *Workspace) Configure(enabled *bool, exts, skipDirs []string, stackGitig
 	}
 	if stackGitignore != nil {
 		w.meta.StackGitignore = *stackGitignore
+	}
+	if len(encoding) > 0 {
+		w.meta.Encoding = normalizeEncodingName(encoding[0])
 	}
 	if docs != nil {
 		if docs.Enabled != nil {
@@ -75,6 +79,13 @@ func (w *Workspace) Configure(enabled *bool, exts, skipDirs []string, stackGitig
 // normalizeExts 归一扩展名列表（去空、补点、小写、去重、排序）。
 func normalizeExts(exts []string) []string {
 	return extx.Normalize(exts)
+}
+
+// encodingName 生效的显式编码配置（"" = 自动识别，D-73）。
+func (w *Workspace) encodingName() string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.meta.Encoding
 }
 
 // extSet 生效的扩展名集合（未配置 → 默认集）。
@@ -163,7 +174,7 @@ func (w *Workspace) collectFiles() (entries []fileEntry, skippedDocs int, err er
 	return out, skippedDocs, nil
 }
 
-// chunksOf 读取单文件并切分为文本块（二进制/超限/读失败返回错误或空）。
+// chunksOf 读取单文件、识别编码转 UTF-8 后切分为文本块（二进制/超限/读失败返回错误或空）。
 // 文档类文件不走本函数（见 preConvertDocs / chunksOfDoc）。
 func (w *Workspace) chunksOf(e fileEntry) ([]chunk, error) {
 	abs := filepath.FromSlash(joinPath(w.Dir, e.path))
@@ -171,10 +182,11 @@ func (w *Workspace) chunksOf(e fileEntry) ([]chunk, error) {
 	if err != nil {
 		return nil, err
 	}
-	if isBinary(data) {
+	if textx.IsBinary(data) {
 		return nil, fmt.Errorf("binary file skipped")
 	}
-	return splitChunks(e.path, string(data), nil), nil
+	text, _ := decodeIndexText(data, w.encodingName())
+	return splitChunks(e.path, text, nil), nil
 }
 
 // preConvertDocs 对文档类文件做**并发转换**（worker 池）阶段：返回按 entries 下标索引的分块结果。

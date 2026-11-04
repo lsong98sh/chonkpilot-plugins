@@ -27,9 +27,9 @@ const (
 
 // 窗口位置标志。
 const (
-	swpNoZOrder  = 0x0004
+	swpNoZOrder   = 0x0004
 	swpNoActivate = 0x0010
-	swShow       = 5
+	swShow        = 5
 )
 
 // setCursorPos 移动光标到屏幕绝对坐标。

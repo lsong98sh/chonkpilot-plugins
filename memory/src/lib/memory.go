@@ -1,12 +1,18 @@
 // Package memory 是记忆库沉淀插件（server 内嵌形态，对齐 docs/spec/20-modules/28-plugins.md）。
 //
-// 定位（42 §2 (27) / 41 D-16）：**每轮（turn 结束）异步**把本轮新信息沉淀进记忆库，
+// 定位（42 §2 (27) / 41 D-16）：**异步**把新信息沉淀进记忆库（触发时机见下；默认跟随压缩），
 // 与 capability 原语库（LLM 经 mcp_find 获取的"普通知识"）无关。
 //
-// 触发：订阅 server 每轮终态事件 `session-complete`（**不新增消息面**；事件由 server.finish 在
-// 终态落库 + 写快照后发出）。2026-10-24 用户口径：压缩与记忆**毫不相干** —— 压缩服务于
-// 「发送前的上下文」，记忆沉淀发生在「轮次结束 / 会话恢复之后」，故**不得借用压缩的触发主题**
-// （原订阅 `session-compress` 已解除）。载荷取 `instance_id` / `work_dir` / `data_dir` /
+// 触发（2026-10-31 用户定案：提取时机**跟随压缩**，不再每轮提取）：
+//   - 主路径 = 压缩阈值判定通过、执行压缩前，server 投递**既有** `memory.flush`
+//     （`{instance_id, session, dialog_id}`，force=true；零新增消息面）→ 本插件提取一次；
+//   - `memory.trigger`（prj，默认 `compress`）：`compress` = 轮末 session-complete **不提取**
+//     （仅安全阀可能触发）；`every-turn` = 保留旧行为（每轮按累计门控提取）；
+//   - 安全阀 `memory.safety-tokens`（prj，默认 20000）：compress 模式下自上次提取累计未提取
+//     token ≥ 该值 → 轮末仍提取一次（避免长期不压缩导致记忆停滞；0 = 关闭安全阀）。
+//
+// 订阅 server 每轮终态事件 `session-complete`（**不新增消息面**；事件由 server.finish 在
+// 终态落库 + 写快照后发出）。载荷取 `instance_id` / `work_dir` / `data_dir` /
 // `session` / `turn`（work_dir/data_dir 为 server 在 session-complete 上**只增**的字段）。
 // **队列 + 合并（2026-10-06，用户拍板）**：
 // 订阅回调只**置待处理标记**（key = (instance, session)，同一 key **覆盖合并**）并立即返回；
@@ -33,8 +39,9 @@
 // 写冲突（OP-08）：**per-(workdir/项目, 类别) 进程内互斥 + 读-改-写临界区** —— 同进程多会话
 // 并发写同一类别 md 不并发（跨进程由单持有者保证，见 OP-14/D-45，另项）。
 //
-// 手动沉淀（2026-09-20，批 3 ⑱；2026-10-06 并入队列；2026-10-07 改投递即回，I-128）：另订阅
-// 点分主题 `memory.flush`（payload `{instance_id, session}`）—— 置**待处理标记**（force=true）
+// 手动沉淀 / 压缩前触发（2026-09-20，批 3 ⑱；2026-10-06 并入队列；2026-10-07 改投递即回，
+// I-128；2026-10-31 起 server 在压缩前自动投递同一主题）：另订阅点分主题 `memory.flush`
+// （payload `{instance_id, session, dialog_id}`）—— 置**待处理标记**（force=true）
 // 并**立即回执** `{ok, queued, session}`（不再同步等各类别 LLM 跑完）；进度经既有通知面
 // tool-notify（`memory-queued`/`memory-start`/`memory-done`）推送，供 statusbar 显示队列状态。
 // **不受 memory.min-turn-tokens 门控**（显式动作即用户意图），范围同自动路径（各进度 → 最新轮）。
@@ -100,8 +107,17 @@ const (
 	// memorySubsessionKey 是「提取子会话记忆」项目级开关键（DSL-4，42 §2 (253)）：默认**关闭**
 	// （键缺失 / 非 "true"）。关 = 子会话（session.parent_id != ""）turn 跳过自动沉淀；主会话恒不跳过。
 	// 注：该键只关**沉淀（写路径）**；记忆清单带出指引（读路径）只随 memory.enabled 门控，与子会话无关。
-	memorySubsessionKey  = "memory.subsession"
-	defaultMinTurnTokens = 200
+	memorySubsessionKey = "memory.subsession"
+	// 触发策略（2026-10-31 用户定案）：默认 `compress` —— 提取跟随压缩（server 在阈值判定通过、
+	// 执行压缩前投递既有 memory.flush）；`every-turn` = 旧行为（轮末按 memory.min-turn-tokens 累计门控）。
+	// 安全阀 memory.safety-tokens（默认 20000）：compress 模式下自上次提取累计未提取 token ≥ 该值 →
+	// 轮末仍提取一次（避免长期不压缩导致记忆停滞）；0 = 关闭安全阀。
+	memoryTriggerKey      = "memory.trigger"
+	memorySafetyTokensKey = "memory.safety-tokens"
+	triggerCompress       = "compress"
+	triggerEveryTurn      = "every-turn"
+	defaultSafetyTokens   = 20000
+	defaultMinTurnTokens  = 200
 	// allTurnsTarget 是 data-session-history 的 target_messages/target_bytes 取值（足够大 →
 	// 返回会话**全部轮**，供跨轮提取范围与累计门控）。
 	allTurnsTarget = 1 << 30
@@ -388,8 +404,14 @@ type memoryConfig struct {
 	Subsession bool
 	// MaxTokens 是单类别 token **告警阈值**（prj `memory.category-max-tokens`）：>0 = 超过即记
 	// 告警日志（不截断、不阻断）；0 = 未设置 = 不限。
-	MaxTokens  int
-	Categories map[string]bool // 类别名 → 启用（键缺失 → 默认启用）
+	MaxTokens int
+	// Trigger 是提取触发策略（prj `memory.trigger`）：`compress`（默认）= 跟随压缩（轮末不提取，
+	// 由 server 压缩前投递 memory.flush 触发）；`every-turn` = 轮末按 MinTokens 累计门控提取。
+	Trigger string
+	// SafetyTokens 是 compress 模式的安全阀（prj `memory.safety-tokens`，默认 20000）：
+	// 自上次提取累计未提取 token ≥ 该值 → 轮末仍提取一次；0 = 关闭安全阀。
+	SafetyTokens int
+	Categories   map[string]bool // 类别名 → 启用（键缺失 → 默认启用）
 }
 
 // categoryEnabled 判断类别是否启用：读项目配置 memory.category.<类别名>；键缺失 → 默认启用。
@@ -541,7 +563,11 @@ func (p *Plugin) processResolved(ev turnEvent, force bool, d turnDeps) map[strin
 		return done()
 	}
 	cache := newTurnMsgCache(p, ev.InstanceID, ev.DialogID)
-	// 累计门控（OP-05）：手动沉淀（force=true）跳过（显式动作即用户意图）。
+	// 累计门控（OP-05）：手动沉淀 / 压缩前触发（force=true）跳过（显式动作即用户意图）。
+	// 轮末路径按 memory.trigger 分流（2026-10-31 用户定案）：
+	//   - every-turn：累计 ≥ memory.min-turn-tokens 才提取（旧行为）；
+	//   - compress（默认）：轮末**不提取**；仅累计未提取 token ≥ memory.safety-tokens（安全阀）
+	//     时提取一次（提取主路径 = 压缩前 server 投递 memory.flush）。
 	if !force {
 		tokens, terr := p.rangeTokens(turnsAfter(turns, earliestAnchor(turns, processable)), cache)
 		if terr != nil {
@@ -549,8 +575,16 @@ func (p *Plugin) processResolved(ev turnEvent, force bool, d turnDeps) map[strin
 			p.notify(ev, "turns", terr.Error())
 			return fail(terr.Error())
 		}
-		if tokens < cfg.MinTokens {
-			logf("memory: 自上次提取累计 %d token < 阈值 %d → 跳过（session=%s）", tokens, cfg.MinTokens, ev.Session)
+		gate, gateKey := cfg.MinTokens, memoryMinTokensKey
+		if cfg.Trigger != triggerEveryTurn {
+			gate, gateKey = cfg.SafetyTokens, memorySafetyTokensKey
+			if gate <= 0 {
+				logf("memory: 轮末不提取（trigger=%s，%s=0；session=%s）", triggerCompress, memorySafetyTokensKey, ev.Session)
+				return done()
+			}
+		}
+		if tokens < gate {
+			logf("memory: 自上次提取累计 %d token < %s=%d → 跳过（session=%s）", tokens, gateKey, gate, ev.Session)
 			return done()
 		}
 	}
@@ -944,9 +978,11 @@ func (p *Plugin) flush(payload []byte) map[string]any {
 // resolveConfig 经 data-prj-config-list 一次读回项目配置并解析 memory.*（缺失回落默认）。
 func (p *Plugin) resolveConfig(instanceID string) (memoryConfig, error) {
 	cfg := memoryConfig{
-		Enabled:    false,
-		MinTokens:  p.opts.MinTurnTokens,
-		Categories: map[string]bool{},
+		Enabled:      false,
+		MinTokens:    p.opts.MinTurnTokens,
+		Trigger:      triggerCompress,
+		SafetyTokens: defaultSafetyTokens,
+		Categories:   map[string]bool{},
 	}
 	res, err := p.request(prjConfigListSubject, map[string]any{"instance_id": instanceID})
 	if err != nil {
@@ -968,6 +1004,16 @@ func (p *Plugin) resolveConfig(instanceID string) (memoryConfig, error) {
 	// 「提取子会话记忆」开关（prj 键；缺失/非 "true" → 关闭）。
 	if raw, ok := list[memorySubsessionKey]; ok {
 		cfg.Subsession = strval(raw) == "true"
+	}
+	// 触发策略（prj 键；缺失/非法 → compress）：显式 "every-turn" 才保留旧行为。
+	if raw, ok := list[memoryTriggerKey]; ok {
+		if v := strings.TrimSpace(strval(raw)); v == triggerEveryTurn {
+			cfg.Trigger = triggerEveryTurn
+		}
+	}
+	// 安全阀（prj 键；缺失 → 默认 20000；显式 "0" → 关闭）。
+	if raw, ok := list[memorySafetyTokensKey]; ok {
+		cfg.SafetyTokens = atoiOK(strval(raw))
 	}
 	for k, v := range list {
 		if name, ok := strings.CutPrefix(k, memoryCategoryPrefix); ok && name != "" {

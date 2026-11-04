@@ -17,6 +17,7 @@ import (
 
 	"github.com/lsong98sh/chonkpilot-plugin-framework/sdk"
 	"github.com/lsong98sh/chonkpilot-plugin-framework/sdk/engineclient"
+	"github.com/lsong98sh/chonkpilot-util/pathx"
 )
 
 const pluginVersion = "1.0.0"
@@ -137,7 +138,7 @@ func (b *browserPlugin) run(ctx context.Context, args map[string]any, cx plugins
 	}
 	// screenshot 未给 path → 落配置的默认目录（LLM 参数可覆盖）。
 	if action == "screenshot" && pluginsdk.Str(opArgs["path"]) == "" {
-		if dir := b.cfg.Settings().ScreenshotDir; dir != "" {
+		if dir := pathx.ExpandHome(b.cfg.Settings().ScreenshotDir); dir != "" {
 			opArgs["path"] = filepath.Join(dir, fmt.Sprintf("browser-%d.png", time.Now().UnixMilli()))
 		}
 	}

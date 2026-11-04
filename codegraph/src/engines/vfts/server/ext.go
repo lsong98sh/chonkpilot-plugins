@@ -50,22 +50,6 @@ func newExtSet(exts []string) map[string]bool {
 	return extx.Set(exts)
 }
 
-// isBinary 粗判二进制：前 8KB 出现 NUL 字节即视为二进制（跳过不索引）。
-// utilguard:allow: vfts 索引对 UTF-16 BOM 文件也按二进制跳过（不做 textx.IsBinary 的 BOM 例外），
-// 这是流式索引的既有行为，改动会影响索引集合。
-func isBinary(data []byte) bool {
-	n := len(data)
-	if n > 8192 {
-		n = 8192
-	}
-	for i := 0; i < n; i++ {
-		if data[i] == 0 {
-			return true
-		}
-	}
-	return false
-}
-
 // normalizeText 统一换行为 '\n'（避免 CRLF 影响行号与片段）。
 func normalizeText(s string) string {
 	s = strings.ReplaceAll(s, "\r\n", "\n")

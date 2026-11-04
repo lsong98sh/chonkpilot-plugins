@@ -96,6 +96,10 @@ func (f *filePlugin) call(ctx context.Context, name string, args map[string]any)
 // 抽成包级函数是为了让进程内 MCP 面测试（tools_mcp_test.go）复用同一条分派链，不重复实现。
 func dispatch(ctx context.Context, name string, args map[string]any) (string, bool) {
 	applyCallMeta(ctx)
+	// C4（2026-11-03）：写工具按 `_meta.chonkpilot.sandbox` 做可写白名单校验（未启用 = 不校验）。
+	if msg := checkSandboxWritable(ctx, name, args); msg != "" {
+		return msg, true
+	}
 	res, ok := toolset.Dispatch(ctx, name, args)
 	if !ok {
 		return "未知工具: " + name, true
@@ -125,7 +129,17 @@ func (f *filePlugin) applyDefaults(args map[string]any) {
 		"purpose": cfg.DefaultPurpose,
 	})
 	if cfg.DefaultEncoding != "" {
-		pluginsdk.MergeMissing(args, map[string]any{"encoding": cfg.DefaultEncoding})
+		// 编码是**逐 target** 参数（filetool 读 targets[i].encoding）：把默认值注入缺省项，
+		// 而不是塞到顶层（顶层 encoding 无任何消费方）。2026-10-31 审查订正。
+		if targets, ok := args["targets"].([]any); ok {
+			for _, it := range targets {
+				if m, ok := it.(map[string]any); ok {
+					if _, exists := m["encoding"]; !exists {
+						m["encoding"] = cfg.DefaultEncoding
+					}
+				}
+			}
+		}
 	}
 	if maxTargets := cfg.MaxTargets; maxTargets > 0 {
 		if targets, ok := args["targets"].([]any); ok && len(targets) > maxTargets {

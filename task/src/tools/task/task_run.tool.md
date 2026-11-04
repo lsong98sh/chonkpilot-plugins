@@ -13,7 +13,7 @@ timeout: 600
 ```
 
 # 摘要
-执行一条本机命令或脚本（前台执行，带超时，返回退出码与输出）。`command` 与 `file` **二选一**：前者是脚本/命令内容，后者是脚本文件的绝对路径。`runtime` 缺省 `shell`（Windows = PowerShell，其它平台 = `/bin/sh`），可选 `cmd` / `bash` / `powershell` / `python` / `js` / `vbs` / `java`。**跑 exe 不需要额外 runtime**：用 `shell` 或 `cmd`，`file` 填 exe 绝对路径，或 `command` 写 exe 路径 + 参数。工具以**调用方进程权限**运行，不提权、不弹 UAC；遇到必须管理员权限的操作会返回 `ok:false` 并附可复制的命令行。
+执行一条本机命令或脚本（前台执行，带超时，返回退出码与输出）。`command` 与 `file` **二选一**：前者是脚本/命令内容，后者是脚本文件的绝对路径。`runtime` 缺省 `shell`（Windows = PowerShell，其它平台 = `/bin/sh`），可选 `cmd` / `bash` / `powershell` / `python` / `js` / `vbs` / `java`。**跑 exe 不需要额外 runtime**：用 `shell` 或 `cmd`，`file` 填 exe 绝对路径，或 `command` 写 exe 路径 + 参数。工具以**调用方进程权限**运行，不提权、不弹 UAC；遇到必须管理员权限的操作会返回 `ok:false` 并附可复制的命令行。**沙箱**：开关开启时脚本以 Low Integrity Level 运行，只能写项目「可写目录」白名单（`work_dir` + `.chonkpilot/tmp` + 配置目录，递归），读取不受限；未开启时不隔离。
 
 # 参数
 ```json

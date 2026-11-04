@@ -17,6 +17,7 @@ package main
 
 import (
 	"context"
+	"embed"
 	"encoding/json"
 	"fmt"
 	"hash/fnv"
@@ -37,6 +38,12 @@ import (
 
 const pluginVersion = "1.0.0"
 
+//go:embed all:webui
+var webuiFS embed.FS
+
+// uiAssetRoot 是 webui 资源根（`plugin/v1/ui.asset.get` 的相对前缀）。
+const uiAssetRoot = "webui"
+
 func main() {
 	p, err := pluginsdk.New(pluginsdk.Options{
 		ID:      "memory",
@@ -44,7 +51,7 @@ func main() {
 		Version: pluginVersion,
 		// 单次宿主调用上限：覆盖插件侧 llmTimeout（60s）；data-* 等短调用由 bridgebus 另行收敛到 5s。
 		Timeout:  120 * time.Second,
-		Features: map[string]any{"mq": true},
+		Features: map[string]any{"mq": true, "ui": true},
 	})
 	if err != nil {
 		slog.Error("memory: 连接插件桥失败", "err", err)
@@ -79,6 +86,9 @@ func main() {
 		os.Exit(1)
 	}
 	defer plug.Stop()
+
+	// 配置页（MEMORY-UI-1）：插件维护 → 记忆沉淀 → 配置（webui 资源 + UI 动作面）。
+	registerUI(p, plug)
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()

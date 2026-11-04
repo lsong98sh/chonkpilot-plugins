@@ -37,6 +37,7 @@ import (
 	"encoding/json"
 	"os"
 	"os/exec"
+	"os/user"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -267,6 +268,15 @@ func (h *History) logf() func(string, ...any) {
 		return h.deps.Logf
 	}
 	return func(string, ...any) {}
+}
+
+// logfWD 取**带项目标签**的日志函数（PLUGIN-LOG-1）：行尾由 SDK 追加 `wd=<workDir>`，
+// 宿主据此把该行镜像到项目日志。未装配 LogfWD（旧宿主 / 单测）→ 回落 logf（只进全局）。
+func (h *History) logfWD(workDir string) func(string, ...any) {
+	if h.deps.LogfWD != nil {
+		return func(format string, args ...any) { h.deps.LogfWD(workDir, format, args...) }
+	}
+	return h.logf()
 }
 
 // ─── 门控（history.enabled）────────────────────────────────
@@ -526,7 +536,7 @@ func (h *History) clearChain(slug string) error {
 		}
 		if _, err := h.git(ws, "update-ref", "-d", chainRefPrefix+slug); err != nil {
 			ws.mu.Unlock()
-			h.logf()("history: history.clear 删除目标会话链失败（workdir=%s，slug=%s）：%v", ws.workDir, slug, err)
+			h.logfWD(ws.workDir)("history: history.clear 删除目标会话链失败（slug=%s）：%v", slug, err)
 			if firstErr == nil {
 				firstErr = err
 			}
@@ -545,7 +555,7 @@ func (h *History) clearChain(slug string) error {
 			ws.lastSlug = ""
 		}
 		ws.mu.Unlock()
-		h.logf()("history: history.clear → 已清空目标会话检查点链（workdir=%s，slug=%s）", ws.workDir, slug)
+		h.logfWD(ws.workDir)("history: history.clear → 已清空目标会话检查点链（slug=%s）", slug)
 		h.writeback(ws, slug)
 	}
 	return firstErr
@@ -695,7 +705,7 @@ func (h *History) onComplete(_ string, payload []byte) {
 		return
 	}
 	if err := h.checkpointSync(ws, rec.root, "session-complete", ev.Turn, true); err != nil {
-		h.logf()("history: 轮末补点失败（workdir=%s）：%v", ws.workDir, err)
+		h.logfWD(ws.workDir)("history: 轮末补点失败：%v", err)
 	}
 }
 
@@ -747,15 +757,42 @@ func (h *History) anyActive() bool {
 // dataEmit / newReqID / strval / prjConfigReadKey / prjConfigSaveKey 已收口到 plugin/dataclient
 // （三插件逐字重复 → 单点实现），本包改为调用 dataclient.*。
 
-// instanceForWorkdir 返回该 workdir 任一活跃实例 id（回写 prj-config 用；无则空串）。
+// instanceForWorkdir 返回该 workdir 的活跃实例 id（回写 prj-config 用；无则空串）。
+//
+// 多用户（D-50，2026-10-31）：prjusr 数据根按**实例归属用户**解析，故优先选与本进程 OS 用户
+// 一致的实例；同用户有多个 → 取 id 最小（稳定）。无同用户实例（如本机用户与注册用户不一致）
+// 才回落到任一实例，保持引入前行为（不强行丢弃回写）。
 func (h *History) instanceForWorkdir(wd string) string {
-	var inst string
-	for _, ins := range h.im.List() {
-		if filepath.Clean(ins.WorkDir) == wd && (inst == "" || ins.ID < inst) {
-			inst = ins.ID
+	return pickInstanceForWorkdir(h.im.List(), wd, currentOSUser())
+}
+
+// pickInstanceForWorkdir 是 instanceForWorkdir 的纯选择逻辑（便于单测）：
+// 同用户优先、id 最小稳定；无同用户 → 任一 id 最小；无匹配 → ""。
+func pickInstanceForWorkdir(list []instance.Info, wd, me string) string {
+	var mine, anyInst string
+	for _, ins := range list {
+		if filepath.Clean(ins.WorkDir) != wd {
+			continue
+		}
+		if anyInst == "" || ins.ID < anyInst {
+			anyInst = ins.ID
+		}
+		if me != "" && ins.User == me && (mine == "" || ins.ID < mine) {
+			mine = ins.ID
 		}
 	}
-	return inst
+	if mine != "" {
+		return mine
+	}
+	return anyInst
+}
+
+// currentOSUser 取本机 OS 用户名（与宿主 instance-register 的 `user` 同口径；取不到 → ""）。
+func currentOSUser() string {
+	if u, err := user.Current(); err == nil && u != nil {
+		return strings.TrimSpace(u.Username)
+	}
+	return ""
 }
 
 // ensureGitignore 保证 work-dir .gitignore 含 .chonkpilot/（chonkpilot 数据目录不入库）。

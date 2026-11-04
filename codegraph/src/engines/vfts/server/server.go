@@ -3,7 +3,9 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -28,6 +30,7 @@ var toolSpecs = []toolSpec{
 			"docs 段（可选）接入「文档转换服务」（Office/PDF → 文本）：docs 开关、doc_endpoint（如 http://127.0.0.1:7317）、" +
 			"doc_token（X-Chonk-Token，仅内存、不落盘）、doc_max_bytes（文档单文件上限，默认 50MiB）、" +
 			"doc_text_max_bytes（转换文本上限，默认 2MiB）、doc_cache_dir（转换缓存目录，默认 <workdir>/.chonkpilot/vfts/doc_text）。" +
+			"encoding 指定遗留文本编码（默认 auto 自动识别；可填 utf-8 / gb18030 / gbk / shift_jis / big5 / euc-kr）。" +
 			"docs 各字段为「键存在即覆盖（含空值）」：doc_endpoint/doc_token 下发空串 = 服务不可用（清掉旧值）。" +
 			"文档类扩展名（docx/xlsx/pptx/pdf）独立成组，仅在 docs 开启时参与索引。",
 		Props: map[string]any{
@@ -42,6 +45,7 @@ var toolSpecs = []toolSpec{
 			"doc_max_bytes":      map[string]any{"type": "integer", "description": "文档类单文件上限字节（默认 50MiB）"},
 			"doc_text_max_bytes": map[string]any{"type": "integer", "description": "单文件转换文本上限字节（默认 2MiB）"},
 			"doc_cache_dir":      map[string]any{"type": "string", "description": "转换缓存目录（默认 <workdir>/.chonkpilot/vfts/doc_text）"},
+			"encoding":           map[string]any{"type": "string", "description": "遗留文本编码（默认 auto 自动识别；可填 utf-8 / gb18030 / gbk / shift_jis / big5 / euc-kr，缺省不改）"},
 		},
 		Required: []string{"workdir"},
 		Fn:       toolConfigure,
@@ -50,6 +54,7 @@ var toolSpecs = []toolSpec{
 		Name: "vfts_index",
 		Description: "对某 workdir 建/更新 FTS 全文索引（同步，直到完成并落盘到 <workdir>/.chonkpilot/vfts/）：" +
 			"不传 files/remove 时全量重建（索引源码 + .txt + .md 等纯文本，按 gitignore 语义排除，含 .chonkpilot；" +
+			"文本类先识别编码并转 UTF-8（UTF-16 BOM / UTF-8 BOM / GBK-GB18030 中文）再分词；" +
 			"非文档类单文件 >8MB 或二进制跳过、文档类 >doc_max_bytes 跳过（需 docs 已开启且转换服务可用）；重复调用为幂等重建）；" +
 			"传 files/remove 时按文件增量（仅处理这些文件）。" +
 			"返回 mode 与计数（added/updated/removed/removedChunks/newChunks），以及逐文件 indexed[{path,key,doc_ids,chunks}]（供调用方回写清单）。",
@@ -91,17 +96,68 @@ var toolSpecs = []toolSpec{
 		Required: []string{"user_dict"},
 		Fn:       toolDictSet,
 	},
+	// ---- 会话索引管理（SESSION-FTS，hot=false，插件内部调用）----
+	{
+		Name: "vfts_session_index",
+		Description: "写入/删除**会话内容索引**（独立于文件索引，落 <workdir>/.chonkpilot/vfts-session/）：" +
+			"一条消息 = 一个 doc（主键 s:<session_id>:<message_id>，path=sessions/<session_id>/<message_id>，" +
+			"content=消息正文，另存 session_id/dialog_id/turn_id/message_id/role/ts）。" +
+			"docs 每项 {session_id,dialog_id,turn_id,message_id,role,ts,text}；remove 每项 {session_id,message_id}" +
+			"（也接受主键字符串 \"s:<session_id>:<message_id>\"）。按 message_id **先删后插**（幂等）。" +
+			"返回 {added, removed, total}。",
+		Props: map[string]any{
+			"workdir": map[string]any{"type": "string", "description": "项目根目录（绝对路径）"},
+			"docs": map[string]any{
+				"type":        "array",
+				"items":       map[string]any{"type": "object"},
+				"description": "待写入的消息 doc：每项 {session_id,dialog_id?,turn_id?,message_id,role,ts?,text}",
+			},
+			"remove": map[string]any{
+				"type":        "array",
+				"items":       map[string]any{"type": "object"},
+				"description": "待删除的消息：每项 {session_id,message_id}（也接受主键字符串）",
+			},
+		},
+		Required: []string{"workdir"},
+		Fn:       toolSessionIndex,
+	},
+	{
+		Name: "vfts_session_clear",
+		Description: "清空**会话内容索引**：给 session_id 时只删该会话；缺省清空整个会话集合（含落盘目录）。" +
+			"返回 {ok, removed}。",
+		Props: map[string]any{
+			"workdir":    map[string]any{"type": "string", "description": "项目根目录（绝对路径）"},
+			"session_id": map[string]any{"type": "string", "description": "只清理该会话（缺省 = 清空整个会话集合）"},
+		},
+		Required: []string{"workdir"},
+		Fn:       toolSessionClear,
+	},
+	{
+		Name: "vfts_session_status",
+		Description: "查询**会话内容索引**状态：state（\"\"未初始化 / ready / error）、sessions（已索引会话数）、" +
+			"docs（消息 doc 数）、lastIndexedAt。",
+		Props: map[string]any{
+			"workdir": map[string]any{"type": "string", "description": "项目根目录（绝对路径）"},
+		},
+		Required: []string{"workdir"},
+		Fn:       toolSessionStatus,
+	},
 	// ---- 查询类（hot=true）----
 	{
 		Name: "vfts_query",
-		Description: "在某 workdir 的 vfts 全文索引中检索：match 为自然语言匹配串，query 为布尔/高级表达式" +
-			"（二者至少给其一，query 不支持字段前缀）；返回命中文件 + 片段/行号（topK，按相关度）。",
+		Description: "在 vfts 全文索引中检索：match 为自然语言匹配串，query 为布尔/高级表达式" +
+			"（二者至少给其一，query 不支持字段前缀）。scope=file（默认）检索文件：返回命中文件 + 片段/行号" +
+			"（topK，按相关度）；scope=session 检索**会话正文索引**：按 ts 升序返回命中消息" +
+			"（session_id/dialog_id/turn_id/message_id/role/ts/snippet/score），snippet 为命中词前后约 240 字符正文。",
 		Props: map[string]any{
-			"workdir": map[string]any{"type": "string", "description": "项目根目录"},
-			"match":   map[string]any{"type": "string", "description": "自然语言匹配串（如：全文索引）"},
-			"query":   map[string]any{"type": "string", "description": "布尔/高级表达式（如：fox AND brown；不支持 content: 字段前缀）"},
-			"topK":    map[string]any{"type": "integer", "description": "返回命中文件数上限（默认 20）"},
-			"path":    map[string]any{"type": "string", "description": "文件路径子串过滤（可选）"},
+			"workdir":    map[string]any{"type": "string", "description": "项目根目录"},
+			"scope":      map[string]any{"type": "string", "enum": []string{"file", "session"}, "description": "检索范围（默认 file；session = 会话正文索引）"},
+			"session_id": map[string]any{"type": "string", "description": "scope=session 时按会话过滤（缺省 = 全部会话）"},
+			"role":       map[string]any{"type": "string", "enum": []string{"user", "assistant"}, "description": "scope=session 时按角色过滤（缺省 = 两者）"},
+			"match":      map[string]any{"type": "string", "description": "自然语言匹配串（如：全文索引）"},
+			"query":      map[string]any{"type": "string", "description": "布尔/高级表达式（如：fox AND brown；不支持 content: 字段前缀）"},
+			"topK":       map[string]any{"type": "integer", "description": "返回命中数上限（默认 20）"},
+			"path":       map[string]any{"type": "string", "description": "文件路径子串过滤（可选，scope=file）"},
 		},
 		Required: []string{"workdir"},
 		Hot:      true,
@@ -111,7 +167,23 @@ var toolSpecs = []toolSpec{
 
 // RegisterTools 把全部工具注册进官方 go-sdk server（管理工具标 hot=false）。
 func RegisterTools(srv *mcp.Server) error {
+	return registerTools(srv, true)
+}
+
+// RegisterManagementTools 只注册**管理工具**（不含 vfts_query）。
+//
+// 插件（codegraph）用本入口：查询面由插件自己注册（schema 不带 workdir，workdir 从
+// `_meta.chonkpilot.work_dir` 注入，见 2B §3.5「工具表面不带 workdir」）。
+func RegisterManagementTools(srv *mcp.Server) error {
+	return registerTools(srv, false)
+}
+
+// registerTools 注册工具集（withQuery=false 时跳过查询类工具）。
+func registerTools(srv *mcp.Server, withQuery bool) error {
 	for _, spec := range toolSpecs {
+		if !withQuery && spec.Hot {
+			continue
+		}
 		schema := map[string]any{"type": "object", "properties": spec.Props}
 		if len(spec.Required) > 0 {
 			schema["required"] = spec.Required
@@ -382,8 +454,12 @@ func toolConfigure(_ context.Context, args map[string]any) (any, error) {
 	if err != nil {
 		return nil, err
 	}
+	var enc []string
+	if p := getStringPtr(args, "encoding"); p != nil {
+		enc = append(enc, *p)
+	}
 	if err := w.Configure(getBoolPtr(args, "enabled"), getStrings(args, "exts"), getStrings(args, "skip_dirs"),
-		getBoolPtr(args, "stack_gitignore"), docsConfigFromArgs(args)); err != nil {
+		getBoolPtr(args, "stack_gitignore"), docsConfigFromArgs(args), enc...); err != nil {
 		return nil, err
 	}
 	return map[string]any{"ok": true, "workdir": w.Dir, "meta": w.Meta()}, nil
@@ -454,6 +530,9 @@ func toolStatus(_ context.Context, args map[string]any) (any, error) {
 // ---- 查询工具实现 ----
 
 func toolQuery(_ context.Context, args map[string]any) (any, error) {
+	if getString(args, "scope") == "session" {
+		return toolSessionQuery(args)
+	}
 	resp, w, ok := readyGate(args)
 	if !ok {
 		return resp, nil
@@ -469,4 +548,125 @@ func toolQuery(_ context.Context, args map[string]any) (any, error) {
 		return nil, err
 	}
 	return map[string]any{"workdir": w.Dir, "total": len(hits), "hits": hits}, nil
+}
+
+// toolSessionQuery 会话正文检索（scope=session）：未初始化走结构化应答（不算协议错误）。
+func toolSessionQuery(args map[string]any) (any, error) {
+	w, err := needWS(args)
+	if err != nil {
+		return nil, err
+	}
+	match := getString(args, "match")
+	expr := getString(args, "query")
+	if match == "" && expr == "" {
+		return nil, fmt.Errorf("需要 match 或 query 至少其一")
+	}
+	role := strings.ToLower(strings.TrimSpace(getString(args, "role")))
+	if role != "" && role != "user" && role != "assistant" {
+		return nil, fmt.Errorf("role 只允许 user / assistant（收到 %q）", role)
+	}
+	hits, err := w.QuerySessions(match, expr, getInt(args, "topK", 20), getString(args, "session_id"), role)
+	if err != nil {
+		if errors.Is(err, ErrSessionNotInitialized) {
+			return map[string]any{
+				"status": "not_initialized", "state": "not_initialized",
+				"message": "该项目尚未建立会话内容索引（请先在 vfts 配置页开启「会话内容检索」或重建会话索引）",
+				"workdir": w.Dir, "total": 0, "hits": []SessionHit{},
+			}, nil
+		}
+		return nil, err
+	}
+	return map[string]any{"workdir": w.Dir, "total": len(hits), "hits": hits}, nil
+}
+
+// ---- 会话索引管理工具实现 ----
+
+func toolSessionIndex(_ context.Context, args map[string]any) (any, error) {
+	w, err := needWS(args)
+	if err != nil {
+		return nil, err
+	}
+	docs := sessionDocsFromArgs(args["docs"])
+	removes := sessionRemovesFromArgs(args["remove"])
+	res, err := w.IndexSessions(docs, removes)
+	if err != nil {
+		return nil, err
+	}
+	return map[string]any{"ok": true, "workdir": w.Dir,
+		"added": res.Added, "removed": res.Removed, "total": res.Total}, nil
+}
+
+func toolSessionClear(_ context.Context, args map[string]any) (any, error) {
+	w, err := needWS(args)
+	if err != nil {
+		return nil, err
+	}
+	removed, err := w.ClearSessions(getString(args, "session_id"))
+	if err != nil {
+		return nil, err
+	}
+	return map[string]any{"ok": true, "workdir": w.Dir, "removed": removed}, nil
+}
+
+func toolSessionStatus(_ context.Context, args map[string]any) (any, error) {
+	w, err := needWS(args)
+	if err != nil {
+		return nil, err
+	}
+	st := w.SessionStatus()
+	return map[string]any{
+		"workdir": w.Dir, "state": st.State, "sessions": st.Sessions,
+		"docs": st.Docs, "lastIndexedAt": st.LastIndexedAt,
+	}, nil
+}
+
+// sessionDocsFromArgs 解析 docs 参数（对象数组；非法项忽略）。
+func sessionDocsFromArgs(v any) []SessionDoc {
+	arr, ok := v.([]any)
+	if !ok {
+		return nil
+	}
+	out := make([]SessionDoc, 0, len(arr))
+	for _, item := range arr {
+		m, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		out = append(out, SessionDoc{
+			SessionID: getString(m, "session_id"),
+			DialogID:  getString(m, "dialog_id"),
+			TurnID:    getString(m, "turn_id"),
+			MessageID: getString(m, "message_id"),
+			Role:      getString(m, "role"),
+			TS:        int64(getInt(m, "ts", 0)),
+			Text:      getString(m, "text"),
+		})
+	}
+	return out
+}
+
+// sessionRemovesFromArgs 解析 remove 参数：对象 {session_id,message_id} 或字面主键
+// "s:<session_id>:<message_id>"（契约形态）。
+func sessionRemovesFromArgs(v any) []SessionRemove {
+	arr, ok := v.([]any)
+	if !ok {
+		return nil
+	}
+	out := make([]SessionRemove, 0, len(arr))
+	for _, item := range arr {
+		switch x := item.(type) {
+		case string:
+			s := strings.TrimSpace(x)
+			if sid, mid, ok := strings.Cut(strings.TrimPrefix(s, "s:"), ":"); ok && strings.HasPrefix(s, "s:") {
+				out = append(out, SessionRemove{SessionID: sid, MessageID: mid})
+			}
+		case map[string]any:
+			sid := getString(x, "session_id")
+			mid := getString(x, "message_id")
+			if sid != "" && mid != "" {
+				out = append(out, SessionRemove{SessionID: sid, MessageID: mid})
+			}
+		}
+	}
+	return out
 }

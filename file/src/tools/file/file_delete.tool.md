@@ -15,6 +15,8 @@ timeout: 120
 # 摘要
 按批删除文件或目录。统一参数 `{purpose, targets[]}`。
 
+**沙箱**：开启沙箱时，`targets[].path` 必须落在项目「可写目录」白名单内（递归），否则**整次调用被拒绝**；未开启沙箱不受此限制。
+
 - 删目录必须显式 `recursive=true`，否则该项 `failed`（防误删整棵树）。
 - `missingOk` 缺省 false：目标不存在 → `failed`；`true` → `skipped`（幂等重试友好）。
 - 删除前记录 `md5`（仅文件）与 `size`，随结果返回，便于审计与事后恢复判断。

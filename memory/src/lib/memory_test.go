@@ -187,6 +187,7 @@ func TestExtractRewritesEnabledCategories(t *testing.T) {
 		return map[string]any{"list": map[string]any{
 			memoryEnabledKey:              "true",
 			memoryMinTokensKey:            "1",
+			memoryTriggerKey:              "every-turn", // 验证轮末沉淀路径（默认 compress 不提取）
 			memoryCategoryPrefix + "开发规范": "false",
 		}}
 	})
@@ -280,6 +281,7 @@ func TestUserPrefCategoryToggle(t *testing.T) {
 		return map[string]any{"list": map[string]any{
 			memoryEnabledKey:              "true",
 			memoryMinTokensKey:            "1",
+			memoryTriggerKey:              "every-turn", // 验证轮末沉淀路径（默认 compress 不提取）
 			memoryCategoryPrefix + "用户偏好": "false",
 		}}
 	})
@@ -364,7 +366,10 @@ func TestDistillCarriesSubsystemLLM(t *testing.T) {
 		"llms":       []any{map[string]any{"name": "prov-m"}},
 	})
 	reply(t, bus, prjConfigListSubject, func(map[string]any) map[string]any {
-		return map[string]any{"list": map[string]any{memoryEnabledKey: "true", memoryMinTokensKey: "1"}}
+		return map[string]any{"list": map[string]any{
+			memoryEnabledKey: "true", memoryMinTokensKey: "1",
+			memoryTriggerKey: "every-turn", // 验证轮末沉淀路径（默认 compress 不提取）
+		}}
 	})
 	reply(t, bus, sessionLoadSubject, func(map[string]any) map[string]any {
 		return map[string]any{"messages": []any{
@@ -411,7 +416,10 @@ func TestDistillCarriesSubsystemLLM(t *testing.T) {
 func TestDistillWithoutSubsystemLLMByteEquivalent(t *testing.T) {
 	bus := newTestBus(t) // 默认空 usr 配置
 	reply(t, bus, prjConfigListSubject, func(map[string]any) map[string]any {
-		return map[string]any{"list": map[string]any{memoryEnabledKey: "true", memoryMinTokensKey: "1"}}
+		return map[string]any{"list": map[string]any{
+			memoryEnabledKey: "true", memoryMinTokensKey: "1",
+			memoryTriggerKey: "every-turn", // 验证轮末沉淀路径（默认 compress 不提取）
+		}}
 	})
 	reply(t, bus, sessionLoadSubject, func(map[string]any) map[string]any {
 		return map[string]any{"messages": []any{
@@ -450,6 +458,101 @@ func TestDistillWithoutSubsystemLLMByteEquivalent(t *testing.T) {
 	})
 	if string(raw) != string(want) {
 		t.Fatalf("未指定子系统 LLM 时载荷须逐字节等价：\n got=%s\nwant=%s", raw, want)
+	}
+}
+
+// TestTriggerCompressSkipsTurnEnd：默认 memory.trigger=compress（2026-10-31 用户定案：提取跟随
+// 压缩）→ 轮末累计 token 低于安全阀（memory.safety-tokens，默认 20000）时**不提取**；
+// 显式把安全阀调到 1 → 轮末照常提取（安全阀生效）。
+func TestTriggerCompressSkipsTurnEnd(t *testing.T) {
+	newBusWith := func(t *testing.T, extra map[string]any) (mq.Bus, *int32) {
+		t.Helper()
+		bus := newTestBus(t)
+		list := map[string]any{memoryEnabledKey: "true", memoryMinTokensKey: "1"}
+		for k, v := range extra {
+			list[k] = v
+		}
+		reply(t, bus, prjConfigListSubject, func(map[string]any) map[string]any {
+			return map[string]any{"list": list}
+		})
+		stubSessionGet(t, bus, "")
+		stubSessionHistory(t, bus, []any{map[string]any{"turn_id": "t1", "full_tokens": 100}})
+		stubProgress(t, bus, map[string]string{})
+		stubProgressSave(t, bus, nil)
+		reply(t, bus, memoryListSubject, func(map[string]any) map[string]any {
+			return map[string]any{"list": []any{
+				map[string]any{"category": "项目概要", "level": "project", "prompt": "P"},
+			}}
+		})
+		stubTurnMessages(t, bus)
+		_, saved := stubRewriteReplies(t, bus)
+		return bus, saved
+	}
+
+	// ① 默认 compress：100 token < 安全阀 20000 → 不提取（不调 LLM、不写记忆）。
+	bus1, saved1 := newBusWith(t, nil)
+	p1 := New(DefaultOptions())
+	p1.deps = plugin.Deps{Bus: bus1}
+	res1 := p1.process(turnEvent{InstanceID: "ins-1", WorkDir: `C:\ws`, Session: "s1", LastTurn: "t1"}, false)
+	if res1["ok"] != true {
+		t.Fatalf("compress 模式轮末应正常跳过（ok:true）：%+v", res1)
+	}
+	if n := atomic.LoadInt32(saved1); n != 0 {
+		t.Fatalf("compress 模式轮末不应提取：保存次数 = %d，want 0", n)
+	}
+
+	// ② 安全阀 = 1 → 100 ≥ 1 → 轮末照常提取。
+	bus2, saved2 := newBusWith(t, map[string]any{memorySafetyTokensKey: "1"})
+	p2 := New(DefaultOptions())
+	p2.deps = plugin.Deps{Bus: bus2}
+	p2.process(turnEvent{InstanceID: "ins-1", WorkDir: `C:\ws`, Session: "s1", LastTurn: "t1"}, false)
+	if n := atomic.LoadInt32(saved2); n != 1 {
+		t.Fatalf("安全阀达阈值应提取：保存次数 = %d，want 1", n)
+	}
+
+	// ③ force=true（压缩前 memory.flush / 手动）不受触发策略影响 → 始终提取。
+	bus3, saved3 := newBusWith(t, nil)
+	p3 := New(DefaultOptions())
+	p3.deps = plugin.Deps{Bus: bus3}
+	p3.process(turnEvent{InstanceID: "ins-1", WorkDir: `C:\ws`, Session: "s1", LastTurn: "t1"}, true)
+	if n := atomic.LoadInt32(saved3); n != 1 {
+		t.Fatalf("force=true 应提取（跳过触发策略与阈值）：保存次数 = %d，want 1", n)
+	}
+}
+
+// TestResolveConfigTriggerDefaults：memory.trigger / memory.safety-tokens 读口径 ——
+// 缺失 → compress / 20000；显式 every-turn / 0 → 生效。
+func TestResolveConfigTriggerDefaults(t *testing.T) {
+	bus := newTestBus(t)
+	reply(t, bus, prjConfigListSubject, func(map[string]any) map[string]any {
+		return map[string]any{"list": map[string]any{memoryEnabledKey: "true"}}
+	})
+	p := New(DefaultOptions())
+	p.deps = plugin.Deps{Bus: bus}
+	cfg, err := p.resolveConfig("ins-1")
+	if err != nil {
+		t.Fatalf("resolveConfig: %v", err)
+	}
+	if cfg.Trigger != triggerCompress || cfg.SafetyTokens != defaultSafetyTokens {
+		t.Fatalf("缺失应回落 compress/%d：%+v", defaultSafetyTokens, cfg)
+	}
+
+	bus2 := newTestBus(t)
+	reply(t, bus2, prjConfigListSubject, func(map[string]any) map[string]any {
+		return map[string]any{"list": map[string]any{
+			memoryEnabledKey:      "true",
+			memoryTriggerKey:      "every-turn",
+			memorySafetyTokensKey: "0",
+		}}
+	})
+	p2 := New(DefaultOptions())
+	p2.deps = plugin.Deps{Bus: bus2}
+	cfg2, err := p2.resolveConfig("ins-1")
+	if err != nil {
+		t.Fatalf("resolveConfig(2): %v", err)
+	}
+	if cfg2.Trigger != triggerEveryTurn || cfg2.SafetyTokens != 0 {
+		t.Fatalf("显式值未生效：%+v", cfg2)
 	}
 }
 

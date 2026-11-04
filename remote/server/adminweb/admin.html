@@ -1,0 +1,305 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>ChonkPilot Remote · 后台管理</title>
+<style>
+  :root { color-scheme: light dark; --bg:#f5f6f8; --panel:#fff; --line:#e3e6ea; --text:#1f2329; --dim:#6b7280; --accent:#2f6feb; --danger:#d92d20; --ok:#12b76a; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#14161a; --panel:#1c1f25; --line:#2b3038; --text:#e6e8ec; --dim:#9aa3af; --accent:#6b9bff; --danger:#ff6b6b; --ok:#3ddc97; } }
+  * { box-sizing: border-box; }
+  body { margin:0; font:14px/1.5 system-ui, "Segoe UI", "Microsoft YaHei", sans-serif; background:var(--bg); color:var(--text); }
+  header { display:flex; align-items:center; gap:12px; padding:12px 20px; background:var(--panel); border-bottom:1px solid var(--line); }
+  header h1 { font-size:15px; margin:0; font-weight:600; }
+  header .spacer { flex:1; }
+  main { padding:20px; max-width:1200px; margin:0 auto; }
+  .card { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:16px 18px; margin-bottom:16px; }
+  .row { display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
+  input, select { height:32px; padding:0 10px; border:1px solid var(--line); border-radius:6px; background:var(--panel); color:var(--text); font:inherit; }
+  button { height:32px; padding:0 12px; border-radius:6px; border:1px solid var(--line); background:var(--panel); color:var(--text); font:inherit; cursor:pointer; }
+  button.primary { background:var(--accent); border-color:var(--accent); color:#fff; }
+  button.danger { color:var(--danger); border-color:var(--danger); }
+  button:disabled { opacity:.5; cursor:not-allowed; }
+  table { width:100%; border-collapse:collapse; }
+  th, td { text-align:left; padding:8px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  th { color:var(--dim); font-weight:500; font-size:12.5px; }
+  .tabs { display:flex; gap:6px; margin-bottom:14px; }
+  .tabs button.on { border-color:var(--accent); color:var(--accent); }
+  .muted { color:var(--dim); }
+  .tag { display:inline-block; padding:1px 7px; border-radius:999px; border:1px solid var(--line); font-size:12px; }
+  .tag.ok { color:var(--ok); border-color:var(--ok); }
+  .tag.off { color:var(--dim); }
+  .tag.admin { color:var(--accent); border-color:var(--accent); }
+  .tag.disabled { color:var(--danger); border-color:var(--danger); }
+  .ws { margin:0; padding-left:16px; }
+  .ws code { font-family: ui-monospace, Consolas, monospace; font-size:12.5px; word-break:break-all; }
+  #login { max-width:360px; margin:12vh auto; }
+  #login .row { flex-direction:column; align-items:stretch; }
+  #toast { position:fixed; right:20px; bottom:20px; display:flex; flex-direction:column; gap:8px; }
+  #toast div { padding:8px 12px; border-radius:8px; background:var(--panel); border:1px solid var(--line); box-shadow:0 6px 20px rgba(0,0,0,.18); }
+  .hide { display:none !important; }
+</style>
+</head>
+<body>
+<header>
+  <h1>ChonkPilot Remote · 后台管理</h1>
+  <span class="spacer"></span>
+  <span id="who" class="muted"></span>
+  <button id="logout" class="hide">退出</button>
+</header>
+
+<main>
+  <section id="login" class="card">
+    <h2 style="font-size:15px;margin:0 0 12px">管理员登录</h2>
+    <div class="row">
+      <input id="u" placeholder="用户名" autocomplete="username" />
+      <input id="p" type="password" placeholder="密码" autocomplete="current-password" />
+      <button id="doLogin" class="primary">登录</button>
+    </div>
+    <p id="loginHint" class="muted" style="margin:10px 0 0">使用 admin 角色的账号登录。</p>
+  </section>
+
+  <section id="app" class="hide">
+    <div class="tabs">
+      <button data-tab="users" class="on">用户管理</button>
+      <button data-tab="devices">设备接入</button>
+    </div>
+
+    <!-- 用户管理 -->
+    <div id="tab-users">
+      <div class="card">
+        <div class="row">
+          <input id="newUser" placeholder="新用户名" />
+          <input id="newPass" type="password" placeholder="初始密码" />
+          <select id="newRole">
+            <option value="user">user</option>
+            <option value="admin">admin</option>
+          </select>
+          <button id="addUser" class="primary">新建账号</button>
+        </div>
+      </div>
+      <div class="card">
+        <table>
+          <thead><tr><th>用户名</th><th>角色</th><th>状态</th><th>创建时间</th><th style="width:280px">操作</th></tr></thead>
+          <tbody id="users"></tbody>
+        </table>
+        <p id="usersEmpty" class="muted hide">暂无账号</p>
+      </div>
+    </div>
+
+    <!-- 设备接入 -->
+    <div id="tab-devices" class="hide">
+      <div class="card">
+        <div class="row" style="margin-bottom:10px">
+          <button id="reloadDevices">刷新</button>
+          <span class="muted">在线状态来自桌面端隧道长连接；workdir = 该设备上报的工作区路径。</span>
+        </div>
+        <table>
+          <thead><tr><th>用户</th><th>设备</th><th>平台 / 版本</th><th>在线</th><th>最后在线</th><th>工作区（workdir）</th></tr></thead>
+          <tbody id="devices"></tbody>
+        </table>
+        <p id="devicesEmpty" class="muted hide">还没有设备接入</p>
+      </div>
+    </div>
+  </section>
+</main>
+
+<div id="toast"></div>
+
+<script>
+(function () {
+  const $ = (id) => document.getElementById(id);
+  const esc = (s) => String(s == null ? '' : s).replace(/[&<>"']/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+  const fmt = (ts) => (ts ? new Date(ts * 1000).toLocaleString() : '-');
+
+  function toast(msg) {
+    const el = document.createElement('div');
+    el.textContent = msg;
+    $('toast').appendChild(el);
+    setTimeout(() => el.remove(), 3200);
+  }
+
+  async function api(method, path, body) {
+    const opt = { method, credentials: 'same-origin', headers: {} };
+    if (body !== undefined) {
+      opt.headers['Content-Type'] = 'application/json';
+      opt.body = JSON.stringify(body);
+    }
+    const res = await fetch(path, opt);
+    let data = null;
+    try { data = await res.json(); } catch (e) { data = null; }
+    if (!res.ok) {
+      const msg = (data && data.error && data.error.message) || res.status + ' ' + res.statusText;
+      throw new Error(msg);
+    }
+    return data;
+  }
+
+  // ---------------- 登录 / 会话 ----------------
+
+  async function me() {
+    try {
+      return await api('GET', '/api/me');
+    } catch (e) {
+      return null;
+    }
+  }
+
+  async function boot() {
+    const info = await me();
+    if (!info) { showLogin(); return; }
+    if (!info.user || info.user.role !== 'admin') {
+      showLogin('当前账号不是管理员（role=admin）');
+      await api('POST', '/api/logout').catch(() => {});
+      return;
+    }
+    enterApp(info.user);
+  }
+
+  function showLogin(hint) {
+    $('login').classList.remove('hide');
+    $('app').classList.add('hide');
+    $('logout').classList.add('hide');
+    $('who').textContent = '';
+    $('loginHint').textContent = hint || '使用 admin 角色的账号登录。';
+  }
+
+  function enterApp(user) {
+    $('login').classList.add('hide');
+    $('app').classList.remove('hide');
+    $('logout').classList.remove('hide');
+    $('who').textContent = user.username + '（' + user.role + '）';
+    loadUsers();
+    loadDevices();
+  }
+
+  $('doLogin').addEventListener('click', async () => {
+    const username = $('u').value.trim();
+    const password = $('p').value;
+    if (!username || !password) { toast('请输入用户名与密码'); return; }
+    try {
+      await api('POST', '/api/login', { username, password });
+      await boot();
+    } catch (e) { toast('登录失败：' + e.message); }
+  });
+  $('p').addEventListener('keydown', (e) => { if (e.key === 'Enter') $('doLogin').click(); });
+
+  $('logout').addEventListener('click', async () => {
+    await api('POST', '/api/logout').catch(() => {});
+    showLogin();
+  });
+
+  // ---------------- 标签页 ----------------
+
+  document.querySelectorAll('.tabs button').forEach((b) => {
+    b.addEventListener('click', () => {
+      document.querySelectorAll('.tabs button').forEach((x) => x.classList.remove('on'));
+      b.classList.add('on');
+      const tab = b.dataset.tab;
+      $('tab-users').classList.toggle('hide', tab !== 'users');
+      $('tab-devices').classList.toggle('hide', tab !== 'devices');
+      if (tab === 'devices') loadDevices();
+    });
+  });
+
+  // ---------------- 用户管理 ----------------
+
+  let users = [];
+
+  async function loadUsers() {
+    try {
+      users = (await api('GET', '/api/admin/users')) || [];
+    } catch (e) { toast('读取账号失败：' + e.message); return; }
+    const tb = $('users');
+    tb.innerHTML = '';
+    $('usersEmpty').classList.toggle('hide', users.length > 0);
+    users.forEach((u) => {
+      const tr = document.createElement('tr');
+      const role = u.role === 'admin' ? '<span class="tag admin">admin</span>' : '<span class="tag">user</span>';
+      const st = u.disabled ? '<span class="tag disabled">已禁用</span>' : '<span class="tag ok">正常</span>';
+      tr.innerHTML = '<td>' + esc(u.username) + '</td><td>' + role + '</td><td>' + st + '</td><td>' + fmt(u.created_at) + '</td>' +
+        '<td><div class="row">' +
+        '<button data-act="passwd">改密</button>' +
+        '<button data-act="status">' + (u.disabled ? '启用' : '禁用') + '</button>' +
+        '<button data-act="del" class="danger">删除</button>' +
+        '</div></td>';
+      tr.querySelector('[data-act="passwd"]').addEventListener('click', () => changePassword(u.username));
+      tr.querySelector('[data-act="status"]').addEventListener('click', () => setStatus(u, !u.disabled));
+      tr.querySelector('[data-act="del"]').addEventListener('click', () => removeUser(u.username));
+      tb.appendChild(tr);
+    });
+  }
+
+  async function changePassword(name) {
+    const pwd = prompt('为账号「' + name + '」设置新密码：');
+    if (!pwd) return;
+    try {
+      await api('PATCH', '/api/admin/users/' + encodeURIComponent(name) + '/password', { password: pwd });
+      toast('密码已更新');
+    } catch (e) { toast('改密失败：' + e.message); }
+  }
+
+  async function setStatus(u, disabled) {
+    try {
+      await api('POST', '/api/admin/users/' + encodeURIComponent(u.username) + '/status', { disabled });
+      toast(disabled ? '已禁用' : '已启用');
+      loadUsers();
+    } catch (e) { toast('操作失败：' + e.message); }
+  }
+
+  async function removeUser(name) {
+    if (!confirm('删除账号「' + name + '」？其设备与登录会话会一并删除。')) return;
+    try {
+      await api('DELETE', '/api/admin/users/' + encodeURIComponent(name));
+      toast('已删除');
+      loadUsers();
+      loadDevices();
+    } catch (e) { toast('删除失败：' + e.message); }
+  }
+
+  $('addUser').addEventListener('click', async () => {
+    const username = $('newUser').value.trim();
+    const password = $('newPass').value;
+    const role = $('newRole').value;
+    if (!username || !password) { toast('请输入用户名与密码'); return; }
+    try {
+      await api('POST', '/api/admin/users', { username, password, role });
+      $('newUser').value = '';
+      $('newPass').value = '';
+      toast('账号已创建');
+      loadUsers();
+    } catch (e) { toast('创建失败：' + e.message); }
+  });
+
+  // ---------------- 设备接入 ----------------
+
+  async function loadDevices() {
+    let list = [];
+    try {
+      list = (await api('GET', '/api/admin/devices')) || [];
+    } catch (e) { toast('读取设备失败：' + e.message); return; }
+    const tb = $('devices');
+    tb.innerHTML = '';
+    $('devicesEmpty').classList.toggle('hide', list.length > 0);
+    list.forEach((d) => {
+      const ws = (d.workspaces || []).map((w) =>
+        '<li>' + esc(w.name || w.id) + ' — <code>' + esc(w.path || '（未上报）') + '</code></li>'
+      ).join('');
+      const tr = document.createElement('tr');
+      tr.innerHTML = '<td>' + esc(d.username || d.user_id || '-') + '</td>' +
+        '<td>' + esc(d.name || d.device_id) + '<div class="muted" style="font-size:12px">' + esc(d.device_id) + '</div></td>' +
+        '<td>' + esc(d.platform || '-') + ' / ' + esc(d.version || '-') + '</td>' +
+        '<td>' + (d.online ? '<span class="tag ok">在线</span>' : '<span class="tag off">离线</span>') + '</td>' +
+        '<td>' + fmt(d.last_seen) + '</td>' +
+        '<td>' + (ws ? '<ul class="ws">' + ws + '</ul>' : '<span class="muted">（无）</span>') + '</td>';
+      tb.appendChild(tr);
+    });
+  }
+
+  $('reloadDevices').addEventListener('click', loadDevices);
+
+  boot();
+})();
+</script>
+</body>
+</html>

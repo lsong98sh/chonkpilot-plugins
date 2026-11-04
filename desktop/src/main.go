@@ -17,6 +17,7 @@ import (
 
 	"github.com/lsong98sh/chonkpilot-plugin-framework/sdk"
 	"github.com/lsong98sh/chonkpilot-plugin-framework/sdk/engineclient"
+	"github.com/lsong98sh/chonkpilot-util/pathx"
 )
 
 const pluginVersion = "1.0.0"
@@ -136,7 +137,7 @@ func (d *desktopPlugin) run(ctx context.Context, args map[string]any, cx plugins
 		opArgs = map[string]any{}
 	}
 	if action == "screenshot" && pluginsdk.Str(opArgs["path"]) == "" {
-		if dir := d.cfg.Settings().ScreenshotDir; dir != "" {
+		if dir := pathx.ExpandHome(d.cfg.Settings().ScreenshotDir); dir != "" {
 			opArgs["path"] = filepath.Join(dir, fmt.Sprintf("desktop-%d.png", time.Now().UnixMilli()))
 		}
 	}

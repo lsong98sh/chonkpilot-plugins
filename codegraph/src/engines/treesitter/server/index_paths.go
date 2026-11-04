@@ -7,6 +7,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	ignore "github.com/lsong98sh/chonkpilot-util/ignore"
 )
 
 // IndexPaths 按路径增量更新索引（入参为绝对路径；相对 workdir 内部归一）。
@@ -36,8 +38,7 @@ func (w *Workspace) IndexPaths(files, removes []string) (indexed, removed, skipp
 
 	next := cloneIndex(base)
 	exts := w.extSet()
-	opts := w.excludeOptions()
-	opts.Root = w.Dir // Ignored 需要规则根（WalkDir 的根取入参，不依赖该字段）
+	m := ignore.New(w.Dir, w.excludeOptions())
 
 	for _, p := range removes {
 		rel, ok := w.relInWorkdir(p)
@@ -67,7 +68,7 @@ func (w *Workspace) IndexPaths(files, removes []string) (indexed, removed, skipp
 		}
 
 		ext := strings.ToLower(filepath.Ext(rel))
-		if !exts[ext] || opts.Ignored(rel) {
+		if !exts[ext] || m.Ignored(rel) {
 			drop()
 			continue
 		}

@@ -19,7 +19,7 @@ import (
 
 	webview2 "github.com/jchv/go-webview2"
 
-	"github.com/lsong98sh/chonkpilot-plugins/shared/pluginhost"
+	"github.com/lsong98sh/chonkpilot-plugin-framework/sdk/enginehost"
 )
 
 // evalTimeout 是单次 JS 求值的默认超时。
@@ -30,12 +30,12 @@ type webviewEngine struct {
 	wv      webview2.WebView
 	ready   chan struct{}
 	done    chan struct{}
-	opts    pluginhost.ContextOptions
+	opts    enginehost.ContextOptions
 	dataDir string
 }
 
-// NewWebViewEngine 创建并启动一个 WebView2 会话（实现 pluginhost.Options.NewEngine）。
-func NewWebViewEngine(opts pluginhost.ContextOptions) (pluginhost.Engine, error) {
+// NewWebViewEngine 创建并启动一个 WebView2 会话（实现 enginehost.Options.NewEngine）。
+func NewWebViewEngine(opts enginehost.ContextOptions) (enginehost.Engine, error) {
 	w, h := opts.Width, opts.Height
 	if w <= 0 {
 		w = 1280
@@ -125,7 +125,7 @@ func profileDir(name string) string {
 
 // Do 执行一个原子动作。
 func (e *webviewEngine) Do(action string, args map[string]any) (map[string]any, error) {
-	a := pluginhost.NormalizeAction(action)
+	a := enginehost.NormalizeAction(action)
 	switch a {
 	case "navigate", "goto", "open":
 		url := argString(args, "url")

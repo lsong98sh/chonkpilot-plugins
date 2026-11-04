@@ -290,19 +290,32 @@ func TestApplyDefaultsUsesSettings(t *testing.T) {
 	}), nil)
 	f := &filePlugin{cfg: m}
 
-	args := map[string]any{"targets": []any{"a", "b", "c"}}
+	args := map[string]any{"targets": []any{
+		map[string]any{"path": "a"},
+		map[string]any{"path": "b", "encoding": "gbk"},
+		map[string]any{"path": "c"},
+	}}
 	f.applyDefaults(args)
-	if args["purpose"] != "审查" || args["encoding"] != "utf-8" {
-		t.Errorf("默认参数未生效：%v", args)
+	if args["purpose"] != "审查" {
+		t.Errorf("默认 purpose 未生效：%v", args)
 	}
-	if targets := args["targets"].([]any); len(targets) != 2 {
-		t.Errorf("targets 截断 = %d，期望 2", len(targets))
+	targets := args["targets"].([]any)
+	if len(targets) != 2 {
+		t.Fatalf("targets 截断 = %d，期望 2", len(targets))
+	}
+	t0 := targets[0].(map[string]any)
+	t1 := targets[1].(map[string]any)
+	if t0["encoding"] != "utf-8" {
+		t.Errorf("默认 encoding 应注入缺省 target：%v", t0)
+	}
+	if t1["encoding"] != "gbk" {
+		t.Errorf("显式 target encoding 不应被覆盖：%v", t1)
 	}
 
 	// 显式入参优先（LLM 可逐次覆盖）。
-	args = map[string]any{"purpose": "自定", "encoding": "gbk"}
+	args = map[string]any{"purpose": "自定", "targets": []any{map[string]any{"path": "a"}}}
 	f.applyDefaults(args)
-	if args["purpose"] != "自定" || args["encoding"] != "gbk" {
+	if args["purpose"] != "自定" {
 		t.Errorf("显式入参应优先：%v", args)
 	}
 }

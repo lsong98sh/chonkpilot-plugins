@@ -62,6 +62,7 @@ func TestNotifyOnSaveFailure(t *testing.T) {
 		return map[string]any{"list": map[string]any{
 			memoryEnabledKey:   "true",
 			memoryMinTokensKey: "1",
+			memoryTriggerKey:   "every-turn", // 验证轮末沉淀路径（默认 compress 不提取）
 		}}
 	})
 	reply(t, bus, sessionLoadSubject, func(map[string]any) map[string]any {
@@ -128,7 +129,10 @@ func TestNotifyOnSaveFailure(t *testing.T) {
 func TestNotifyPerFailedCategory(t *testing.T) {
 	bus := newTestBus(t)
 	reply(t, bus, prjConfigListSubject, func(map[string]any) map[string]any {
-		return map[string]any{"list": map[string]any{memoryEnabledKey: "true", memoryMinTokensKey: "1"}}
+		return map[string]any{"list": map[string]any{
+			memoryEnabledKey: "true", memoryMinTokensKey: "1",
+			memoryTriggerKey: "every-turn", // 验证轮末沉淀路径（默认 compress 不提取）
+		}}
 	})
 	reply(t, bus, sessionLoadSubject, func(map[string]any) map[string]any {
 		return map[string]any{"messages": []any{
@@ -167,7 +171,10 @@ func TestNotifyPerFailedCategory(t *testing.T) {
 func TestNoNotifyOnNonFailure(t *testing.T) {
 	bus := newTestBus(t)
 	reply(t, bus, prjConfigListSubject, func(map[string]any) map[string]any {
-		return map[string]any{"list": map[string]any{memoryEnabledKey: "true", memoryMinTokensKey: "1000"}}
+		return map[string]any{"list": map[string]any{
+			memoryEnabledKey: "true", memoryMinTokensKey: "1000",
+			memoryTriggerKey: "every-turn", // 验证轮末累计门控（默认 compress 轮末不提取）
+		}}
 	})
 	reply(t, bus, sessionLoadSubject, func(map[string]any) map[string]any {
 		return map[string]any{"messages": []any{map[string]any{"role": "user", "content": "你好"}}}
@@ -189,7 +196,10 @@ func TestNoNotifyOnNonFailure(t *testing.T) {
 func TestNotifyNilSafe(t *testing.T) {
 	bus := newTestBus(t)
 	reply(t, bus, prjConfigListSubject, func(map[string]any) map[string]any {
-		return map[string]any{"list": map[string]any{memoryEnabledKey: "true", memoryMinTokensKey: "1"}}
+		return map[string]any{"list": map[string]any{
+			memoryEnabledKey: "true", memoryMinTokensKey: "1",
+			memoryTriggerKey: "every-turn", // 验证轮末沉淀路径（默认 compress 不提取）
+		}}
 	})
 	reply(t, bus, sessionLoadSubject, func(map[string]any) map[string]any {
 		return map[string]any{"messages": []any{

@@ -18,6 +18,9 @@ import (
 // stubSubsessionDistill 桩齐沉淀回路最小应答集（parentID 决定主/子会话），返回保存计数。
 func stubSubsessionDistill(t *testing.T, bus mq.Bus, prjList map[string]any, parentID string) *int32 {
 	t.Helper()
+	// 用例验证的是轮末（session-complete）沉淀路径 → 显式走旧触发策略 every-turn
+	// （2026-10-31 起默认 memory.trigger=compress，轮末不提取）。
+	prjList[memoryTriggerKey] = "every-turn"
 	reply(t, bus, prjConfigListSubject, func(map[string]any) map[string]any {
 		return map[string]any{"list": prjList}
 	})

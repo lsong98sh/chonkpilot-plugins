@@ -53,7 +53,10 @@ func (b *blockingHistory) count() int {
 func TestQueueMergesSameSession(t *testing.T) {
 	bus := newTestBus(t)
 	reply(t, bus, prjConfigListSubject, func(map[string]any) map[string]any {
-		return map[string]any{"list": map[string]any{memoryEnabledKey: "true", memoryMinTokensKey: "1"}}
+		return map[string]any{"list": map[string]any{
+			memoryEnabledKey: "true", memoryMinTokensKey: "1",
+			memoryTriggerKey: "every-turn", // 验证轮末沉淀路径（默认 compress 不提取）
+		}}
 	})
 	stubSessionGet(t, bus, "")
 	hist := &blockingHistory{started: make(chan struct{}), release: make(chan struct{})}
@@ -160,7 +163,10 @@ func TestNoNewTurnSkips(t *testing.T) {
 func TestProgressNotAdvancedOnSaveFailure(t *testing.T) {
 	bus := newTestBus(t)
 	reply(t, bus, prjConfigListSubject, func(map[string]any) map[string]any {
-		return map[string]any{"list": map[string]any{memoryEnabledKey: "true", memoryMinTokensKey: "1"}}
+		return map[string]any{"list": map[string]any{
+			memoryEnabledKey: "true", memoryMinTokensKey: "1",
+			memoryTriggerKey: "every-turn", // 验证轮末沉淀路径（默认 compress 不提取）
+		}}
 	})
 	stubSessionGet(t, bus, "")
 	stubSessionHistory(t, bus, []any{map[string]any{"turn_id": "t1", "full_tokens": 100}})

@@ -70,7 +70,7 @@ func main() {
 
 	plug := history.New()
 	// git 不存在 → Start 返回 nil（功能禁用、工具摘除；不视为启动失败），与改造前一致。
-	if err := plug.Start(plugin.Deps{Bus: bus, Logf: logf}); err != nil {
+	if err := plug.Start(plugin.Deps{Bus: bus, Logf: logf, LogfWD: p.Logf}); err != nil {
 		slog.Error("history: 启动失败", "err", err)
 		os.Exit(1)
 	}

@@ -16,20 +16,20 @@ import (
 	"strings"
 	"syscall"
 
+	"github.com/lsong98sh/chonkpilot-plugin-framework/sdk/enginehost"
 	"github.com/lsong98sh/chonkpilot-plugins/desktop/engine/internal/desktop"
-	"github.com/lsong98sh/chonkpilot-plugins/shared/pluginhost"
 )
 
 // engine 是一个桌面会话。
 type engine struct {
-	opts pluginhost.ContextOptions
+	opts enginehost.ContextOptions
 	hwnd syscall.Handle // start 时可选绑定；0 = 未绑定
 }
 
-// New 构造桌面会话（实现 pluginhost.Options.NewEngine）。
+// New 构造桌面会话（实现 enginehost.Options.NewEngine）。
 // start 时可经 meta 传 title / class / hwnd 预先绑定目标窗口；绑定失败立即报错，
 // 避免等到 operation 才暴露「窗口不存在」。
-func New(opts pluginhost.ContextOptions) (pluginhost.Engine, error) {
+func New(opts enginehost.ContextOptions) (enginehost.Engine, error) {
 	e := &engine{opts: opts}
 	if len(opts.Meta) > 0 {
 		h, err := findWindowFrom(opts.Meta)
@@ -47,7 +47,7 @@ func (e *engine) Do(action string, args map[string]any) (map[string]any, error) 
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
 
-	a := pluginhost.NormalizeAction(action)
+	a := enginehost.NormalizeAction(action)
 	switch a {
 	case "find_window":
 		h, err := findWindowFrom(args)

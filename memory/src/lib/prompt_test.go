@@ -48,6 +48,9 @@ func (s *systemCollector) system(category string) string {
 // 并返回 llm-simple 的 system 收集器。cats 由调用方给出（每项须带 `prompt` 才参与提取）。
 func stubDistillReplies(t *testing.T, bus mq.Bus, prjList map[string]any, cats []any) *systemCollector {
 	t.Helper()
+	// 用例验证轮末（session-complete）沉淀路径 → 显式走旧触发策略 every-turn
+	// （2026-10-31 起默认 memory.trigger=compress，轮末不提取）。
+	prjList[memoryTriggerKey] = "every-turn"
 	reply(t, bus, prjConfigListSubject, func(map[string]any) map[string]any {
 		return map[string]any{"list": prjList}
 	})

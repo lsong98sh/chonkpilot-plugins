@@ -38,7 +38,7 @@ var toolSpecs = []toolSpec{
 	},
 	{
 		Name:        "codegraph_initialize",
-		Description: "对某 workdir 全量建索引（同步，直到完成并落盘到 <workdir>/.chonkpilot/codegraph/）。重复调用为重建。",
+		Description: "对某 workdir 全量建索引（同步，直到完成并落盘到 <workdir>/.chonkpilot/codegraph/）。源码先识别编码并统一转 UTF-8（UTF-8 BOM / UTF-16 / GBK 等）再解析。重复调用为重建。",
 		Props: map[string]any{
 			"workdir":         map[string]any{"type": "string", "description": "项目根目录"},
 			"exts":            map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "本次参与索引的扩展名（缺省沿用配置/默认集）"},

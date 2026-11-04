@@ -31,9 +31,12 @@ type Meta struct {
 	SkipDirs       []string `json:"skipDirs,omitempty"`       // 用户排除规则（gitignore 语法，最高优先级）
 	StackGitignore bool     `json:"stackGitignore,omitempty"` // 是否叠加各级 .gitignore / info/exclude / 全局 ignore
 	Exts           []string `json:"exts,omitempty"`
-	FileCount      int      `json:"fileCount"`
-	ChunkCount     int      `json:"chunkCount"`
-	Tokenizer      string   `json:"tokenizer"`
+	// Encoding 遗留文本编码（D-73）："" / "auto" = 自动识别；其余 = 按指定编码解码
+	// （utf-8 / gb18030 / gbk / shift_jis / big5 / euc-kr）。
+	Encoding   string `json:"encoding,omitempty"`
+	FileCount  int    `json:"fileCount"`
+	ChunkCount int    `json:"chunkCount"`
+	Tokenizer  string `json:"tokenizer"`
 	// Docs 文档转换接入（Office/PDF → 文本）的配置与最近一次索引的运行态。
 	// 注意：**不含 token**（token 仅内存持有，见 Workspace.docsToken，避免密文落盘）。
 	Docs DocsMeta `json:"docs,omitempty"`
@@ -42,10 +45,13 @@ type Meta struct {
 	NextPK int64 `json:"nextPK,omitempty"`
 }
 
-// Workspace 引擎内部工作区：Dir=项目根；索引与元信息落在 Store。
+// Workspace 引擎内部工作区：Dir=项目根；索引与元信息落在 Store（文件索引）+ SessionStore（会话索引）。
 type Workspace struct {
 	Dir   string // 规范绝对路径（'/' 分隔）
 	Store string // Dir/.chonkpilot/vfts
+	// SessionStore 会话内容索引落盘目录（Dir/.chonkpilot/vfts-session；与文件索引完全独立，
+	// 文件索引全量重建不会清空它会话索引）。
+	SessionStore string
 
 	mu    sync.Mutex // 保护 meta
 	recMu sync.Mutex // 就绪/重建单飞：同一 workdir 不平行执行
@@ -55,6 +61,11 @@ type Workspace struct {
 	// Initialize 的整段长 zmu 临界区；单原子写入消除「先改 coll 再改标志」两段式带来的瞬时误报。
 	coll atomic.Pointer[zvec.Collection]
 	meta Meta
+
+	// 会话索引（SESSION-FTS）：与文件索引独立的一把锁 + 一套集合/状态，互不阻塞。
+	smu      sync.Mutex
+	sessColl atomic.Pointer[zvec.Collection]
+	sess     sessionStateFile
 	// docsToken 转换服务鉴权 token（仅内存，绝不落盘/落日志；每次 vfts_configure 下发）。
 	docsToken string
 }
@@ -118,7 +129,7 @@ func Open(dir string) (*Workspace, error) {
 	if w, ok := wsReg[wsKey(abs)]; ok {
 		return w, nil
 	}
-	w := &Workspace{Dir: abs, Store: StoreDir(abs)}
+	w := &Workspace{Dir: abs, Store: StoreDir(abs), SessionStore: SessionStoreDir(abs)}
 	if err := os.MkdirAll(filepath.FromSlash(w.Store), 0o755); err != nil {
 		return nil, fmt.Errorf("mkdir store: %w", err)
 	}
@@ -143,6 +154,12 @@ func Drop(dir string) {
 			w.setColl(nil)
 		}
 		w.zmu.Unlock()
+		w.smu.Lock()
+		if c := w.sessColl.Load(); c != nil {
+			_ = c.Close()
+			w.sessColl.Store(nil)
+		}
+		w.smu.Unlock()
 		delete(wsReg, wsKey(abs))
 	}
 }
@@ -293,6 +310,12 @@ func CloseAll() {
 			w.setColl(nil)
 		}
 		w.zmu.Unlock()
+		w.smu.Lock()
+		if c := w.sessColl.Load(); c != nil {
+			_ = c.Close()
+			w.sessColl.Store(nil)
+		}
+		w.smu.Unlock()
 	}
 	wsMu.Unlock()
 	shutdownZvec()

@@ -1,0 +1,266 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>定时任务</title>
+  <link rel="stylesheet" href="/shared/ck-theme.css" />
+  <link rel="stylesheet" href="/themes.css" />
+  <script src="/shared/ck-theme.js"></script>
+  <style>
+    body { margin: 0; padding: 16px 18px; font: 13px/1.5 var(--ck-font-sans); color: var(--ck-text); background: var(--ck-bg); }
+    h1 { font-size: 16px; margin: 0 0 4px; }
+    p.sub { margin: 0 0 14px; color: var(--ck-text-muted); font-size: 12px; }
+    .bar { display: flex; gap: 8px; align-items: center; margin-bottom: 12px; }
+    .grow { flex: 1; }
+    button { padding: 5px 11px; border-radius: 6px; border: 1px solid var(--ck-border); background: var(--ck-surface); color: inherit; font: inherit; cursor: pointer; }
+    button.primary { background: var(--ck-accent); border-color: var(--ck-accent); color: var(--ck-accent-fg); }
+    button.danger { color: var(--ck-danger); }
+    table { width: 100%; border-collapse: collapse; font-size: 12px; }
+    th, td { text-align: left; padding: 7px 8px; border-bottom: 1px solid var(--ck-border); vertical-align: top; }
+    th { color: var(--ck-text-muted); font-weight: 600; }
+    .desc { max-width: 300px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .cron { font-family: var(--ck-font-mono, Consolas, monospace); }
+    .state { display: inline-flex; align-items: center; gap: 5px; }
+    .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--ck-border); }
+    .dot.on { background: var(--ck-ok, #27ae60); }
+    .dot.off { background: var(--ck-text-muted); }
+    .err { color: var(--ck-danger); }
+    .msg { font-size: 12px; white-space: pre-wrap; overflow-wrap: anywhere; margin-top: 10px; }
+    .msg.err { color: var(--ck-danger); }
+    .empty { color: var(--ck-text-muted); padding: 18px 0; }
+    tr.detail-row > td { background: var(--ck-surface); padding: 10px 12px 12px; }
+    .detail-box { display: grid; grid-template-columns: 96px 1fr; gap: 6px 12px; font-size: 12px; }
+    .detail-box .k { color: var(--ck-text-muted); }
+    .detail-box .v { white-space: pre-wrap; overflow-wrap: anywhere; }
+    .warn { color: var(--ck-danger); }
+  </style>
+</head>
+<body>
+  <h1>定时任务</h1>
+  <p class="sub">本机全局任务（不区分项目）。任务由 LLM 经 crontab_* 工具创建，此处可启用 / 停用 / 删除。变更即时推送，无需刷新。</p>
+  <div class="bar">
+    <span class="grow" id="summary"></span>
+    <button id="refresh">刷新</button>
+  </div>
+  <table>
+    <thead><tr><th style="width:34px">状态</th><th>简述</th><th style="width:130px">cron</th><th style="width:150px">下次执行</th><th style="width:120px">最近一次</th><th style="width:170px"></th></tr></thead>
+    <tbody id="rows"></tbody>
+  </table>
+  <div id="empty" class="empty" hidden>还没有定时任务。</div>
+  <div id="msg" class="msg"></div>
+
+  <script src="/plugin-ui/_sdk/plugin.js"></script>
+  <script>
+    const rows = document.getElementById('rows');
+    const msg = document.getElementById('msg');
+    const empty = document.getElementById('empty');
+    const summary = document.getElementById('summary');
+    let tasks = [];
+
+    function show(t, err) { msg.textContent = t || ''; msg.className = 'msg ' + (t && err ? 'err' : ''); }
+    function fmt(ts) { if (!ts) return '-'; const d = new Date(ts * 1000); return d.toLocaleString(); }
+    function esc(s) { return String(s == null ? '' : s); }
+
+    async function api(action, payload) {
+      const res = await fetch('/plugins/crontab/api/' + encodeURIComponent(action), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-CK-Plugin-Id': 'crontab' },
+        body: JSON.stringify(payload || {}),
+      });
+      let body = null;
+      try { body = await res.json(); } catch (_) { /* 非 JSON */ }
+      if (!res.ok) {
+        const errors = (body && Array.isArray(body.errors) && body.errors) || ['HTTP ' + res.status];
+        throw new Error(errors.join('; '));
+      }
+      return body;
+    }
+
+    function lastText(r) {
+      if (!r) return '-';
+      if (r.kind === 'skipped') return '跳过（' + (r.detail || '') + '）';
+      if (r.kind === 'interrupted') return '中断';
+      return r.ok ? '成功' : '失败';
+    }
+
+    function runText(r) {
+      if (!r) return '-';
+      const head = r.kind === 'skipped' ? '跳过' : r.kind === 'interrupted' ? '中断' : (r.ok ? '成功' : '失败');
+      const bits = [fmt(r.at) + ' · ' + head];
+      if (r.detail) bits.push('原因：' + r.detail);
+      if (r.error) bits.push(r.error);
+      if (typeof r.exit_code === 'number' && r.exit_code !== 0) bits.push('exit ' + r.exit_code);
+      return bits.join(' · ');
+    }
+
+    // sessionText 汇总任务会话（P4 / C12）：任务 → 会话（1 个）→ 最近一轮（时间 / 状态）。
+    function sessionText(s) {
+      if (!s || !s.available) {
+        const why = s && s.error ? '（' + s.error + '）' : '';
+        return '尚无会话（首次执行后建立）' + why;
+      }
+      const bits = [];
+      if (s.title) bits.push(s.title);
+      if (s.session_id) bits.push('会话 ' + s.session_id);
+      if (typeof s.turn_count === 'number') bits.push(s.turn_count + ' 轮');
+      if (s.last_turn_at) bits.push('最近一轮 ' + s.last_turn_at.slice(0, 19).replace('T', ' '));
+      if (s.last_turn_status) bits.push('状态 ' + s.last_turn_status);
+      if (s.origin) bits.push('执行主体 ' + s.origin);
+      if (s.error) bits.push('（' + s.error + '）');
+      return bits.join(' · ') || '-';
+    }
+
+    function sandboxText(sb) {
+      if (!sb) return '-';
+      const src = sb.source === 'task' ? '任务设置' : '继承插件配置';
+      if (!sb.enabled) return '关（' + src + '）';
+      if (sb.available === false) {
+        const reason = sb.reason === 'work_dir_missing' ? '项目目录不存在（work_dir_missing）' : (sb.reason || '未知原因');
+        return '开 · 不可用：' + reason;
+      }
+      const n = Array.isArray(sb.writable_dirs) ? sb.writable_dirs.length : 0;
+      return '开（' + src + '；可写目录 ' + n + ' 个）';
+    }
+
+    // openSession 用**既有窗口能力**打开会话内容（gui.window.open-chat，G-105 起载荷可选
+    // 带 dialog_id）：带 dialog_id → 宿主直开该 dialog（窗口 URL 携带 dialog-id，前端免
+    // session→dialog 反查 —— 开关缺省关闭时顶层列表不含 crontab 对话，反查会自举空库）；
+    // 不带 → 宿主按 session_id 定位（行为同既有）。
+    function openSession(sessionId, dialogId) {
+      let mq = null;
+      try { mq = window.top.ckMq.new(window); } catch (e) {
+        show('打开会话失败：当前页面不在宿主窗口内', true);
+        return;
+      }
+      const payload = { session_id: sessionId };
+      if (dialogId) payload.dialog_id = dialogId;
+      mq.emit('gui.window.open-chat', payload).then((env) => {
+        const backend = env && env.backend;
+        if (backend && backend.ok === false) {
+          show('打开会话失败：可能已达对话窗口上限', true);
+          return;
+        }
+        show('');
+      }).catch((e) => show('打开会话失败: ' + e.message, true));
+    }
+
+    // toggleDetail 在任务行下方展开任务详情：沙箱实际状态 + 最近 5 条运行记录（含 skipped 原因）。
+    async function toggleDetail(task, tr) {
+      const next = tr.nextElementSibling;
+      if (next && next.classList.contains('detail-row')) { next.remove(); return; }
+      let body;
+      try {
+        body = await api('detail', { task_id: task.id });
+      } catch (e) { show('读取详情失败: ' + e.message, true); return; }
+
+      const row = document.createElement('tr');
+      row.className = 'detail-row';
+      const td = document.createElement('td');
+      td.colSpan = 6;
+      const box = document.createElement('div');
+      box.className = 'detail-box';
+      const addKV = (k, v, warn) => {
+        const kk = document.createElement('span'); kk.className = 'k'; kk.textContent = k;
+        const vv = document.createElement('span'); vv.className = 'v' + (warn ? ' warn' : ''); vv.textContent = v || '-';
+        box.appendChild(kk); box.appendChild(vv);
+      };
+      const addNode = (k, node) => {
+        const kk = document.createElement('span'); kk.className = 'k'; kk.textContent = k;
+        const vv = document.createElement('span'); vv.className = 'v'; vv.appendChild(node);
+        box.appendChild(kk); box.appendChild(vv);
+      };
+      const t = body.task || {};
+      addKV('任务 ID', t.id);
+      addKV('work_dir', t.work_dir);
+      addKV('沙箱状态', sandboxText(body.sandbox), body.sandbox && body.sandbox.available === false);
+      addKV('会话', sessionText(body.session), !(body.session && body.session.available));
+      // 「打开会话内容」（G-99 / G-105）：经既有 gui.window.open-chat 打开该任务的子会话
+      // （按列表逐项；openable_sessions 项自带 dialog_id → 透传给宿主直开）。
+      const openable = (body.session && body.session.openable_sessions) || [];
+      for (const item of openable) {
+        if (!item || !item.session_id) continue;
+        const open = document.createElement('button');
+        open.textContent = '打开会话内容';
+        open.onclick = () => openSession(item.session_id, item.dialog_id);
+        addNode('', open);
+      }
+      if (t.disabled_reason) addKV('停用原因', t.disabled_reason, t.disabled_reason === 'work_dir_missing');
+      const runs = (body.runs || []).map(runText);
+      addKV('最近运行', runs.length ? runs.join('\n') : '-');
+      td.appendChild(box);
+      row.appendChild(td);
+      tr.after(row);
+    }
+
+    function render(list) {
+      tasks = list || [];
+      rows.innerHTML = '';
+      empty.hidden = tasks.length > 0;
+      summary.textContent = '共 ' + tasks.length + ' 条 · 启用 ' + tasks.filter((t) => t.enabled).length + ' 条';
+      for (const t of tasks) {
+        const tr = document.createElement('tr');
+        const tdState = document.createElement('td');
+        tdState.innerHTML = '<span class="state"><span class="dot ' + (t.enabled ? 'on' : 'off') + '"></span></span>';
+        const tdDesc = document.createElement('td');
+        tdDesc.className = 'desc';
+        tdDesc.title = esc(t.description);
+        tdDesc.textContent = t.description;
+        const tdCron = document.createElement('td');
+        tdCron.className = 'cron';
+        tdCron.textContent = t.cron;
+        const tdNext = document.createElement('td');
+        tdNext.textContent = t.enabled ? fmt(t.next_run_at) : '已停用';
+        const tdLast = document.createElement('td');
+        tdLast.textContent = lastText(t.last_run);
+        if (t.last_run && t.last_run.ok === false) tdLast.className = 'err';
+        const tdOps = document.createElement('td');
+        const detail = document.createElement('button');
+        detail.textContent = '详情';
+        detail.onclick = () => toggleDetail(t, tr);
+        const toggle = document.createElement('button');
+        toggle.textContent = t.enabled ? '停用' : '启用';
+        toggle.style.marginLeft = '6px';
+        toggle.onclick = () => act('toggle', { task_id: t.id, enabled: !t.enabled });
+        const del = document.createElement('button');
+        del.className = 'danger';
+        del.textContent = '删除';
+        del.style.marginLeft = '6px';
+        del.onclick = () => { if (confirm('删除任务：' + t.description + '？')) act('delete', { task_id: t.id }); };
+        tdOps.appendChild(detail);
+        tdOps.appendChild(toggle);
+        tdOps.appendChild(del);
+        tr.appendChild(tdState); tr.appendChild(tdDesc); tr.appendChild(tdCron);
+        tr.appendChild(tdNext); tr.appendChild(tdLast); tr.appendChild(tdOps);
+        rows.appendChild(tr);
+      }
+    }
+
+    async function refresh() {
+      try {
+        const r = await api('list', {});
+        render(r.tasks);
+        show('');
+      } catch (e) { show('读取失败: ' + e.message, true); }
+    }
+
+    async function act(action, payload) {
+      try {
+        await api(action, payload);
+        show('');
+        await refresh();
+      } catch (e) { show('操作失败: ' + e.message, true); }
+    }
+
+    document.getElementById('refresh').onclick = refresh;
+    refresh();
+
+    // 变更事件（plugin-event）：工具创建 / 删除后即时刷新，零轮询。
+    try {
+      ckPlugin.onEvent(function (topic, payload) {
+        if (payload && payload.kind === 'crontab-changed') refresh();
+      });
+    } catch (e) { /* 独立打开页面时无 event 通道 */ }
+  </script>
+</body>
+</html>

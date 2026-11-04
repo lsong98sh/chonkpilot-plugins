@@ -201,7 +201,7 @@ func (h *History) checkpointSync(ws *workState, root, tool, turn string, force b
 			ws.fused = true
 		}
 		ws.mu.Unlock()
-		h.logf()("history: 打点失败（workdir=%s，连续 %d 次）：%v", ws.workDir, fails, err)
+		h.logfWD(ws.workDir)("history: 打点失败（连续 %d 次）：%v", fails, err)
 		h.writeback(ws, slug)
 		if wasFused {
 			return nil // 熔断态：放行（不拦截工具调用）；下次成功即复位
@@ -292,7 +292,7 @@ func (h *History) doCheckpoint(ws *workState, slug, tool string, protected map[s
 	final := commit
 	var idmap map[string]string
 	if nh, im, perr := h.prune(ws, slug, protected); perr != nil {
-		h.logf()("history: 修剪失败（workdir=%s）：%v", ws.workDir, perr)
+		h.logfWD(ws.workDir)("history: 修剪失败：%v", perr)
 	} else if nh != "" {
 		final, idmap = nh, im
 	}
@@ -346,7 +346,7 @@ func (h *History) prune(ws *workState, slug string, protected map[string]bool) (
 		if err := h.graftTruncate(ws, slug, recs[k-1].id); err != nil {
 			return "", nil, err
 		}
-		h.logf()("history: 修剪完成（workdir=%s，slug=%s）：保留 %d 个检查点（解链最老前缀，未重放）", ws.workDir, slug, k)
+		h.logfWD(ws.workDir)("history: 修剪完成（slug=%s）：保留 %d 个检查点（解链最老前缀，未重放）", slug, k)
 		return recs[0].id, nil, nil // 链头未变（id 不变）→ 无需 idmap
 	}
 	// 保留段（旧→新）重建。
@@ -382,7 +382,7 @@ func (h *History) prune(ws *workState, slug string, protected map[string]bool) (
 	}
 	// 重建段为**新建的线性链**（不再需要任何 graft）：清理本会话遗留的替换引用（不依赖内存映射）。
 	h.cleanStaleGrafts(ws, slug, "")
-	h.logf()("history: 修剪完成（workdir=%s，slug=%s）：保留 %d 个检查点（含保底项）", ws.workDir, slug, len(idmap))
+	h.logfWD(ws.workDir)("history: 修剪完成（slug=%s）：保留 %d 个检查点（含保底项）", slug, len(idmap))
 	return newHead, idmap, nil
 }
 

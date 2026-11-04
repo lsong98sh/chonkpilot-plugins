@@ -1,0 +1,353 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>记忆沉淀设置</title>
+  <link rel="stylesheet" href="/shared/ck-theme.css" />
+  <link rel="stylesheet" href="/themes.css" />
+  <script src="/shared/ck-theme.js"></script>
+  <style>
+    body { margin: 0; padding: 16px 18px 24px; font: 13px/1.5 var(--ck-font-sans); color: var(--ck-text); background: var(--ck-bg); }
+    h1 { font-size: 16px; margin: 0 0 4px; }
+    p.sub { margin: 0 0 16px; color: var(--ck-text-muted); font-size: 12px; }
+    .card { border: 1px solid var(--ck-border); border-radius: 8px; padding: 14px; margin-bottom: 14px; }
+    .card h2 { font-size: 13px; margin: 0 0 10px; }
+    .row { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; flex-wrap: wrap; }
+    .row .lab { width: 210px; flex: none; font-weight: 600; font-size: 12px; }
+    .row .hint { color: var(--ck-text-muted); font-size: 11px; flex-basis: 100%; padding-left: 220px; }
+    input[type=text], input[type=number], select, textarea {
+      box-sizing: border-box; padding: 6px 8px; border: 1px solid var(--ck-border); border-radius: 6px;
+      font: inherit; background: transparent; color: inherit;
+    }
+    input[type=number] { width: 140px; }
+    input[type=text] { width: 190px; }
+    table { width: 100%; border-collapse: collapse; font-size: 12px; }
+    th, td { padding: 6px 8px; border-bottom: 1px solid var(--ck-border); text-align: left; vertical-align: middle; }
+    th { color: var(--ck-text-muted); font-weight: 600; font-size: 11px; }
+    tr.over td.tk { color: var(--ck-danger); font-weight: 600; }
+    td.ops { white-space: nowrap; }
+    .link { border: none; background: transparent; color: var(--ck-accent); cursor: pointer; padding: 0 4px; font: inherit; }
+    .link:disabled { color: var(--ck-text-muted); cursor: default; }
+    button { padding: 6px 12px; border-radius: 6px; border: 1px solid var(--ck-border); background: var(--ck-surface); color: inherit; font: inherit; cursor: pointer; }
+    button.primary { background: var(--ck-accent); border-color: var(--ck-accent); color: var(--ck-accent-fg); }
+    button:disabled { opacity: .5; cursor: default; }
+    .actions { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+    .msg { font-size: 12px; white-space: pre-wrap; overflow-wrap: anywhere; margin-top: 10px; }
+    .msg.err { color: var(--ck-danger); } .msg.ok { color: var(--ck-success); }
+    .total { margin-left: auto; color: var(--ck-text-muted); font-size: 12px; }
+    .mask { position: fixed; inset: 0; background: rgba(18, 26, 40, .38); display: flex; align-items: center; justify-content: center; z-index: 50; }
+    .dlg { width: min(760px, 92vw); max-height: 82vh; display: flex; flex-direction: column; background: var(--ck-bg); border: 1px solid var(--ck-border); border-radius: 10px; padding: 14px; gap: 10px; }
+    .dlg h3 { margin: 0; font-size: 14px; }
+    .dlg textarea { flex: 1; min-height: 320px; resize: vertical; font-family: var(--ck-font-mono, monospace); font-size: 12px; }
+    .dlg .actions { justify-content: flex-end; }
+    .dlg .left { margin-right: auto; }
+    .dlg .hint { color: var(--ck-text-muted); font-size: 11px; }
+  </style>
+</head>
+<body>
+  <h1>记忆沉淀设置</h1>
+  <p class="sub">memory 插件配置（项目级 <code>memory.*</code>，团队共享）。保存后按轮生效，无需重启。</p>
+
+  <div class="card">
+    <h2>基本设置</h2>
+    <div class="row">
+      <span class="lab">启用记忆沉淀</span>
+      <input type="checkbox" id="f_enabled" />
+      <span class="hint">关闭后本项目不再自动沉淀记忆（手动沉淀仍可用）。</span>
+    </div>
+    <div class="row">
+      <span class="lab">触发策略</span>
+      <select id="f_trigger">
+        <option value="compress">跟随上下文压缩（推荐）</option>
+        <option value="every-turn">每轮按 token 门控</option>
+      </select>
+    </div>
+    <div class="row">
+      <span class="lab">最小轮次 Token</span>
+      <input type="number" id="f_min" min="0" step="50" />
+      <span class="hint">every-turn 策略下：自上次沉淀累计 token 达到该值才提取。</span>
+    </div>
+    <div class="row">
+      <span class="lab">单类别告警阈值</span>
+      <input type="number" id="f_max" min="0" step="100" />
+      <span class="hint">超过即标红告警（不截断、不阻断）；0 = 不限。</span>
+    </div>
+    <div class="row">
+      <span class="lab">安全阀 Token</span>
+      <input type="number" id="f_safety" min="0" step="1000" />
+      <span class="hint">compress 策略下：累计未提取 token 达到该值仍提取一次；0 = 关闭。</span>
+    </div>
+    <div class="row">
+      <span class="lab">提取子会话记忆</span>
+      <input type="checkbox" id="f_subsession" />
+      <span class="hint">关闭时子会话（任务）轮次跳过自动沉淀。</span>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>记忆类别</h2>
+    <table>
+      <thead>
+        <tr><th>类别</th><th>级别</th><th style="width:100px">Token</th><th style="width:70px">启用</th><th style="width:260px">操作</th></tr>
+      </thead>
+      <tbody id="cats"></tbody>
+    </table>
+    <div class="row" style="margin-top:12px">
+      <input type="text" id="new_cat" placeholder="新类别名称" maxlength="24" />
+      <button id="add_cat">新增类别</button>
+      <span class="total" id="total"></span>
+    </div>
+  </div>
+
+  <div class="actions">
+    <button class="primary" id="save">保存</button>
+    <button id="reload">刷新</button>
+    <button id="flush">立即沉淀当前会话</button>
+  </div>
+  <div id="msg" class="msg"></div>
+
+  <script src="/plugin-ui/_sdk/plugin.js"></script>
+  <script>
+    const instanceId = new URLSearchParams(location.search).get('instance_id') || '';
+    const $ = (id) => document.getElementById(id);
+    const msg = $('msg');
+
+    let state = null;
+    let editing = null; // { kind: 'content'|'prompt', category }
+
+    function show(text, err) {
+      msg.textContent = text || '';
+      msg.className = 'msg ' + (text ? (err ? 'err' : 'ok') : '');
+    }
+
+    function esc(s) {
+      return String(s == null ? '' : s).replace(/[&<>"']/g, (c) => (
+        { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]
+      ));
+    }
+
+    async function rpc(method, params) {
+      const r = await ckPlugin.call('rpc', { method, params: Object.assign({ instance_id: instanceId }, params || {}) });
+      const v = r && Object.prototype.hasOwnProperty.call(r, 'result') ? r.result : r;
+      if (v && v.ok === false) throw new Error(v.reason || v.error || (method + ' 失败'));
+      return v;
+    }
+
+    /** 记忆库关闭 → 其下子项逐个禁用（开启恢复），与主仓原页面口径一致 */
+    function applyEnabled() {
+      const on = $('f_enabled').checked;
+      ['f_trigger', 'f_min', 'f_max', 'f_safety', 'f_subsession', 'new_cat', 'add_cat', 'flush'].forEach((id) => {
+        const el = $(id);
+        if (el) el.disabled = !on;
+      });
+      document.querySelectorAll('#cats input[data-cat], #cats button[data-op]').forEach((el) => {
+        el.disabled = !on;
+      });
+    }
+
+    function render() {
+      $('f_enabled').checked = !!state.enabled;
+      $('f_trigger').value = state.trigger === 'every-turn' ? 'every-turn' : 'compress';
+      $('f_min').value = state.min_turn_tokens;
+      $('f_max').value = state.category_max_tokens;
+      $('f_safety').value = state.safety_tokens;
+      $('f_subsession').checked = !!state.subsession;
+      $('total').textContent = '启用类别合计约 ' + (state.total_tokens || 0) + ' tokens';
+
+      const th = Number($('f_max').value) || 0;
+      const body = $('cats');
+      body.innerHTML = '';
+      for (const c of state.categories || []) {
+        const tr = document.createElement('tr');
+        const over = th > 0 && Number(c.tokens) > th;
+        if (over) tr.className = 'over';
+        tr.innerHTML =
+          '<td>' + esc(c.category) + (over ? ' <span style="color:var(--ck-danger)">超阈值</span>' : '') + '</td>' +
+          '<td>' + (c.level === 'user' ? '用户偏好' : '项目') + '</td>' +
+          '<td class="tk">' + Number(c.tokens || 0) + '</td>' +
+          '<td><input type="checkbox" data-cat="' + esc(c.category) + '"' + (c.enabled ? ' checked' : '') + ' /></td>' +
+          '<td class="ops">' +
+            '<button class="link" data-op="content" data-cat="' + esc(c.category) + '">内容</button>' +
+            '<button class="link" data-op="prompt" data-cat="' + esc(c.category) + '">提示词</button>' +
+            '<button class="link" data-op="clear" data-cat="' + esc(c.category) + '">清空</button>' +
+            (c.preset ? '' : '<button class="link" data-op="delete" data-cat="' + esc(c.category) + '">删除</button>') +
+          '</td>';
+        body.appendChild(tr);
+      }
+      applyEnabled();
+    }
+
+    function categoryOf(name) {
+      return (state.categories || []).find((c) => c.category === name) || null;
+    }
+
+    async function load() {
+      try {
+        state = await rpc('config-load');
+        render();
+        show('');
+      } catch (e) {
+        show('读取失败：' + e.message, true);
+      }
+    }
+
+    function collect() {
+      const entries = {
+        'memory.enabled': $('f_enabled').checked ? 'true' : 'false',
+        'memory.trigger': $('f_trigger').value,
+        'memory.min-turn-tokens': String(Number($('f_min').value) || 0),
+        'memory.category-max-tokens': String(Number($('f_max').value) || 0),
+        'memory.safety-tokens': String(Number($('f_safety').value) || 0),
+        'memory.subsession': $('f_subsession').checked ? 'true' : 'false',
+      };
+      document.querySelectorAll('#cats input[data-cat]').forEach((el) => {
+        entries['memory.category.' + el.dataset.cat] = el.checked ? 'true' : 'false';
+      });
+      return entries;
+    }
+
+    async function save() {
+      $('save').disabled = true;
+      try {
+        await rpc('config-save', { entries: collect() });
+        await load();
+        show('已保存');
+      } catch (e) {
+        show('保存失败：' + e.message, true);
+      } finally {
+        $('save').disabled = false;
+      }
+    }
+
+    async function addCategory() {
+      const name = ($('new_cat').value || '').trim();
+      if (!name) { show('请输入类别名称', true); return; }
+      try {
+        await rpc('category-save', { category: name, content: '' });
+        $('new_cat').value = '';
+        await load();
+        show('已新增类别：' + name);
+      } catch (e) {
+        show('新增失败：' + e.message, true);
+      }
+    }
+
+    async function clearCategory(name) {
+      if (!confirm('清空「' + name + '」的全部记忆内容？')) return;
+      try {
+        await rpc('category-save', { category: name, content: '' });
+        await load();
+        show('已清空：' + name);
+      } catch (e) {
+        show('清空失败：' + e.message, true);
+      }
+    }
+
+    async function deleteCategory(name) {
+      if (!confirm('删除自定义类别「' + name + '」及其内容？此操作不可撤销。')) return;
+      try {
+        await rpc('category-delete', { category: name });
+        await load();
+        show('已删除：' + name);
+      } catch (e) {
+        show('删除失败：' + e.message, true);
+      }
+    }
+
+    async function flush() {
+      $('flush').disabled = true;
+      try {
+        const v = await rpc('flush');
+        show(v && v.queued ? '已提交沉淀（后台执行，进度见状态栏）' : ('未提交：' + ((v && v.reason) || '原因未知')), !(v && v.queued));
+      } catch (e) {
+        show('沉淀失败：' + e.message, true);
+      } finally {
+        applyEnabled();
+      }
+    }
+
+    /* ── 内容 / 提示词编辑弹框 ── */
+    function openEditor(kind, name) {
+      const c = categoryOf(name);
+      if (!c) return;
+      editing = { kind, category: name };
+      const mask = document.createElement('div');
+      mask.className = 'mask';
+      const isPrompt = kind === 'prompt';
+      mask.innerHTML =
+        '<div class="dlg">' +
+        '<h3>' + (isPrompt ? '沉淀提示词' : '记忆内容') + ' · ' + esc(name) + '</h3>' +
+        '<div class="hint">' + (isPrompt
+          ? (c.prompt_override ? '当前为项目/用户级自定义覆盖。' : '当前为系统内置（保存后生成本级覆盖）。')
+          : '整篇内容按类别文件保存（每类一份）。') + '</div>' +
+        '<textarea></textarea>' +
+        '<div class="actions">' +
+        (isPrompt && c.prompt_override ? '<button class="left" data-act="reset">恢复默认</button>' : '') +
+        '<button data-act="cancel">取消</button>' +
+        '<button class="primary" data-act="ok">保存</button>' +
+        '</div></div>';
+      document.body.appendChild(mask);
+      const ta = mask.querySelector('textarea');
+      ta.value = isPrompt ? (c.prompt || '') : '';
+      ta.focus();
+
+      const close = () => { mask.remove(); editing = null; };
+
+      mask.addEventListener('click', async (ev) => {
+        const act = ev.target && ev.target.dataset && ev.target.dataset.act;
+        if (!act) return;
+        if (act === 'cancel') { close(); return; }
+        if (act === 'ok') {
+          try {
+            if (isPrompt) await rpc('prompt-save', { category: name, value: ta.value });
+            else await rpc('category-save', { category: name, content: ta.value });
+            close();
+            await load();
+            show('已保存');
+          } catch (e) {
+            show('保存失败：' + e.message, true);
+          }
+          return;
+        }
+        if (act === 'reset') {
+          try {
+            await rpc('prompt-reset', { category: name });
+            close();
+            await load();
+            show('已恢复默认提示词');
+          } catch (e) {
+            show('恢复失败：' + e.message, true);
+          }
+        }
+      });
+
+      if (!isPrompt) {
+        rpc('category-content', { category: name }).then((v) => { ta.value = v.content || ''; }).catch((e) => {
+          ta.value = '';
+          show('读取内容失败：' + e.message, true);
+        });
+      }
+    }
+
+    /* ── 事件绑定 ── */
+    $('save').addEventListener('click', save);
+    $('reload').addEventListener('click', load);
+    $('flush').addEventListener('click', flush);
+    $('add_cat').addEventListener('click', addCategory);
+    $('f_max').addEventListener('change', render);
+    $('f_enabled').addEventListener('change', applyEnabled);
+    $('cats').addEventListener('click', (ev) => {
+      const btn = ev.target.closest('button[data-op]');
+      if (!btn) return;
+      const name = btn.dataset.cat;
+      const op = btn.dataset.op;
+      if (op === 'content' || op === 'prompt') openEditor(op, name);
+      else if (op === 'clear') clearCategory(name);
+      else if (op === 'delete') deleteCategory(name);
+    });
+
+    load();
+  </script>
+</body>
+</html>

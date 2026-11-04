@@ -15,6 +15,8 @@ timeout: 300
 # 摘要
 按批转换文件编码（如 GBK → UTF-8）。统一参数 `{purpose, targets[]}`。
 
+**沙箱**：开启沙箱时，`targets[].path` 必须落在项目「可写目录」白名单内（递归），否则**整次调用被拒绝**；未开启沙箱不受此限制。
+
 ## 源编码
 - `from` 缺省 `auto`：复用 `file_detect` 的检测链（UTF-16 BOM → UTF-8 → GBK/ShiftJIS/Big5/EUCKR）。
 - **低置信度拒绝自动转**：GBK / Big5 / Shift-JIS 互相撞车时 → 该项 `failed`，错误码 `encoding_undetermined`，并附候选；**要求调用方显式指定 `from`**。

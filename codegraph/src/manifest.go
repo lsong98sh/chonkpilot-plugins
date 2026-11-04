@@ -80,11 +80,11 @@ func writeVftsManifest(logf func(format string, args ...any), workdir string, ou
 	sort.Slice(rows, func(i, j int) bool { return rows[i].Key < rows[j].Key })
 	b, err := json.Marshal(rows)
 	if err != nil {
-		logf("codegraph: vfts 清单序列化失败（workdir=%s）：%v", workdir, err)
+		logf("codegraph: vfts 清单序列化失败：%v", err)
 		return
 	}
 	if err := writeManifestFile(manifestPath(workdir), b); err != nil {
-		logf("codegraph: vfts 清单写入失败（workdir=%s）：%v", workdir, err)
+		logf("codegraph: vfts 清单写入失败：%v", err)
 	}
 }
 
