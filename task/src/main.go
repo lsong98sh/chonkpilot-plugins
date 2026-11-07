@@ -245,30 +245,62 @@ func envMap(raw any) map[string]string {
 
 // ── task_llm ─────────────────────────
 
-func (t *taskPlugin) llm(ctx context.Context, args map[string]any, _ pluginsdk.CallContext) (any, error) {
+// llm 委派一个**全能力子代理**（2026-11-04）：完整子会话 / 子轮次 + 全工具面（可按 agent
+// 定义收窄），与主轮次同构，可再派生下一级；结果为子代理最终回复。
+//
+// 插件只做适配：能力在宿主 `plugin/v1/agent.delegate`（进程内唯一 turn 状态与任务层）。
+// `waitSec` > 0 → 最多等该秒数；0/缺省 → 等到收尾；`detach=true` → 立即返回 running，
+// 之后用 `task_status(task_id=...)` 取结果（任务节点 id 随返回体给出）。
+func (t *taskPlugin) llm(ctx context.Context, args map[string]any, cx pluginsdk.CallContext) (any, error) {
 	prompt := strings.TrimSpace(asString(args["prompt"]))
 	if prompt == "" {
 		return nil, fmt.Errorf("prompt 不能为空")
 	}
-	timeout := 120
-	if n := toInt(args["timeoutSec"]); n > 0 {
-		timeout = n
+	if cx.Turn == "" {
+		return nil, fmt.Errorf("缺少会话轮次（turn）：task_llm 必须在会话轮次内调用")
 	}
-	text, err := t.p.LLM(ctx, prompt, strings.TrimSpace(asString(args["system"])), time.Duration(timeout)*time.Second)
-	if err != nil {
+	in := map[string]any{
+		"instance_id":  cx.InstanceID,
+		"turn":         cx.Turn,
+		"session":      cx.Session,
+		"tool_call_id": cx.ToolCallID,
+		"prompt":       prompt,
+		"agent":        strings.TrimSpace(asString(args["agent"])),
+		"session_id":   strings.TrimSpace(asString(args["session_id"])),
+		"title":        strings.TrimSpace(asString(args["title"])),
+		"purpose":      cx.Purpose,
+	}
+	if n := toInt(args["waitSec"]); n > 0 {
+		in["wait_sec"] = n
+	}
+	if d, ok := args["detach"].(bool); ok {
+		in["detach"] = d
+	}
+	var out map[string]any
+	if err := t.p.CallInto(ctx, "plugin/v1/agent.delegate", in, &out); err != nil {
 		return nil, err
 	}
-	return map[string]any{"text": text}, nil
+	return out, nil
 }
 
 // ── task_status ─────────────────────────
 
-func (t *taskPlugin) status(ctx context.Context, _ map[string]any, cx pluginsdk.CallContext) (any, error) {
+// status 查询任务：`task_id` 非空 → 单任务（可等待 / 附已产出）；空 → 会话任务树 + 列表。
+//
+// 与 `tool_result` 同口径（2026-11-04）：终态返回结果；仍在运行 → `state=running` +
+// `output`（已产出的部分输出）；`waitSec` > 0 时先等待至多该秒数。
+func (t *taskPlugin) status(ctx context.Context, args map[string]any, cx pluginsdk.CallContext) (any, error) {
 	if cx.InstanceID == "" {
 		return nil, fmt.Errorf("缺少会话实例（instance_id）")
 	}
+	if id := strings.TrimSpace(asString(args["task_id"])); id != "" {
+		return t.statusOne(ctx, args, cx, id)
+	}
 	cfg := t.cfg.Settings()
-	limit := cfg.StatusLimit
+	limit := toInt(args["limit"])
+	if limit <= 0 {
+		limit = cfg.StatusLimit
+	}
 	if limit <= 0 {
 		limit = 50
 	}
@@ -284,8 +316,65 @@ func (t *taskPlugin) status(ctx context.Context, _ map[string]any, cx pluginsdk.
 		"ok":    true,
 		"limit": limit,
 		"tree":  unwrap(treeRaw),
-		"tasks": unwrap(tasksRaw),
+		"tasks": trimTasks(unwrap(tasksRaw), limit),
 	}, nil
+}
+
+// statusOne 查单个任务（任务节点 / gateway 执行 id / 委派子轮次 id 均可）：
+// 宿主 `plugin/v1/task.result` 返回权威状态 + 部分输出；waitSec 内轮询至终态。
+func (t *taskPlugin) statusOne(ctx context.Context, args map[string]any, cx pluginsdk.CallContext, id string) (any, error) {
+	if cx.Turn == "" {
+		return nil, fmt.Errorf("缺少会话轮次（turn）：单任务查询必须在会话轮次内调用")
+	}
+	wait := toInt(args["waitSec"])
+	var deadline time.Time
+	if wait > 0 {
+		deadline = time.Now().Add(time.Duration(wait) * time.Second)
+	}
+	query := func() (string, string, string, bool, error) {
+		var out struct {
+			Text    string `json:"text"`
+			State   string `json:"state"`
+			Found   bool   `json:"found"`
+			Partial string `json:"partial"`
+		}
+		err := t.p.CallInto(ctx, "plugin/v1/task.result", map[string]any{
+			"instance_id": cx.InstanceID, "turn": cx.Turn, "id": id,
+		}, &out)
+		return out.Text, out.State, out.Partial, out.Found, err
+	}
+	for {
+		text, state, partial, found, err := query()
+		if err != nil {
+			return nil, fmt.Errorf("查询任务失败: %w", err)
+		}
+		if !found {
+			return map[string]any{"ok": false, "task_id": id, "state": "not_found",
+				"message": "未找到任务 " + id}, nil
+		}
+		if state != "running" {
+			return map[string]any{"ok": true, "task_id": id, "state": state,
+				"result": text, "output": partial}, nil
+		}
+		if wait <= 0 || time.Now().After(deadline) {
+			return map[string]any{"ok": true, "task_id": id, "state": "running",
+				"message": "任务仍在运行（可加大 waitSec 继续等待）", "output": partial}, nil
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(500 * time.Millisecond):
+		}
+	}
+}
+
+// trimTasks 截断任务列表到 limit 条（缺省 / 非数组 → 原样返回）。
+func trimTasks(raw any, limit int) any {
+	list, ok := raw.([]any)
+	if !ok || limit <= 0 || len(list) <= limit {
+		return raw
+	}
+	return list[:limit]
 }
 
 // ── task_stop ─────────────────────────

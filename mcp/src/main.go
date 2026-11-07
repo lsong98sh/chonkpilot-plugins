@@ -1,8 +1,8 @@
 // chonkpilot-mcp —— MCP 工具系列插件（检索 / 加载 / 调用）。
 //
 // 三个工具（全部走宿主能力面，不直连 gateway 内部）：
-//   - mcp_find   在工具 / 提示（技能）/ 资源中检索（query 本地匹配）
-//   - mcp_load   按名称加载一个条目的完整定义（工具 = 输入 schema）
+//   - mcp_find   在工具 / 技能（提示）/ 资源中检索（query 本地匹配；type=skill 是 prompt 别名）
+//   - mcp_load   按名称加载一个条目的完整定义（tool = input_schema；skill/prompt = 正文；resource = content）
 //   - mcp_invoke 调用一个工具（plugin/v1/tools.call，参数 {name,arguments}）
 //
 // 配置（插件自身，不分四级）：默认返回条数 / 是否包含非 hot 工具 / 默认调用超时。
@@ -35,13 +35,17 @@ type mcpPlugin struct {
 	cfg *configManager
 }
 
-// entry 是检索结果条目。
+// entry 是检索结果条目。kind 是资产类别（tool/skill/prompt/resource）；
+// type 与 kind 同值（T2 契约要求条目至少含 name/kind/type/description）。
 type entry struct {
 	Name        string         `json:"name"`
 	Kind        string         `json:"kind"`
-	Description string         `json:"description,omitempty"`
+	Type        string         `json:"type"`
+	Description string         `json:"description"`
 	Server      string         `json:"server,omitempty"`
 	Hot         bool           `json:"hot,omitempty"`
+	URI         string         `json:"uri,omitempty"`
+	MimeType    string         `json:"mimeType,omitempty"`
 	Schema      map[string]any `json:"input_schema,omitempty"`
 }
 
@@ -62,21 +66,21 @@ func main() {
 	defer p.Close()
 
 	m := &mcpPlugin{p: p, cfg: newConfigManager(p)}
-	p.Tool("mcp_find", "在可用工具 / 提示（技能）/ 资源中检索；query 为空则列出该类型全部（受 limit 限制）。",
+	p.Tool("mcp_find", "在可用工具 / 技能（提示）/ 资源中检索；query 为空则列出该类型全部（受 limit 限制）。",
 		map[string]any{
 			"type": "object",
 			"properties": map[string]any{
 				"query": map[string]any{"type": "string", "description": "关键词（名称/描述包含匹配，忽略大小写）"},
-				"type":  map[string]any{"type": "string", "description": "tool（默认）/prompt/resource/all"},
+				"type":  map[string]any{"type": "string", "description": "tool（默认）/skill/prompt/resource/all（skill 与 prompt 同义）"},
 				"limit": map[string]any{"type": "integer", "description": "最多返回条数（缺省用配置）"},
 			},
 		}, m.find)
 
-	p.Tool("mcp_load", "按名称加载一个条目的完整定义（工具返回 input_schema）。",
+	p.Tool("mcp_load", "按名称加载一个条目的完整定义：tool 返回 input_schema；skill/prompt 返回正文 content；resource 返回 content。",
 		map[string]any{
 			"type": "object",
 			"properties": map[string]any{
-				"name": map[string]any{"type": "string", "description": "条目名称（工具名 / 提示名 / 资源 uri）"},
+				"name": map[string]any{"type": "string", "description": "条目名称（工具名 / 技能或提示名 / 资源名或 uri）"},
 			},
 			"required": []string{"name"},
 		}, m.load)
@@ -119,12 +123,9 @@ func main() {
 
 func (m *mcpPlugin) find(ctx context.Context, args map[string]any, _ pluginsdk.CallContext) (any, error) {
 	cfg := m.cfg.Settings()
-	kind := strings.ToLower(strings.TrimSpace(asString(args["type"])))
-	if kind == "" {
-		kind = "tool"
-	}
-	if kind != "tool" && kind != "prompt" && kind != "resource" && kind != "all" {
-		return nil, fmt.Errorf("type 只允许 tool/prompt/resource/all（收到 %q）", kind)
+	kind, err := normalizeKind(asString(args["type"]))
+	if err != nil {
+		return nil, err
 	}
 	limit := cfg.DefaultLimit
 	if n := toInt(args["limit"]); n > 0 {
@@ -139,18 +140,19 @@ func (m *mcpPlugin) find(ctx context.Context, args map[string]any, _ pluginsdk.C
 	query := strings.ToLower(strings.TrimSpace(asString(args["query"])))
 
 	all := make([]entry, 0, 64)
-	if kind == "tool" || kind == "all" {
-		tools, err := m.tools(ctx)
-		if err != nil {
-			return nil, err
+	for _, group := range listGroups(kind) {
+		switch group {
+		case "tool":
+			tools, err := m.tools(ctx)
+			if err != nil {
+				return nil, err
+			}
+			all = append(all, tools...)
+		case "prompt":
+			all = append(all, m.promptEntries(ctx, kind)...)
+		case "resource":
+			all = append(all, m.resourceEntries(ctx)...)
 		}
-		all = append(all, tools...)
-	}
-	if kind == "prompt" || kind == "all" {
-		all = append(all, m.simpleList(ctx, "plugin/v1/prompts.list", "prompt")...)
-	}
-	if kind == "resource" || kind == "all" {
-		all = append(all, m.simpleList(ctx, "plugin/v1/resources.list", "resource")...)
 	}
 
 	out := make([]entry, 0, limit)
@@ -174,19 +176,63 @@ func (m *mcpPlugin) load(ctx context.Context, args map[string]any, _ pluginsdk.C
 	if name == "" {
 		return nil, errors.New("name 不能为空")
 	}
-	all := make([]entry, 0, 64)
-	tools, err := m.tools(ctx)
-	if err == nil {
-		all = append(all, tools...)
+	e, ok := m.lookupEntry(ctx, name)
+	if !ok {
+		return nil, fmt.Errorf("未找到条目 %q", name)
 	}
-	all = append(all, m.simpleList(ctx, "plugin/v1/prompts.list", "prompt")...)
-	all = append(all, m.simpleList(ctx, "plugin/v1/resources.list", "resource")...)
-	for _, e := range all {
-		if e.Name == name {
-			return map[string]any{"ok": true, "entry": e}, nil
+	if e.Kind == "tool" {
+		return mergeLoad(e, "", ""), nil
+	}
+	method, payload := loadRequest(e)
+	if method == "" {
+		return nil, fmt.Errorf("不支持加载条目 %q（kind=%s）", name, e.Kind)
+	}
+	detail, err := m.callDetail(ctx, method, payload)
+	if err != nil {
+		return nil, fmt.Errorf("读取 %s %q 内容失败: %w", e.Kind, name, err)
+	}
+	content := asString(detail["content"])
+	mime := asString(detail["mimeType"])
+	if mime == "" {
+		mime = asString(detail["mimetype"])
+	}
+	return mergeLoad(e, content, mime), nil
+}
+
+// lookupEntry 按名称查找条目：工具 → 提示/技能 → 资源（同旧行为，tool 优先）。
+// 列表读取失败按「该组无结果」处理，最终未命中时返回明确错误。
+func (m *mcpPlugin) lookupEntry(ctx context.Context, name string) (entry, bool) {
+	if tools, err := m.tools(ctx); err == nil {
+		for _, e := range tools {
+			if e.Name == name {
+				return e, true
+			}
 		}
 	}
-	return nil, fmt.Errorf("未找到条目 %q", name)
+	for _, e := range m.promptEntries(ctx, "prompt") {
+		if e.Name == name {
+			return e, true
+		}
+	}
+	for _, e := range m.resourceEntries(ctx) {
+		if e.Name == name || (e.URI != "" && e.URI == name) {
+			return e, true
+		}
+	}
+	return entry{}, false
+}
+
+// callDetail 调宿主详情能力面并返回结果对象（信封已解包）。
+func (m *mcpPlugin) callDetail(ctx context.Context, method string, payload map[string]any) (map[string]any, error) {
+	raw, err := m.p.Call(ctx, method, payload)
+	if err != nil {
+		return nil, err
+	}
+	obj, ok := unwrap(raw).(map[string]any)
+	if !ok {
+		return nil, fmt.Errorf("宿主 %s 返回非对象结果", method)
+	}
+	return obj, nil
 }
 
 // ── mcp_invoke ─────────────────────────
@@ -240,27 +286,7 @@ func (m *mcpPlugin) tools(ctx context.Context) ([]entry, error) {
 		if !ok {
 			continue
 		}
-		e := entry{
-			Name:        asString(t["name"]),
-			Kind:        "tool",
-			Description: asString(t["description"]),
-		}
-		if s, ok := t["inputSchema"].(map[string]any); ok {
-			e.Schema = s
-		}
-		if meta, ok := t["_meta"].(map[string]any); ok {
-			e.Hot, _ = meta["hot"].(bool)
-			if srv, ok := meta["server"].(map[string]any); ok {
-				e.Server = asString(srv["alias"])
-				if e.Server == "" {
-					e.Server = asString(srv["node"])
-				}
-			}
-		}
-		if !e.Hot && !includeNonHot {
-			continue
-		}
-		if e.Name != "" {
+		if e, ok := entryFromTool(t, includeNonHot); ok {
 			out = append(out, e)
 		}
 	}
@@ -268,8 +294,33 @@ func (m *mcpPlugin) tools(ctx context.Context) ([]entry, error) {
 	return out, nil
 }
 
-// simpleList 读取 prompts/resources 列表（形状差异全部容错）。
-func (m *mcpPlugin) simpleList(ctx context.Context, method, kind string) []entry {
+// promptEntries 读取 prompts/list 并归类为 skill / prompt。
+// requested 是请求 type：宿主条目未给 type 时用它兜底（skill 请求 → skill；其余 → prompt）。
+func (m *mcpPlugin) promptEntries(ctx context.Context, requested string) []entry {
+	items := m.listItems(ctx, "plugin/v1/prompts.list")
+	out := make([]entry, 0, len(items))
+	for _, item := range items {
+		if e := entryFromPrompt(item, requested); e.Name != "" {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+// resourceEntries 读取 resources/list 并归一化为 resource 条目。
+func (m *mcpPlugin) resourceEntries(ctx context.Context) []entry {
+	items := m.listItems(ctx, "plugin/v1/resources.list")
+	out := make([]entry, 0, len(items))
+	for _, item := range items {
+		if e := entryFromResource(item); e.Name != "" {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+// listItems 读取一组列表能力面并取其中的数组（形状差异全部容错）。
+func (m *mcpPlugin) listItems(ctx context.Context, method string) []map[string]any {
 	raw, err := m.p.Call(ctx, method, map[string]any{})
 	if err != nil {
 		return nil
@@ -283,20 +334,156 @@ func (m *mcpPlugin) simpleList(ctx context.Context, method, kind string) []entry
 			break
 		}
 	}
-	out := make([]entry, 0, len(list))
+	out := make([]map[string]any, 0, len(list))
 	for _, item := range list {
-		t, ok := item.(map[string]any)
-		if !ok {
-			continue
+		if t, ok := item.(map[string]any); ok {
+			out = append(out, t)
 		}
-		name := asString(t["name"])
-		if name == "" {
-			name = asString(t["uri"])
+	}
+	return out
+}
+
+// ── 纯逻辑（可单测，不依赖真实桥）──────────────────────────────────
+
+// normalizeKind 归一 mcp_find 的 type：空 = tool；skill 是 prompt 的别名（两者都保留）。
+func normalizeKind(raw string) (string, error) {
+	kind := strings.ToLower(strings.TrimSpace(raw))
+	switch kind {
+	case "":
+		return "tool", nil
+	case "tool", "skill", "prompt", "resource", "all":
+		return kind, nil
+	}
+	return "", fmt.Errorf("type 只允许 tool/skill/prompt/resource/all（收到 %q）", raw)
+}
+
+// listGroups 返回某 type 需查询的宿主列表组（skill/prompt 都落到 prompt 列表）。
+func listGroups(kind string) []string {
+	switch kind {
+	case "tool", "resource":
+		return []string{kind}
+	case "skill", "prompt":
+		return []string{"prompt"}
+	case "all":
+		return []string{"tool", "prompt", "resource"}
+	}
+	return nil
+}
+
+// entryFromTool 归一 tools/list 条目；非 hot 且未开启 includeNonHot 时丢弃。
+func entryFromTool(t map[string]any, includeNonHot bool) (entry, bool) {
+	e := entry{
+		Name:        asString(t["name"]),
+		Kind:        "tool",
+		Type:        "tool",
+		Description: asString(t["description"]),
+	}
+	if s, ok := t["inputSchema"].(map[string]any); ok {
+		e.Schema = s
+	} else if s, ok := t["input_schema"].(map[string]any); ok {
+		e.Schema = s
+	}
+	if meta, ok := t["_meta"].(map[string]any); ok {
+		e.Hot, _ = meta["hot"].(bool)
+		if srv, ok := meta["server"].(map[string]any); ok {
+			e.Server = asString(srv["alias"])
+			if e.Server == "" {
+				e.Server = asString(srv["node"])
+			}
 		}
-		if name == "" {
-			continue
+	}
+	if e.Name == "" {
+		return entry{}, false
+	}
+	if !e.Hot && !includeNonHot {
+		return entry{}, false
+	}
+	return e, true
+}
+
+// entryFromPrompt 归一 prompts/list 条目：宿主 type=skill → skill，type=prompt → prompt；
+// 宿主未给 type（或其他值）时用请求值兜底（skill 请求 → skill，其余 → prompt）。
+func entryFromPrompt(t map[string]any, requested string) entry {
+	kind := strings.ToLower(strings.TrimSpace(asString(t["type"])))
+	if kind != "skill" && kind != "prompt" {
+		kind = requested
+		if kind != "skill" {
+			kind = "prompt"
 		}
-		out = append(out, entry{Name: name, Kind: kind, Description: asString(t["description"])})
+	}
+	return entry{
+		Name:        asString(t["name"]),
+		Kind:        kind,
+		Type:        kind,
+		Description: asString(t["description"]),
+	}
+}
+
+// entryFromResource 归一 resources/list 条目（name 缺失时回落 uri；保留 uri 供 read）。
+func entryFromResource(t map[string]any) entry {
+	uri := asString(t["uri"])
+	name := asString(t["name"])
+	if name == "" {
+		name = uri
+	}
+	return entry{
+		Name:        name,
+		Kind:        "resource",
+		Type:        "resource",
+		Description: asString(t["description"]),
+		URI:         uri,
+		MimeType:    asString(t["mimeType"]),
+	}
+}
+
+// loadRequest 返回加载条目需二次调用的宿主方法与载荷（tool 无需二次读取 → method 为空）。
+func loadRequest(e entry) (string, map[string]any) {
+	switch e.Kind {
+	case "skill", "prompt":
+		return "plugin/v1/prompts.get", map[string]any{"name": e.Name}
+	case "resource":
+		uri := e.URI
+		if uri == "" {
+			uri = e.Name
+		}
+		return "plugin/v1/resources.read", map[string]any{"uri": uri}
+	}
+	return "", nil
+}
+
+// mergeLoad 组装 mcp_load 返回：tool → input_schema；skill/prompt/resource → content（+ text 兼容）。
+func mergeLoad(e entry, content, mimeType string) map[string]any {
+	if e.Type == "" {
+		e.Type = e.Kind
+	}
+	out := map[string]any{
+		"ok":    true,
+		"kind":  e.Kind,
+		"type":  e.Type,
+		"name":  e.Name,
+		"entry": e,
+	}
+	if e.Description != "" {
+		out["description"] = e.Description
+	}
+	if e.Server != "" {
+		out["server"] = e.Server
+	}
+	switch e.Kind {
+	case "tool":
+		out["input_schema"] = e.Schema
+	case "skill", "prompt":
+		out["content"] = content
+		out["text"] = content
+	case "resource":
+		if e.URI != "" {
+			out["uri"] = e.URI
+		}
+		out["content"] = content
+		out["text"] = content
+		if mimeType != "" {
+			out["mimeType"] = mimeType
+		}
 	}
 	return out
 }

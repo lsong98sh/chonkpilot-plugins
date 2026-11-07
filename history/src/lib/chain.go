@@ -684,6 +684,11 @@ func safeRel(p string) (string, error) {
 	if p == "" {
 		return "", errors.New("path 必填（单文件、相对 workdir）")
 	}
+	// `!` 是平台保留的临时目录根前缀（R-11：`!/` = <temp>/chonkpilot/<instance>/），
+	// 不属于 workdir 相对路径；history 的 path 只接受 workdir 内单文件，一律拒绝。
+	if strings.Contains(p, "!") {
+		return "", errors.New("path 非法（含保留字符 !）")
+	}
 	p = strings.ReplaceAll(p, "\\", "/")
 	if strings.HasPrefix(p, "/") || (len(p) >= 2 && p[1] == ':') {
 		return "", errors.New("path 必须是 workdir 相对路径")

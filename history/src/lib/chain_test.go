@@ -17,6 +17,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	mq "github.com/lsong98sh/chonkpilot-plugin-framework/runtime/bus"
 	plugin "github.com/lsong98sh/chonkpilot-plugin-framework/runtime/hook"
@@ -1052,5 +1053,319 @@ func TestStatusTimelinePerSessionAndClearTarget(t *testing.T) {
 	}
 	if x.reg.savedVal(timelineKeyPrefix+slugB) == "" {
 		t.Fatal("B 的时间线不应被清空动作覆盖")
+	}
+}
+
+// TestSafeRel：workdir 相对路径校验/归一（table-driven，断言精确错误文本与归一结果）。
+//
+// 期望口径（docs/spec/20-modules/28-plugins.md §3.2 history 内部工具 + 16-路径解析规范 §8）：
+// history 的 path 只接受 workdir 内的相对单文件——空 / 绝对（盘符、POSIX、UNC）/
+// 越界（`..`）/ 平台保留根前缀（`!` = R-11 临时目录）全部拒绝；合法路径**保留大小写**、
+// 分隔符统一归一到 `/`。
+func TestSafeRel(t *testing.T) {
+	cases := []struct {
+		name    string
+		in      string
+		want    string
+		wantErr string
+	}{
+		{"空", "", "", "path 必填（单文件、相对 workdir）"},
+		{"空白", " \t\r\n ", "", "path 必填（单文件、相对 workdir）"},
+		{"父目录越界", "../outside.txt", "", "path 非法（越出 workdir）"},
+		{"反斜杠父目录越界", `..\outside.txt`, "", "path 非法（越出 workdir）"},
+		{"中段父目录越界", "sub/../../x", "", "path 非法（越出 workdir）"},
+		{"Windows 盘符绝对路径", `C:\Windows\win.ini`, "", "path 必须是 workdir 相对路径"},
+		{"Windows 盘符绝对路径（正斜杠）", "C:/Windows/win.ini", "", "path 必须是 workdir 相对路径"},
+		{"Windows 盘符相对路径", "C:foo.txt", "", "path 必须是 workdir 相对路径"},
+		{"POSIX 绝对路径", "/abs", "", "path 必须是 workdir 相对路径"},
+		{"UNC 路径", `\\server\share\x.txt`, "", "path 必须是 workdir 相对路径"},
+		{"保留前缀 !", "!/tmp/x.txt", "", "path 非法（含保留字符 !）"},
+		{"保留字符 !（中段）", "sub/a!b.txt", "", "path 非法（含保留字符 !）"},
+		{"当前目录", ".", "", "path 非法（越出 workdir）"},
+		{"归一回根", "sub/..", "", "path 非法（越出 workdir）"},
+		{"普通文件", "a.txt", "a.txt", ""},
+		{"子目录文件", "sub/a.txt", "sub/a.txt", ""},
+		{"反斜杠分隔符归一", `sub\a.txt`, "sub/a.txt", ""},
+		{"点前缀归一", "./a.txt", "a.txt", ""},
+		{"重复分隔符归一", "sub//a.txt", "sub/a.txt", ""},
+		{"中段父目录归一", "sub/../a.txt", "a.txt", ""},
+		{"大小写保留", "Sub/A.TXT", "Sub/A.TXT", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := safeRel(tc.in)
+			if tc.wantErr != "" {
+				if err == nil {
+					t.Fatalf("safeRel(%q) = %q, nil；期望精确错误 %q", tc.in, got, tc.wantErr)
+				}
+				if err.Error() != tc.wantErr {
+					t.Fatalf("safeRel(%q) 错误 = %q；期望 %q", tc.in, err.Error(), tc.wantErr)
+				}
+				if got != "" {
+					t.Fatalf("拒绝时应返回空路径，got %q", got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("safeRel(%q) 意外错误：%v", tc.in, err)
+			}
+			if got != tc.want {
+				t.Fatalf("safeRel(%q) = %q；期望 %q", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestSafeRelNormalPathsRestoreCRLF：正常路径（`a.txt` / `sub/a.txt`，含 CRLF 与大小写）
+// 经工具面**真实通过**——show 读到链头字节、restore 正确写回目标检查点字节；
+// 分隔符 `\` 归一为 `/`，文件名大小写原样保留（git tree 路径大小写敏感）。
+func TestSafeRelNormalPathsRestoreCRLF(t *testing.T) {
+	wd := newRepo(t)
+	gitT(t, wd, "config", "core.autocrlf", "false") // blob 保留 CRLF 原始字节，便于逐字节断言
+	x := newHarnessWithWd(t, wd, true, "", "")
+
+	if err := os.MkdirAll(filepath.Join(wd, "sub"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeFileT(t, wd, "a.txt", "a-v1\r\n")
+	writeFileT(t, wd, filepath.Join("sub", "Crlf.txt"), "sub-v1\r\nline2\r\n")
+	writeFileT(t, wd, "Upper.TXT", "upper-v1\r\n")
+	x.cp(t, "rootSafe", "tool1", "t1") // A（回滚目标）
+
+	writeFileT(t, wd, "a.txt", "a-v2\r\n")
+	writeFileT(t, wd, filepath.Join("sub", "Crlf.txt"), "sub-v2\r\nline2\r\n")
+	writeFileT(t, wd, "Upper.TXT", "upper-v2\r\n")
+	x.cp(t, "rootSafe", "tool2", "t1") // B（链头）
+
+	// show：反斜杠分隔符归一 + 大小写原样 → 读到链头字节（CRLF 不转换）。
+	text, isErr := x.callTool(t, "rootSafe", "history_show", map[string]any{"to": -1, "path": `sub\Crlf.txt`})
+	if isErr {
+		t.Fatalf("history_show 正常路径应成功，got: %s", text)
+	}
+	if text != "sub-v2\r\nline2\r\n" {
+		t.Fatalf("show 子目录 CRLF 文件字节不符：%q", text)
+	}
+	text, isErr = x.callTool(t, "rootSafe", "history_show", map[string]any{"to": -1, "path": "Upper.TXT"})
+	if isErr {
+		t.Fatalf("history_show 大写文件名应成功，got: %s", text)
+	}
+	if text != "upper-v2\r\n" {
+		t.Fatalf("show 大写文件名内容不符：%q", text)
+	}
+
+	// restore：`./a.txt` 归一 → A 的字节。
+	if _, isErr := x.callTool(t, "rootSafe", "history_restore", map[string]any{"to": -2, "path": "./a.txt"}); isErr {
+		t.Fatal("history_restore 归一后的 a.txt 应成功")
+	}
+	if got := readFileT(t, wd, "a.txt"); got != "a-v1\r\n" {
+		t.Fatalf("restore a.txt 后字节 = %q；期望 %q", got, "a-v1\r\n")
+	}
+
+	// restore：`sub\Crlf.txt` 归一 → A 的 CRLF 字节。
+	text, isErr = x.callTool(t, "rootSafe", "history_restore", map[string]any{"to": -2, "path": `sub\Crlf.txt`})
+	if isErr {
+		t.Fatalf("history_restore 子目录 CRLF 文件应成功，got: %s", text)
+	}
+	if got := readFileT(t, wd, filepath.Join("sub", "Crlf.txt")); got != "sub-v1\r\nline2\r\n" {
+		t.Fatalf("restore 后 CRLF 字节 = %q；期望 %q", got, "sub-v1\r\nline2\r\n")
+	}
+}
+
+// TestDiffTruncationValidUTF8：>`diffMaxBytes` 的 diff → 返回截断标记 + **合法 UTF-8**
+// （回退到多字节字符边界，不切断），且截断体 = 源 diff 在合法边界上的精确前缀。
+func TestDiffTruncationValidUTF8(t *testing.T) {
+	wd := newRepo(t)
+	gitT(t, wd, "config", "core.autocrlf", "false")
+	x := newHarnessWithWd(t, wd, true, "", "")
+
+	writeFileT(t, wd, "seed.txt", "seed")
+	x.cp(t, "rootTrunc", "tool0", "t1")
+
+	// 构造 diff：一行为大量多字节（中文，3 字节/字）内容；微调 ASCII 前缀，
+	// 直到 `diffMaxBytes` 恰好落在某个多字节字符中间（前置断言，证明守卫被实际触发）。
+	var content, full string
+	const attempts = 8
+	for pad := 0; pad < attempts; pad++ {
+		content = strings.Repeat("a", pad) + strings.Repeat("中文测试", 9000)
+		writeFileT(t, wd, "big.txt", content)
+		x.cp(t, "rootTrunc", "tool-big", "t1")
+		head := strings.TrimSpace(gitT(t, wd, "rev-parse", chainRefPrefix+chainSlug("rootTrunc")))
+		full = gitT(t, wd, "diff-tree", "--no-commit-id", "-p", "-r", "--root", head)
+		if len(full) <= diffMaxBytes {
+			t.Fatalf("前置：diff 应超 %d 字节，got %d", diffMaxBytes, len(full))
+		}
+		if !utf8.ValidString(full[:diffMaxBytes]) {
+			break // 边界确实落在多字节字符中间
+		}
+		if pad == attempts-1 {
+			t.Fatalf("前置：未能构造出在多字节字符中间截断的 diff（长度 %d）", len(full))
+		}
+	}
+
+	text, isErr := x.callTool(t, "rootTrunc", "history_diff", map[string]any{"to": -1})
+	if isErr {
+		t.Fatalf("history_diff 应成功，got: %s", text)
+	}
+	marker := fmt.Sprintf("\n…（diff 超 %d 字节已截断；请用 path 参数缩小范围）", diffMaxBytes)
+	if !strings.HasSuffix(text, marker) {
+		t.Fatalf("缺少精确截断标记 %q；实际尾部：%q", marker, tail(text, len(marker)+8))
+	}
+	body := strings.TrimSuffix(text, marker)
+	if !utf8.ValidString(text) {
+		t.Fatal("截断后的 diff 必须是合法 UTF-8（不得切断多字节字符）")
+	}
+	if len(body) > diffMaxBytes {
+		t.Fatalf("截断体 %d 字节超过上限 %d", len(body), diffMaxBytes)
+	}
+	if !strings.HasPrefix(full, body) {
+		t.Fatal("截断体必须是源 diff 的前缀")
+	}
+	// 精确边界：从 diffMaxBytes 回退到最近合法 UTF-8 边界后的前缀。
+	want := full[:diffMaxBytes]
+	for len(want) > 0 && !utf8.ValidString(want) {
+		want = want[:len(want)-1]
+	}
+	if body != want {
+		t.Fatalf("截断体边界不符：got %d 字节，期望 %d 字节", len(body), len(want))
+	}
+}
+
+// tail 返回字符串末尾 n 字节（诊断用）。
+func tail(s string, n int) string {
+	if n > len(s) {
+		n = len(s)
+	}
+	return s[len(s)-n:]
+}
+
+// TestShowTruncatedAndRestoreFull：show 超 `showMaxBytes` → truncated=true 且只读前 N 字节
+// （展示面上限）；restore 读取 maxBytes=0 → 全量写回，字节与检查点完全一致（截断即数据损坏）。
+func TestShowTruncatedAndRestoreFull(t *testing.T) {
+	wd := newRepo(t)
+	gitT(t, wd, "config", "core.autocrlf", "false")
+	x := newHarnessWithWd(t, wd, true, "", "")
+
+	content := strings.Repeat("中文测试", 9000) // 108000 字节 > showMaxBytes
+	if len(content) <= showMaxBytes {
+		t.Fatalf("前置：内容应超 %d 字节", showMaxBytes)
+	}
+	writeFileT(t, wd, "big.txt", content)
+	x.cp(t, "rootShow", "tool1", "t1")
+	ws := x.ws(t)
+	head := strings.TrimSpace(gitT(t, wd, "rev-parse", chainRefPrefix+chainSlug("rootShow")))
+
+	// 展示面：截断 + truncated=true，且 = 前 showMaxBytes 字节。
+	blob, truncated, err := x.h.showBlob(ws, head, "big.txt", showMaxBytes)
+	if err != nil {
+		t.Fatalf("showBlob: %v", err)
+	}
+	if !truncated {
+		t.Fatal("超上限必须置 truncated=true")
+	}
+	if len(blob) != showMaxBytes {
+		t.Fatalf("截断读取应为 %d 字节，got %d", showMaxBytes, len(blob))
+	}
+	if !bytes.Equal(blob, []byte(content)[:showMaxBytes]) {
+		t.Fatal("截断读取必须是源内容的前 showMaxBytes 字节")
+	}
+
+	// restore 口径（maxBytes=0）：全量、不置 truncated。
+	full, truncated, err := x.h.showBlob(ws, head, "big.txt", 0)
+	if err != nil {
+		t.Fatalf("showBlob(0): %v", err)
+	}
+	if truncated {
+		t.Fatal("maxBytes=0（restore 写回）不得截断")
+	}
+	if string(full) != content {
+		t.Fatalf("全量读取字节不符：got %d，期望 %d", len(full), len(content))
+	}
+
+	// 工具面：show 返回截断提示（精确标记），内容 = 前 showMaxBytes 字节。
+	text, isErr := x.callTool(t, "rootShow", "history_show", map[string]any{"to": -1, "path": "big.txt"})
+	if isErr {
+		t.Fatalf("history_show 应成功，got: %s", text)
+	}
+	marker := fmt.Sprintf("\n…（文件内容超 %d 字节已截断；大文件请分段查看）", showMaxBytes)
+	if !strings.HasSuffix(text, marker) {
+		t.Fatalf("缺少精确截断标记 %q；实际尾部：%q", marker, tail(text, len(marker)+8))
+	}
+	if body := strings.TrimSuffix(text, marker); body != content[:showMaxBytes] {
+		t.Fatalf("show 截断体不符：got %d 字节，期望 %d 字节", len(body), showMaxBytes)
+	}
+
+	// restore 仍全量写回：删除后从链头恢复，磁盘字节 == 检查点全量内容（> showMaxBytes）。
+	if err := os.Remove(filepath.Join(wd, "big.txt")); err != nil {
+		t.Fatal(err)
+	}
+	if text, isErr := x.callTool(t, "rootShow", "history_restore", map[string]any{"to": -1, "path": "big.txt"}); isErr {
+		t.Fatalf("history_restore 应成功，got: %s", text)
+	}
+	got, err := os.ReadFile(filepath.Join(wd, "big.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != content {
+		t.Fatalf("restore 必须全量写回（不得截断）：got %d 字节，期望 %d 字节", len(got), len(content))
+	}
+	if len(got) <= showMaxBytes {
+		t.Fatalf("restore 结果应超展示上限 %d，got %d", showMaxBytes, len(got))
+	}
+}
+
+// TestPathTraversalRejectedBytesUnchanged：越界 / 绝对 / 保留前缀路径在 **show 与 restore 两个入口**
+// 均被拒（精确错误文本），且 workdir 外的目标文件字节不变、workdir 内不产生副作用。
+func TestPathTraversalRejectedBytesUnchanged(t *testing.T) {
+	wd := newRepo(t)
+	parent := filepath.Dir(wd)
+	outside := filepath.Join(parent, "outside.txt")
+	absTarget := filepath.Join(parent, "abs-target.txt")
+	if err := os.WriteFile(outside, []byte("outside-bytes"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(absTarget, []byte("abs-bytes"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	x := newHarnessWithWd(t, wd, true, "", "")
+	writeFileT(t, wd, "a.txt", "v1")
+	x.cp(t, "rootTrav", "tool1", "t1")
+
+	cases := []struct {
+		name    string
+		path    string
+		wantErr string
+	}{
+		{"相对父目录越界", "../outside.txt", "history: path 非法（越出 workdir）"},
+		{"中段父目录越界", "sub/../../outside.txt", "history: path 非法（越出 workdir）"},
+		{"绝对路径", absTarget, "history: path 必须是 workdir 相对路径"},
+		{"保留前缀 !", "!/tmp/x.txt", "history: path 非法（含保留字符 !）"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, tool := range []string{"history_restore", "history_show"} {
+				text, isErr := x.callTool(t, "rootTrav", tool, map[string]any{"path": tc.path, "to": -1})
+				if !isErr {
+					t.Fatalf("%s 应拒绝 %q，got: %s", tool, tc.path, text)
+				}
+				if text != tc.wantErr {
+					t.Fatalf("%s 错误文本 = %q；期望 %q", tool, text, tc.wantErr)
+				}
+			}
+		})
+	}
+
+	// 目标文件字节不变（拒绝发生在任何写盘之前）。
+	if b, err := os.ReadFile(outside); err != nil || string(b) != "outside-bytes" {
+		t.Fatalf("workdir 外目标文件被改动：%q, err=%v", string(b), err)
+	}
+	if b, err := os.ReadFile(absTarget); err != nil || string(b) != "abs-bytes" {
+		t.Fatalf("绝对路径目标文件被改动：%q, err=%v", string(b), err)
+	}
+	// 未在工作区内创建 `!` 目录；既有文件未被改动。
+	if _, err := os.Stat(filepath.Join(wd, "!")); !os.IsNotExist(err) {
+		t.Fatalf("保留前缀路径不得在工作区产生 `!` 目录，stat err=%v", err)
+	}
+	if got := readFileT(t, wd, "a.txt"); got != "v1" {
+		t.Fatalf("既有文件被改动：%q", got)
 	}
 }
