@@ -128,8 +128,10 @@ func TestHandleLoadDefaults(t *testing.T) {
 		KeyTimeoutSec:        "30",
 		KeyFetchMaxMB:        "4",
 		KeyFetchTimeoutSec:   "60",
+		KeyMaxRedirects:      "5",
+		KeyAllowPrivate:      "false",
 		KeyDownloadDir:       "",
-		KeyDownloadMaxMB:     "100",
+		KeyDownloadMaxMB:     "2048",
 		KeyDownloadExts:      "",
 		KeyDownloadOverwrite: "false",
 	}
@@ -153,6 +155,7 @@ func TestHandleSaveWritesNamespaceAndReadsBack(t *testing.T) {
 			KeyTimeoutSec:        "15",
 			KeyFetchMaxMB:        "8",
 			KeyFetchTimeoutSec:   "90",
+			KeyAllowPrivate:      "true",
 			KeyDownloadDir:       `E:\dl`,
 			KeyDownloadMaxMB:     "50",
 			KeyDownloadExts:      ".zip,.pdf",
@@ -167,6 +170,7 @@ func TestHandleSaveWritesNamespaceAndReadsBack(t *testing.T) {
 	cfg := m.Settings()
 	if cfg.APIKey != "sk-test-key" || cfg.BaseURL != "https://api.example.com" || cfg.Count != 5 ||
 		!cfg.NeedContent || cfg.TimeoutSec != 15 || cfg.FetchMaxMB != 8 || cfg.FetchTimeoutSec != 90 ||
+		!cfg.AllowPrivate ||
 		cfg.DownloadDir != `E:\dl` || cfg.DownloadMaxMB != 50 || cfg.DownloadExts != ".zip,.pdf" || !cfg.DownloadOverwrite {
 		t.Errorf("Settings = %+v", cfg)
 	}
@@ -235,6 +239,7 @@ func TestHandleSaveValidationRejects(t *testing.T) {
 		{"count 下界", KeyCount, "0", "1–50"},
 		{"count 上界", KeyCount, "51", "1–50"},
 		{"布尔非法", KeyNeedContent, "yes", `必须是 "true"/"false"`},
+		{"allow-private 非法", KeyAllowPrivate, "yes", `必须是 "true"/"false"`},
 		{"检索超时越界", KeyTimeoutSec, "121", "5–120"},
 		{"fetch 上限越界", KeyFetchMaxMB, "33", "1–32"},
 		{"fetch 超时越界", KeyFetchTimeoutSec, "601", "5–600"},

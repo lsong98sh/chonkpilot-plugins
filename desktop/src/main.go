@@ -6,21 +6,29 @@ package main
 
 import (
 	"context"
+	"embed"
 	"errors"
 	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/lsong98sh/chonkpilot-plugin-framework/contract"
 	"github.com/lsong98sh/chonkpilot-plugin-framework/sdk"
 	"github.com/lsong98sh/chonkpilot-plugin-framework/sdk/engineclient"
 	"github.com/lsong98sh/chonkpilot-util/pathx"
 )
 
 const pluginVersion = "1.0.0"
+
+// toolContractFS 内嵌 desktop_run 的 `.tool.md`（schema / async / timeout / hot 的唯一源）。
+//
+//go:embed tools/desktop/*.tool.md
+var toolContractFS embed.FS
 
 type desktopPlugin struct {
 	p     *pluginsdk.Plugin
@@ -52,8 +60,14 @@ func main() {
 		}),
 		ctxID: map[string]string{},
 	}
-	p.Tool("desktop_run", desktopToolDesc, desktopSchema(), d.run)
-	p.HotTool("desktop_run")
+	// 契约唯一源：内嵌的 `tools/desktop/desktop_run.tool.md`。
+	// `_meta`（async/timeout/on_timeout/category/hot，source=md）由 contract.MetaFor 生成。
+	tool, err := loadDesktopContract()
+	if err != nil {
+		slog.Error("desktop: 解析内嵌工具契约失败", "err", err)
+		os.Exit(1)
+	}
+	p.ToolWithMeta(tool.Name, tool.Description, tool.Schema, contract.MetaFor(tool), d.run)
 	p.OnRequest("status", pluginsdk.StatusHandler(pluginVersion, d.status))
 	p.OnRequest("contexts", d.contexts)
 	p.OnRequest("ping", pluginsdk.PingHandler(pluginVersion))
@@ -75,27 +89,31 @@ func main() {
 	}
 }
 
-const desktopToolDesc = "操作本机桌面窗口（Win32）。action=start/stop 管理会话；其余 action 在当前 context 上执行原子操作：" +
-	"list_windows() / find_window(title|class) / window_info() / focus() / click(x,y) / input(text) / key(keys) / " +
-	"screenshot(path?) / move(x,y) / size(w,h) / minimize / maximize / restore。首次调用会自动开会话。"
-
-func desktopSchema() map[string]any {
-	return map[string]any{
-		"type": "object",
-		"properties": map[string]any{
-			"action":     map[string]any{"type": "string", "description": "动作名（start/stop/list_windows/find_window/window_info/focus/click/input/key/screenshot/move/size/minimize/maximize/restore/ping）"},
-			"context_id": map[string]any{"type": "string", "description": "可选：显式指定会话 context（缺省按当前实例复用）"},
-			"purpose":    map[string]any{"type": "string", "description": "start / 自动开会话时的用途说明"},
-			"args":       map[string]any{"type": "object", "description": "动作参数（如 {title}/{x,y}/{text}/{keys}/{path}/{w,h}）"},
-		},
-		"required": []string{"action"},
+// loadDesktopContract 解析内嵌的 desktop_run `.tool.md`。
+func loadDesktopContract() (contract.Tool, error) {
+	const p = "tools/desktop/desktop_run.tool.md"
+	raw, err := toolContractFS.ReadFile(p)
+	if err != nil {
+		return contract.Tool{}, fmt.Errorf("读取契约 %s: %w", p, err)
 	}
+	tool, err := contract.Parse(string(raw))
+	if err != nil {
+		return contract.Tool{}, fmt.Errorf("%s: %w", p, err)
+	}
+	if tool.Name == "" {
+		return contract.Tool{}, fmt.Errorf("%s: 缺少 name", p)
+	}
+	return tool, nil
 }
 
 func (d *desktopPlugin) run(ctx context.Context, args map[string]any, cx pluginsdk.CallContext) (any, error) {
 	action := strings.ToLower(strings.TrimSpace(pluginsdk.Str(args["action"])))
 	if action == "" {
 		return nil, errors.New("action 必填")
+	}
+	opArgs, _ := args["args"].(map[string]any)
+	if opArgs == nil {
+		opArgs = map[string]any{}
 	}
 	if err := d.eng.Ensure(ctx); err != nil {
 		return nil, err
@@ -104,7 +122,8 @@ func (d *desktopPlugin) run(ctx context.Context, args map[string]any, cx plugins
 	case "ping", "status":
 		return d.eng.Call(ctx, "ping", nil)
 	case "start":
-		return d.start(ctx, cx, pluginsdk.Str(args["purpose"]))
+		// start 支持 meta 绑定目标窗口（title/class/hwnd），使「bind at start」可达。
+		return d.start(ctx, cx, pluginsdk.Str(args["purpose"]), targetMeta(opArgs, args))
 	case "stop":
 		id := pluginsdk.Str(args["context_id"])
 		if id == "" {
@@ -126,19 +145,30 @@ func (d *desktopPlugin) run(ctx context.Context, args map[string]any, cx plugins
 		id = d.get(cx.InstanceID)
 	}
 	if id == "" {
-		res, err := d.start(ctx, cx, pluginsdk.Str(args["purpose"]))
+		// 需要目标窗口的动作在自动开会话时顺带预绑定，后续同类动作即可省略目标。
+		var meta map[string]any
+		if requiresTarget(action) {
+			meta = targetMeta(opArgs)
+		}
+		res, err := d.start(ctx, cx, pluginsdk.Str(args["purpose"]), meta)
 		if err != nil {
 			return nil, err
 		}
 		id = pluginsdk.Str(res["context_id"])
 	}
-	opArgs, _ := args["args"].(map[string]any)
-	if opArgs == nil {
-		opArgs = map[string]any{}
-	}
-	if action == "screenshot" && pluginsdk.Str(opArgs["path"]) == "" {
-		if dir := pathx.ExpandHome(d.cfg.Settings().ScreenshotDir); dir != "" {
-			opArgs["path"] = filepath.Join(dir, fmt.Sprintf("desktop-%d.png", time.Now().UnixMilli()))
+	if action == "screenshot" || action == "shot" {
+		raw := pluginsdk.Str(opArgs["path"])
+		if raw == "" {
+			if dir := pathx.ExpandHome(d.cfg.Settings().ScreenshotDir); dir != "" {
+				raw = filepath.Join(dir, fmt.Sprintf("desktop-%d.png", time.Now().UnixMilli()))
+			}
+		}
+		path, err := resolveSandboxPath(cx, raw)
+		if err != nil {
+			return nil, err
+		}
+		if path != "" {
+			opArgs["path"] = path
 		}
 	}
 	res, err := d.eng.Call(ctx, "operation", map[string]any{"context_id": id, "action": action, "args": opArgs})
@@ -149,11 +179,78 @@ func (d *desktopPlugin) run(ctx context.Context, args map[string]any, cx plugins
 	return res, nil
 }
 
-func (d *desktopPlugin) start(ctx context.Context, cx pluginsdk.CallContext, purpose string) (map[string]any, error) {
+// requiresTarget 判断动作是否必须绑定目标窗口（与引擎 desktop.target 的分支一致）。
+func requiresTarget(action string) bool {
+	switch action {
+	case "window_info", "focus", "click", "input", "type", "key",
+		"move", "size", "resize", "minimize", "maximize", "restore":
+		return true
+	}
+	return false
+}
+
+// targetMeta 从参数里提取 start 绑定用的目标窗口字段（hwnd/title/class）。
+// 多个来源按先后顺序取第一个非空值：先 nested args，再顶层 args（防御性）。
+func targetMeta(sources ...map[string]any) map[string]any {
+	out := map[string]any{}
+	for _, src := range sources {
+		if src == nil {
+			continue
+		}
+		if _, ok := out["hwnd"]; !ok {
+			if v, ok := src["hwnd"]; ok {
+				if n, valid := hwndValue(v); valid {
+					out["hwnd"] = n
+				}
+			}
+		}
+		for _, k := range []string{"title", "class"} {
+			if _, ok := out[k]; ok {
+				continue
+			}
+			if s := strings.TrimSpace(pluginsdk.Str(src[k])); s != "" {
+				out[k] = s
+			}
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// hwndValue 把 hwnd 参数（数字/数字字符串）转为 uint64；0 或非法返回 false。
+func hwndValue(v any) (uint64, bool) {
+	switch n := v.(type) {
+	case float64:
+		if n > 0 {
+			return uint64(n), true
+		}
+	case int:
+		if n > 0 {
+			return uint64(n), true
+		}
+	case int64:
+		if n > 0 {
+			return uint64(n), true
+		}
+	case string:
+		if parsed, err := strconv.ParseUint(strings.TrimSpace(n), 10, 64); err == nil && parsed > 0 {
+			return parsed, true
+		}
+	}
+	return 0, false
+}
+
+func (d *desktopPlugin) start(ctx context.Context, cx pluginsdk.CallContext, purpose string, meta map[string]any) (map[string]any, error) {
 	if purpose == "" {
 		purpose = "llm"
 	}
-	res, err := d.eng.Call(ctx, "start", map[string]any{"purpose": purpose})
+	params := map[string]any{"purpose": purpose}
+	if len(meta) > 0 {
+		params["meta"] = meta
+	}
+	res, err := d.eng.Call(ctx, "start", params)
 	if err != nil {
 		return nil, err
 	}

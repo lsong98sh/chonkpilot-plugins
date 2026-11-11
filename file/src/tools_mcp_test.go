@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/lsong98sh/chonkpilot-plugin-framework/contract"
+	"github.com/lsong98sh/chonkpilot-plugins/file/lib/filetool"
 	"github.com/lsong98sh/chonkpilot-plugins/file/lib/paths"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
@@ -87,6 +88,59 @@ func callTool(t *testing.T, cs *mcp.ClientSession, name string, args map[string]
 	return sb.String(), res.IsError
 }
 
+// TestTargetsLimitSingleSource 守卫 targets 上限的**单一来源**：
+// 配置默认值 / 配置上限 / filetool 硬上限 / 10 个契约的 targets.maxItems 必须全部相等。
+// 以后任何一处改动（尤其只改 schema 或只改 config）都会在此失败。
+func TestTargetsLimitSingleSource(t *testing.T) {
+	want := filetool.TargetsHardLimit
+	if defaultMaxTargets != want {
+		t.Errorf("defaultMaxTargets=%d，期望 %d", defaultMaxTargets, want)
+	}
+	if maxMaxTargets != want {
+		t.Errorf("maxMaxTargets=%d，期望 %d", maxMaxTargets, want)
+	}
+	for _, tool := range loadTools(t) {
+		if tool.Name == "file_find" {
+			continue // file_find 用 limit（其自身契约另测），不走 targets
+		}
+		props, _ := tool.Schema["properties"].(map[string]any)
+		targets, _ := props["targets"].(map[string]any)
+		got := 0
+		switch v := targets["maxItems"].(type) {
+		case float64:
+			got = int(v)
+		case int:
+			got = v
+		case json.Number:
+			n, _ := v.Int64()
+			got = int(n)
+		}
+		if got != want {
+			t.Errorf("%s: targets.maxItems=%v，期望 %d", tool.Name, targets["maxItems"], want)
+		}
+	}
+}
+
+// TestFileReadContractMeta：file_read 的行为字段必须经 contract.MetaFor 进入 `_meta`
+// （source=md；async/timeout 来自 .tool.md，而不是被丢弃后回落 gateway 默认）。
+func TestFileReadContractMeta(t *testing.T) {
+	for _, tool := range loadTools(t) {
+		if tool.Name != "file_read" {
+			continue
+		}
+		if tool.Async != "sync" || !tool.AsyncSet || tool.Timeout != 120 || !tool.TimeoutSet {
+			t.Fatalf("file_read 契约解析错误：async=%q(set=%v) timeout=%d(set=%v)",
+				tool.Async, tool.AsyncSet, tool.Timeout, tool.TimeoutSet)
+		}
+		m := contract.MetaFor(tool)
+		if m["source"] != "md" || m["async"] != "sync" || m["timeout"] != 120 {
+			t.Fatalf("file_read _meta=%v，期望 source=md / async=sync / timeout=120", m)
+		}
+		return
+	}
+	t.Fatal("缺少 file_read 契约")
+}
+
 // TestFileToolsContractFace：11 个契约的名称 / schema / 描述齐备，且 MCP 工具面一致。
 func TestFileToolsContractFace(t *testing.T) {
 	tools := loadTools(t)
@@ -136,7 +190,6 @@ func TestFileToolsMCPRoundTrip(t *testing.T) {
 	b := filepath.Join(dir, "b.txt")
 
 	text, isErr := callTool(t, cs, "file_write", map[string]any{
-		"purpose": "mcp 面测试",
 		"targets": []any{
 			map[string]any{"path": a, "content": "alpha\nneedle\n中文内容\n"},
 			map[string]any{"path": b, "content": "beta\n"},
@@ -158,7 +211,6 @@ func TestFileToolsMCPRoundTrip(t *testing.T) {
 	}
 
 	text, isErr = callTool(t, cs, "file_read", map[string]any{
-		"purpose": "mcp 面测试",
 		"targets": []any{map[string]any{"path": a}},
 	}, nil)
 	if isErr {
@@ -169,7 +221,6 @@ func TestFileToolsMCPRoundTrip(t *testing.T) {
 	}
 
 	text, isErr = callTool(t, cs, "file_find", map[string]any{
-		"purpose": "mcp 面测试",
 		"targets": []any{map[string]any{"root": dir, "grep": "needle"}},
 	}, nil)
 	if isErr {
@@ -180,7 +231,6 @@ func TestFileToolsMCPRoundTrip(t *testing.T) {
 	}
 
 	text, isErr = callTool(t, cs, "file_replace", map[string]any{
-		"purpose": "mcp 面测试",
 		"targets": []any{map[string]any{"path": a, "find": "needle", "replace": "replaced"}},
 	}, nil)
 	if isErr {
@@ -193,13 +243,11 @@ func TestFileToolsMCPRoundTrip(t *testing.T) {
 	c := filepath.Join(dir, "c.txt")
 	d := filepath.Join(dir, "d.txt")
 	if text, isErr = callTool(t, cs, "file_copy", map[string]any{
-		"purpose": "mcp 面测试",
 		"targets": []any{map[string]any{"from": a, "to": c}},
 	}, nil); isErr {
 		t.Fatalf("file_copy: %s", text)
 	}
 	if text, isErr = callTool(t, cs, "file_move", map[string]any{
-		"purpose": "mcp 面测试",
 		"targets": []any{map[string]any{"from": c, "to": d}},
 	}, nil); isErr {
 		t.Fatalf("file_move: %s", text)
@@ -212,20 +260,17 @@ func TestFileToolsMCPRoundTrip(t *testing.T) {
 	}
 
 	if text, isErr = callTool(t, cs, "file_diff", map[string]any{
-		"purpose": "mcp 面测试",
 		"targets": []any{map[string]any{"left": a, "right": d}},
 	}, nil); isErr {
 		t.Fatalf("file_diff: %s", text)
 	}
 	if text, isErr = callTool(t, cs, "file_detect", map[string]any{
-		"purpose": "mcp 面测试",
 		"targets": []any{map[string]any{"path": a}},
 	}, nil); isErr {
 		t.Fatalf("file_detect: %s", text)
 	}
 
 	if text, isErr = callTool(t, cs, "file_delete", map[string]any{
-		"purpose": "mcp 面测试",
 		"targets": []any{map[string]any{"path": b}, map[string]any{"path": d}},
 	}, nil); isErr {
 		t.Fatalf("file_delete: %s", text)
@@ -242,7 +287,6 @@ func TestFileToolsInstanceRoot(t *testing.T) {
 	meta := map[string]any{"chonkpilot": map[string]any{"instance_id": inst}}
 
 	text, isErr := callTool(t, cs, "file_write", map[string]any{
-		"purpose": "mcp 面测试",
 		"targets": []any{map[string]any{"path": "!/mcp/meta.txt", "content": "instance-root\n"}},
 	}, meta)
 	if isErr {
@@ -266,7 +310,6 @@ func TestFileToolsInstanceRoot(t *testing.T) {
 	const inst2 = "mcpface-test-2"
 	meta2 := map[string]any{"chonkpilot": map[string]any{"instance_id": inst2}}
 	if text, isErr = callTool(t, cs, "file_write", map[string]any{
-		"purpose": "mcp 面测试",
 		"targets": []any{map[string]any{"path": "!/mcp/meta2.txt", "content": "instance-2\n"}},
 	}, meta2); isErr {
 		t.Fatalf("file_write(!/, inst2): %s", text)
@@ -285,7 +328,6 @@ func TestFileToolsInstanceRoot(t *testing.T) {
 
 	// 不带 _meta 的调用沿用「当前根」（最近一次 SetTempRoot = inst2，兼容旧单实例语义）。
 	text, isErr = callTool(t, cs, "file_read", map[string]any{
-		"purpose": "mcp 面测试",
 		"targets": []any{map[string]any{"path": "!/mcp/meta2.txt"}},
 	}, nil)
 	if isErr {
@@ -293,5 +335,51 @@ func TestFileToolsInstanceRoot(t *testing.T) {
 	}
 	if !strings.Contains(text, "instance-2") {
 		t.Fatalf("无 _meta 读取内容不符: %s", text)
+	}
+}
+
+// TestFileToolsContractMeta：`.tool.md` 的行为字段（async/timeout/on_timeout）经 SDK
+// 写入 tools/list 的 `_meta`，且 source=md；gateway 据此裁决同步/超时动作。
+func TestFileToolsContractMeta(t *testing.T) {
+	tools := loadTools(t)
+	for _, tool := range tools {
+		m := contract.MetaFor(tool)
+		if m["source"] != "md" {
+			t.Errorf("%s: source=%v，期望 md", tool.Name, m["source"])
+		}
+		if m["async"] != "sync" {
+			t.Errorf("%s: async=%v，期望 sync（md async: never）", tool.Name, m["async"])
+		}
+		if m["on_timeout"] != "background" {
+			t.Errorf("%s: on_timeout=%v，期望 background", tool.Name, m["on_timeout"])
+		}
+		if tool.Timeout <= 0 {
+			t.Errorf("%s: timeout=%d，同步工具不应为 0/负数", tool.Name, tool.Timeout)
+		}
+	}
+
+	cs := newMCPFace(t)
+	res, err := cs.ListTools(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("ListTools: %v", err)
+	}
+	metas := make(map[string]map[string]any, len(res.Tools))
+	for _, tl := range res.Tools {
+		metas[tl.Name] = map[string]any(tl.Meta)
+	}
+	write := metas["file_write"]
+	if write == nil {
+		t.Fatal("tools/list 缺 file_write")
+	}
+	if write["source"] != "md" || write["async"] != "sync" || write["on_timeout"] != "background" {
+		t.Fatalf("file_write _meta 不符: %v", write)
+	}
+	if n, _ := write["timeout"].(float64); int(n) != 120 {
+		if n, ok := write["timeout"].(int); !ok || n != 120 {
+			t.Fatalf("file_write timeout=%v，期望 120", write["timeout"])
+		}
+	}
+	if metas["file_find"]["timeout"] == nil {
+		t.Fatalf("file_find _meta 缺 timeout: %v", metas["file_find"])
 	}
 }

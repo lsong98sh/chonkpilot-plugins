@@ -158,6 +158,117 @@ func TestExecuteNotifyAction(t *testing.T) {
 	}
 }
 
+func TestParseScheduleInput(t *testing.T) {
+	now := time.Date(2026, 11, 8, 12, 0, 0, 0, time.Local)
+
+	got, err := parseScheduleInput("*/5 * * * *", nil, nil, now)
+	if err != nil || got.Once || got.Cron != "*/5 * * * *" {
+		t.Fatalf("cron: %+v err=%v", got, err)
+	}
+
+	got, err = parseScheduleInput(nil, nil, "50m", now)
+	if err != nil {
+		t.Fatalf("delay: %v", err)
+	}
+	if !got.Once || got.Cron != "" || got.RunAt != now.Add(50*time.Minute).Unix() {
+		t.Fatalf("delay=%+v", got)
+	}
+
+	at := now.Add(2 * time.Hour).Format("2006-01-02 15:04")
+	got, err = parseScheduleInput(nil, at, nil, now)
+	if err != nil {
+		t.Fatalf("at: %v", err)
+	}
+	if !got.Once || got.RunAt != now.Add(2*time.Hour).Unix() {
+		t.Fatalf("at=%+v", got)
+	}
+
+	// 互斥 / 缺失 / 过期 / 非法时长均拒绝。
+	cases := []struct {
+		name          string
+		cron, at, del any
+	}{
+		{"cron+delay", "*/5 * * * *", nil, "5m"},
+		{"at+delay", nil, "2026-11-08 18:30", "5m"},
+		{"missing", nil, nil, nil},
+		{"past at", nil, "2020-01-01 00:00", nil},
+		{"zero delay", nil, nil, "0s"},
+		{"bad delay", nil, nil, "soon"},
+	}
+	for _, c := range cases {
+		if _, err := parseScheduleInput(c.cron, c.at, c.del, now); err == nil {
+			t.Errorf("%s 应报错", c.name)
+		}
+	}
+}
+
+func TestRecoverOnceTask(t *testing.T) {
+	s, store := newTestScheduler(t, &fakeNotifier{})
+	now := time.Unix(1761900000, 0)
+	grace := int64(s.cfg.Settings().MissedGraceSec)
+
+	future := Task{ID: "ct_once_f", Once: true, RunAt: now.Unix() + 300, Action: Action{Type: ActionNotify},
+		Enabled: true, NextRunAt: 1}
+	future.Action.Param = json.RawMessage(`"x"`)
+	if err := store.Add(future); err != nil {
+		t.Fatal(err)
+	}
+	due := Task{ID: "ct_once_due", Once: true, RunAt: now.Unix() - 10, Action: Action{Type: ActionNotify},
+		Enabled: true, NextRunAt: 1}
+	due.Action.Param = json.RawMessage(`"x"`)
+	if err := store.Add(due); err != nil {
+		t.Fatal(err)
+	}
+	missed := Task{ID: "ct_once_missed", Once: true, RunAt: now.Unix() - grace - 100,
+		Action: Action{Type: ActionNotify}, Enabled: true, NextRunAt: 1}
+	missed.Action.Param = json.RawMessage(`"x"`)
+	if err := store.Add(missed); err != nil {
+		t.Fatal(err)
+	}
+
+	s.Recover(now)
+
+	if got, _ := store.Get("ct_once_f"); got.NextRunAt != future.RunAt {
+		t.Fatalf("未来一次性任务 next_run_at=%d want %d", got.NextRunAt, future.RunAt)
+	}
+	if got, _ := store.Get("ct_once_due"); got.NextRunAt != now.Unix() {
+		t.Fatalf("grace 内应 due now，got %d", got.NextRunAt)
+	}
+	got, _ := store.Get("ct_once_missed")
+	if got.Enabled || got.NextRunAt != 0 || got.DisabledReason != ReasonOnceMissed {
+		t.Fatalf("错过的一次性任务应终态停用: %+v", got)
+	}
+	if got.LastRun == nil || got.LastRun.Detail != "missed" {
+		t.Fatalf("应记录 skipped:missed: %+v", got.LastRun)
+	}
+}
+
+func TestExecuteOnceTaskAutoDisables(t *testing.T) {
+	fake := &fakeNotifier{}
+	s, store := newTestScheduler(t, fake)
+	task := Task{
+		ID: "ct_once_exec", Once: true, RunAt: time.Now().Unix() - 1,
+		Action:      Action{Type: ActionNotify, Param: json.RawMessage(`"一次性完成"`)},
+		Description: "通知：一次性完成", Enabled: true, RunningSince: time.Now().Unix(),
+		CreatedBy: CreatedBy{WorkDir: t.TempDir()},
+	}
+	if err := store.Add(task); err != nil {
+		t.Fatal(err)
+	}
+	s.execute(task)
+
+	got, _ := store.Get("ct_once_exec")
+	if got.Enabled || got.NextRunAt != 0 || got.DisabledReason != ReasonOnceCompleted {
+		t.Fatalf("一次性任务执行后应终态停用: %+v", got)
+	}
+	if got.RunCount != 1 || got.LastRun == nil || !got.LastRun.OK {
+		t.Fatalf("执行收口不符: %+v", got)
+	}
+	if len(fake.calls) != 1 {
+		t.Fatalf("应弹一次通知，got %d", len(fake.calls))
+	}
+}
+
 func TestParseCronRejectsSeconds(t *testing.T) {
 	if _, err := parseCron("*/5 * * * * *"); err == nil {
 		t.Fatal("6 段（含秒）应被拒绝")
@@ -167,5 +278,50 @@ func TestParseCronRejectsSeconds(t *testing.T) {
 	}
 	if _, err := parseCron("@daily"); err != nil {
 		t.Fatalf("@daily 应通过: %v", err)
+	}
+}
+
+func TestParseCronRejectsEmptyAndBadEvery(t *testing.T) {
+	for _, expr := range []string{"", "   ", "@every", "@every 0s", "@every 500ms", "@every not-a-duration"} {
+		if _, err := parseCron(expr); err == nil {
+			t.Fatalf("%q 应被拒绝", expr)
+		}
+	}
+	if _, err := parseCron("@every 5m"); err != nil {
+		t.Fatalf("@every 5m 应通过: %v", err)
+	}
+	if _, err := parseCron("@every 1s"); err != nil {
+		t.Fatalf("@every 1s 应通过: %v", err)
+	}
+}
+
+// TestMissedAndOverlapVisibleInLastRun：misfire / overlap 必须写入 Task.LastRun（不只是 runs.jsonl）。
+func TestMissedAndOverlapVisibleInLastRun(t *testing.T) {
+	s, store := newTestScheduler(t, &fakeNotifier{})
+	now := time.Unix(1761900000, 0)
+	grace := int64(s.cfg.Settings().MissedGraceSec)
+
+	missed := sampleTask("ct_missed_lr")
+	missed.NextRunAt = now.Unix() - grace - 100
+	if err := store.Add(missed); err != nil {
+		t.Fatal(err)
+	}
+	s.Recover(now)
+	got, _ := store.Get("ct_missed_lr")
+	if got.LastRun == nil || got.LastRun.Detail != "missed" || got.LastRun.Kind != "skipped" {
+		t.Fatalf("missed 应写入 LastRun: %+v", got.LastRun)
+	}
+
+	o := sampleTask("ct_overlap_lr")
+	o.Cron = "* * * * *"
+	o.NextRunAt = now.Unix()
+	o.RunningSince = now.Unix() - 5
+	if err := store.Add(o); err != nil {
+		t.Fatal(err)
+	}
+	s.tick(now)
+	got, _ = store.Get("ct_overlap_lr")
+	if got.LastRun == nil || got.LastRun.Detail != "overlap" || got.LastRun.Kind != "skipped" {
+		t.Fatalf("overlap 应写入 LastRun: %+v", got.LastRun)
 	}
 }

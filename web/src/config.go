@@ -47,6 +47,7 @@ const (
 	KeyFetchMaxMB        = "plugins.web.fetch-max-mb"
 	KeyFetchTimeoutSec   = "plugins.web.fetch-timeout-sec"
 	KeyMaxRedirects      = "plugins.web.max-redirects"
+	KeyAllowPrivate      = "plugins.web.allow-private"
 	KeyDownloadDir       = "plugins.web.download-dir"
 	KeyDownloadMaxMB     = "plugins.web.download-max-mb"
 	KeyDownloadExts      = "plugins.web.download-exts"
@@ -70,7 +71,7 @@ const (
 // allKeys 是本插件的用户配置键全集（稳定序；load 恒回显这些键的有效值）。
 var allKeys = []string{
 	KeyAPIKey, KeyBaseURL, KeySearchPath, KeyFetchPath, KeyCount, KeyNeedContent, KeyTimeoutSec,
-	KeyFetchMaxMB, KeyFetchTimeoutSec, KeyMaxRedirects,
+	KeyFetchMaxMB, KeyFetchTimeoutSec, KeyMaxRedirects, KeyAllowPrivate,
 	KeyDownloadDir, KeyDownloadMaxMB, KeyDownloadExts, KeyDownloadOverwrite,
 }
 
@@ -102,6 +103,7 @@ var configFields = []fieldSpec{
 	{Key: KeyFetchMaxMB, Type: "integer", Label: "web_download 返回内容上限（MB）", Min: configkit.IntPtr(fetchMaxMBMin), Max: configkit.IntPtr(fetchMaxMBMax)},
 	{Key: KeyFetchTimeoutSec, Type: "integer", Label: "web_download 超时（秒）", Min: configkit.IntPtr(fetchTimeoutMin), Max: configkit.IntPtr(fetchTimeoutMax)},
 	{Key: KeyMaxRedirects, Type: "integer", Label: "web_download 最大重定向次数（0-20，0 = 不跟随）", Min: configkit.IntPtr(maxRedirectsMin), Max: configkit.IntPtr(maxRedirectsMax)},
+	{Key: KeyAllowPrivate, Type: "boolean", Label: "允许访问本机/内网地址（SSRF 防护开关，默认关闭；仅在调试内网服务时开启）"},
 	{Key: KeyDownloadDir, Type: "string", Label: "web_download 默认目录（空 = ~/Downloads/chonkpilot）"},
 	{Key: KeyDownloadMaxMB, Type: "integer", Label: "web_download 单文件上限（MB）", Min: configkit.IntPtr(downloadMaxMBMin), Max: configkit.IntPtr(downloadMaxMBMax)},
 	{Key: KeyDownloadExts, Type: "string", Label: "允许的扩展名（逗号分隔，空 = 全部）"},
@@ -132,6 +134,7 @@ type settings struct {
 	FetchMaxMB        int
 	FetchTimeoutSec   int
 	MaxRedirects      int
+	AllowPrivate      bool
 	DownloadDir       string
 	DownloadMaxMB     int
 	DownloadExts      string
@@ -149,7 +152,7 @@ func defaultSettings() settings {
 		FetchMaxMB:      4,
 		FetchTimeoutSec: 60,
 		MaxRedirects:    5,
-		DownloadMaxMB:   100,
+		DownloadMaxMB:   2048,
 	}
 }
 
@@ -184,6 +187,9 @@ func settingsOf(values map[string]string) settings {
 	if n, ok := parseIntIn(values[KeyMaxRedirects], maxRedirectsMin, maxRedirectsMax); ok {
 		s.MaxRedirects = n
 	}
+	if raw, ok := values[KeyAllowPrivate]; ok {
+		s.AllowPrivate = parseBool(raw, s.AllowPrivate)
+	}
 	s.DownloadDir = strings.TrimSpace(values[KeyDownloadDir])
 	if n, ok := parseIntIn(values[KeyDownloadMaxMB], downloadMaxMBMin, downloadMaxMBMax); ok {
 		s.DownloadMaxMB = n
@@ -208,6 +214,7 @@ func (s settings) values() map[string]string {
 		KeyFetchMaxMB:        strconv.Itoa(s.FetchMaxMB),
 		KeyFetchTimeoutSec:   strconv.Itoa(s.FetchTimeoutSec),
 		KeyMaxRedirects:      strconv.Itoa(s.MaxRedirects),
+		KeyAllowPrivate:      boolString(s.AllowPrivate),
 		KeyDownloadDir:       s.DownloadDir,
 		KeyDownloadMaxMB:     strconv.Itoa(s.DownloadMaxMB),
 		KeyDownloadExts:      s.DownloadExts,
@@ -577,7 +584,7 @@ func normalizeValue(key string, raw any) (string, error) {
 		return s, nil
 	case KeyCount:
 		return normalizeInt(key, raw, countMin, countMax)
-	case KeyNeedContent, KeyDownloadOverwrite:
+	case KeyNeedContent, KeyDownloadOverwrite, KeyAllowPrivate:
 		s := strings.ToLower(strings.TrimSpace(pluginsdk.Str(raw)))
 		if s == "true" || s == "false" {
 			return s, nil
@@ -684,6 +691,11 @@ func (m *configManager) migrateLocked() bool {
 			continue
 		}
 		if val == defaults[lm.New] {
+			continue
+		}
+		// 2026-11-10：download-max-mb 默认 100 → 2048（落盘支持数百 MB）。
+		// 旧默认 100 不应被迁移成显式配置，否则升级后仍被 100MB 卡住。
+		if lm.New == KeyDownloadMaxMB && val == "100" {
 			continue
 		}
 		m.values[lm.New] = val

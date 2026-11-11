@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -22,6 +23,19 @@ func parseCron(expr string) (cron.Schedule, error) {
 	e := strings.TrimSpace(expr)
 	if e == "" {
 		return nil, errors.New("cron 不能为空")
+	}
+	if strings.HasPrefix(e, "@every") {
+		arg := strings.TrimSpace(strings.TrimPrefix(e, "@every"))
+		if arg == "" {
+			return nil, errors.New("@every 需要时长参数（如 @every 5m）")
+		}
+		d, derr := time.ParseDuration(arg)
+		if derr != nil {
+			return nil, fmt.Errorf("cron 表达式非法: @every %w", derr)
+		}
+		if d < time.Second {
+			return nil, fmt.Errorf("@every 时长必须 ≥ 1s（收到 %s）", d)
+		}
 	}
 	if !strings.HasPrefix(e, "@") {
 		if n := len(strings.Fields(e)); n != 5 {
@@ -46,6 +60,103 @@ func nextRun(expr string, after time.Time) (int64, error) {
 		return 0, errors.New("cron 无下一次执行时间")
 	}
 	return next.Unix(), nil
+}
+
+// scheduleInput 是 crontab_add / crontab_update 的调度参数解析结果。
+// 二选一：Cron 非空（周期）或 Once=true + RunAt（一次性）。
+type scheduleInput struct {
+	Cron  string
+	Once  bool
+	RunAt int64
+}
+
+// parseScheduleInput 解析「cron / at / delay」三选一调度参数。
+//
+//   - cron：5 段 cron 或 @宏（周期任务）；
+//   - at：一次性绝对时间（RFC3339 / "2006-01-02 15:04[:05]" / "2006-01-02" / unix 秒）；
+//   - delay：一次性相对当前时间的时长（如 "50m" / "2h"；必须 > 0）。
+//
+// cron 与 at/delay 互斥；at 必须晚于 now（延迟由 delay 表达）。
+func parseScheduleInput(cronArg, atArg, delayArg any, now time.Time) (scheduleInput, error) {
+	cronExpr := strings.TrimSpace(argString(cronArg))
+	atText := strings.TrimSpace(argString(atArg))
+	delayText := strings.TrimSpace(argString(delayArg))
+
+	hasCron := cronExpr != ""
+	hasAt := atText != ""
+	hasDelay := delayText != ""
+
+	switch {
+	case hasCron && (hasAt || hasDelay):
+		return scheduleInput{}, errors.New("cron 与 at/delay 互斥：周期任务用 cron，一次性任务用 at 或 delay")
+	case hasAt && hasDelay:
+		return scheduleInput{}, errors.New("at 与 delay 互斥：固定时间用 at，相对时间用 delay")
+	case !hasCron && !hasAt && !hasDelay:
+		return scheduleInput{}, errors.New("必须提供 cron（周期）或 at/delay（一次性）之一")
+	}
+
+	if hasCron {
+		if _, err := parseCron(cronExpr); err != nil {
+			return scheduleInput{}, err
+		}
+		return scheduleInput{Cron: cronExpr}, nil
+	}
+
+	var runAt time.Time
+	if hasAt {
+		t, err := parseAtTime(atText)
+		if err != nil {
+			return scheduleInput{}, err
+		}
+		runAt = t
+	} else {
+		d, err := time.ParseDuration(delayText)
+		if err != nil {
+			return scheduleInput{}, fmt.Errorf("delay 非法（示例：50m / 2h）: %w", err)
+		}
+		if d <= 0 {
+			return scheduleInput{}, fmt.Errorf("delay 必须大于 0（收到 %s）", d)
+		}
+		runAt = now.Add(d)
+	}
+	if !runAt.After(now) {
+		return scheduleInput{}, fmt.Errorf("一次性执行时间必须晚于当前时间（收到 %s）", runAt.Format("2006-01-02 15:04:05"))
+	}
+	return scheduleInput{Once: true, RunAt: runAt.Unix()}, nil
+}
+
+// parseAtTime 解析一次性绝对时间（本地时区）。
+func parseAtTime(s string) (time.Time, error) {
+	if n, err := strconv.ParseInt(strings.TrimSpace(s), 10, 64); err == nil {
+		if n <= 0 {
+			return time.Time{}, errors.New("at 的 unix 秒必须大于 0")
+		}
+		return time.Unix(n, 0), nil
+	}
+	for _, layout := range []string{time.RFC3339, "2006-01-02 15:04:05", "2006-01-02 15:04", "2006-01-02"} {
+		if t, err := time.ParseInLocation(layout, strings.TrimSpace(s), time.Local); err == nil {
+			return t, nil
+		}
+	}
+	return time.Time{}, fmt.Errorf("at 时间格式非法（示例：2026-11-08 18:30 / RFC3339）: %q", s)
+}
+
+// argString 把工具参数转字符串（nil → 空）。
+func argString(v any) string {
+	switch x := v.(type) {
+	case nil:
+		return ""
+	case string:
+		return x
+	case float64:
+		return strconv.FormatInt(int64(x), 10)
+	case int:
+		return strconv.Itoa(x)
+	case int64:
+		return strconv.FormatInt(x, 10)
+	default:
+		return ""
+	}
 }
 
 // scheduler 是 1s ticker 的调度内核（单 goroutine 扫描；任务级不重入）。
@@ -123,6 +234,37 @@ func (s *scheduler) Recover(now time.Time) {
 				cur.NextRunAt = 0
 				return nil
 			}
+			// 一次性任务：不重算下一次；错过补偿窗口 → 终态停用（不执行）。
+			if cur.Once {
+				if cur.RunAt <= 0 {
+					cur.Enabled = false
+					cur.NextRunAt = 0
+					cur.DisabledReason = ReasonOnceMissed
+					rec := RunRecord{TaskID: cur.ID, At: nowU, Kind: "skipped",
+						OK: false, Detail: "missed", Error: "一次性任务的 run_at 非法"}
+					recs = append(recs, rec)
+					cp := rec
+					cur.LastRun = &cp
+					return nil
+				}
+				if cur.RunAt <= nowU {
+					if cur.RunAt >= nowU-grace {
+						cur.NextRunAt = nowU // grace 窗口内 → 立即补跑
+						return nil
+					}
+					rec := RunRecord{TaskID: cur.ID, At: nowU, Kind: "skipped",
+						OK: false, Detail: "missed", Error: "错过一次性执行窗口（超出补偿阈值）"}
+					recs = append(recs, rec)
+					cp := rec
+					cur.LastRun = &cp
+					cur.Enabled = false
+					cur.NextRunAt = 0
+					cur.DisabledReason = ReasonOnceMissed
+					return nil
+				}
+				cur.NextRunAt = cur.RunAt
+				return nil
+			}
 			sched, perr := parseCron(cur.Cron)
 			if perr != nil {
 				cur.NextRunAt = 0
@@ -137,8 +279,11 @@ func (s *scheduler) Recover(now time.Time) {
 					cur.NextRunAt = nowU // grace 窗口内 → 立即补跑
 					return nil
 				}
-				recs = append(recs, RunRecord{TaskID: cur.ID, At: nowU, Kind: "skipped",
-					OK: false, Detail: "missed", Error: "错过执行窗口（超出补偿阈值）"})
+				rec := RunRecord{TaskID: cur.ID, At: nowU, Kind: "skipped",
+					OK: false, Detail: "missed", Error: "错过执行窗口（超出补偿阈值）"}
+				recs = append(recs, rec)
+				cp := rec
+				cur.LastRun = &cp // 诊断可见：list 的 last_run 不再停留在更早的成功记录
 			}
 			cur.NextRunAt = next.Unix()
 			return nil
@@ -176,6 +321,11 @@ func (s *scheduler) tick(now time.Time) {
 		if !t.Enabled || t.NextRunAt == 0 || t.NextRunAt > nowU {
 			continue
 		}
+		// 一次性任务：只认领一次，NextRunAt 立即清零（执行收口后自动停用）。
+		if t.Once {
+			s.scheduleOnce(&t, nowU)
+			continue
+		}
 		sched, err := parseCron(t.Cron)
 		if err != nil {
 			if s.logf != nil {
@@ -189,13 +339,16 @@ func (s *scheduler) tick(now time.Time) {
 		}
 
 		id := t.ID
-		overlap := false
+		var overlapRec *RunRecord
 		err = s.store.Update(id, func(cur *Task) error {
 			if !cur.Enabled || cur.NextRunAt == 0 || cur.NextRunAt > nowU {
 				return nil // 已被其它路径推进 / 停用
 			}
 			if cur.RunningSince > 0 {
-				overlap = true
+				rec := RunRecord{TaskID: id, At: nowU, Kind: "skipped", OK: false, Detail: "overlap"}
+				cp := rec
+				cur.LastRun = &cp
+				overlapRec = &rec
 				cur.NextRunAt = next
 				return nil
 			}
@@ -209,8 +362,8 @@ func (s *scheduler) tick(now time.Time) {
 			}
 			continue
 		}
-		if overlap {
-			_ = s.store.AppendRun(RunRecord{TaskID: id, At: nowU, Kind: "skipped", OK: false, Detail: "overlap"})
+		if overlapRec != nil {
+			_ = s.store.AppendRun(*overlapRec)
 			continue
 		}
 		claimed, ok := s.store.Get(id)
@@ -225,13 +378,58 @@ func (s *scheduler) tick(now time.Time) {
 	}
 }
 
+// scheduleOnce 认领一条到期的一次性任务：NextRunAt 清零（不再重复），上一轮仍在跑 →
+// 记 skipped:overlap 并终态停用（一次性任务没有下一轮可推进）。
+func (s *scheduler) scheduleOnce(t *Task, nowU int64) {
+	id := t.ID
+	var overlapRec *RunRecord
+	err := s.store.Update(id, func(cur *Task) error {
+		if !cur.Enabled || !cur.Once || cur.NextRunAt == 0 || cur.NextRunAt > nowU {
+			return nil // 已被其它路径推进 / 停用
+		}
+		if cur.RunningSince > 0 {
+			rec := RunRecord{TaskID: id, At: nowU, Kind: "skipped", OK: false, Detail: "overlap"}
+			cp := rec
+			cur.LastRun = &cp
+			overlapRec = &rec
+			cur.NextRunAt = 0
+			cur.Enabled = false
+			cur.DisabledReason = ReasonOnceMissed
+			return nil
+		}
+		cur.NextRunAt = 0
+		cur.RunningSince = nowU
+		return nil
+	})
+	if err != nil {
+		if !errors.Is(err, ErrTaskNotFound) && s.logf != nil {
+			s.logf("crontab: 认领一次性任务 %s 失败: %v", id, err)
+		}
+		return
+	}
+	if overlapRec != nil {
+		_ = s.store.AppendRun(*overlapRec)
+		return
+	}
+	claimed, ok := s.store.Get(id)
+	if !ok {
+		return
+	}
+	s.wg.Add(1)
+	go func(task Task) {
+		defer s.wg.Done()
+		s.execute(task)
+	}(claimed)
+}
+
 // execute 执行一条已认领的任务（完成 / 失败后清除运行标记并记运行明细）。
 //
-// 执行前检查（P2 / C14）：work_dir 不存在 → 任务停用（`work_dir_missing`），
-// 记 `skipped:workdir-missing`，只通知一次，不执行（run / notify 一律适用）。
+// 执行前检查（P2 / C14）：run / agent 依赖项目目录，work_dir 不存在 → 任务停用
+// （`work_dir_missing`），记 `skipped:workdir-missing`，只通知一次，不执行。
+// notify 不访问工作目录，允许在无项目的全局会话中运行，不参与该检查。
 func (s *scheduler) execute(t Task) {
 	now := time.Now().Unix()
-	if !workDirExists(t.CreatedBy.WorkDir) {
+	if t.Action.Type != ActionNotify && !workDirExists(t.CreatedBy.WorkDir) {
 		s.disableForMissingWorkDir(t, now)
 		return
 	}
@@ -254,6 +452,16 @@ func (s *scheduler) execute(t Task) {
 		cur.RunCount++
 		cp := rec
 		cur.LastRun = &cp
+		// 一次性任务：执行一次即终态（成功 / 失败都不再重跑）。
+		// 仅当当前定义仍是「同一次调度」时才自动停用；若运行期间被 update 改期/改成周期，
+		// 不能把新定义清掉（旧执行只影响旧定义）。
+		if t.Once && cur.Once && cur.RunAt == t.RunAt {
+			cur.Enabled = false
+			cur.NextRunAt = 0
+			if cur.DisabledReason == "" {
+				cur.DisabledReason = ReasonOnceCompleted
+			}
+		}
 		// 会话归属（P4 / C11）：记录首次建立的子会话 / 对话，供任务详情页只读展示。
 		if rec.SessionID != "" {
 			cur.SessionID = rec.SessionID
@@ -317,6 +525,10 @@ func (s *scheduler) rescheduleAll(now time.Time) {
 		_ = s.store.Update(task.ID, func(cur *Task) error {
 			if !cur.Enabled {
 				cur.NextRunAt = 0
+				return nil
+			}
+			if cur.Once {
+				cur.NextRunAt = cur.RunAt
 				return nil
 			}
 			n, err := nextRun(cur.Cron, now)

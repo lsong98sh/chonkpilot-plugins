@@ -3,6 +3,7 @@ package server
 import (
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 )
@@ -105,6 +106,21 @@ func probeRelative(dir, imp string, indexed map[string]bool, exts []string) stri
 	return ""
 }
 
+// firstIndexed 返回满足条件的字典序最小已索引文件（map 遍历本身无序，避免环检测结果抖动）。
+func firstIndexed(indexed map[string]bool, pred func(string) bool) string {
+	var hits []string
+	for f := range indexed {
+		if pred(f) {
+			hits = append(hits, f)
+		}
+	}
+	if len(hits) == 0 {
+		return ""
+	}
+	sort.Strings(hits)
+	return hits[0]
+}
+
 // resolveImport 把一条 import 原语解析为 rel 空间下已索引文件（解析不到返回 ""）。
 // 规则按语言近似；解析不到的边不参与环检测（get_dependency_graph 仍给原始列表）。
 func resolveImport(lang, importerFile, imp, rootDir string, indexed map[string]bool) string {
@@ -130,11 +146,7 @@ func resolveImport(lang, importerFile, imp, rootDir string, indexed map[string]b
 			if indexed[rel] {
 				return rel
 			}
-			for f := range indexed {
-				if dirOf(f) == rel {
-					return f
-				}
-			}
+			return firstIndexed(indexed, func(f string) bool { return dirOf(f) == rel })
 		}
 	case "python":
 		if !strings.HasPrefix(imp, ".") {
@@ -145,11 +157,7 @@ func resolveImport(lang, importerFile, imp, rootDir string, indexed map[string]b
 			if indexed[p+".py"] {
 				return p + ".py"
 			}
-			for f := range indexed {
-				if strings.HasPrefix(f, p+"/") {
-					return f
-				}
-			}
+			return firstIndexed(indexed, func(f string) bool { return strings.HasPrefix(f, p+"/") })
 		}
 	case "java":
 		if strings.HasPrefix(imp, "java.") || strings.HasPrefix(imp, "javax.") {
@@ -159,11 +167,7 @@ func resolveImport(lang, importerFile, imp, rootDir string, indexed map[string]b
 		if indexed[p+".java"] {
 			return p + ".java"
 		}
-		for f := range indexed {
-			if strings.HasPrefix(f, p+"/") {
-				return f
-			}
-		}
+		return firstIndexed(indexed, func(f string) bool { return strings.HasPrefix(f, p+"/") })
 	case "rust":
 		seg := strings.TrimPrefix(imp, "crate::")
 		if i := strings.Index(seg, "::"); i >= 0 {

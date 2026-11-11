@@ -29,7 +29,6 @@ func TestFileToolsSandboxWritable(t *testing.T) {
 
 	okPath := filepath.Join(allowed, "ok.txt")
 	if text, isErr := callTool(t, cs, "file_write", map[string]any{
-		"purpose": "sandbox 测试",
 		"targets": []any{map[string]any{"path": okPath, "content": "ok\n"}},
 	}, meta); isErr {
 		t.Fatalf("白名单内写入应成功: %s", text)
@@ -40,7 +39,6 @@ func TestFileToolsSandboxWritable(t *testing.T) {
 
 	badPath := filepath.Join(denied, "bad.txt")
 	text, isErr := callTool(t, cs, "file_write", map[string]any{
-		"purpose": "sandbox 测试",
 		"targets": []any{map[string]any{"path": badPath, "content": "bad\n"}},
 	}, meta)
 	if !isErr || !strings.Contains(text, "sandbox:") {
@@ -56,7 +54,6 @@ func TestFileToolsSandboxWritable(t *testing.T) {
 		t.Fatalf("准备只读文件: %v", err)
 	}
 	if text, isErr := callTool(t, cs, "file_read", map[string]any{
-		"purpose": "sandbox 测试",
 		"targets": []any{map[string]any{"path": outside}},
 	}, meta); isErr {
 		t.Fatalf("只读工具不应受写白名单限制: %s", text)
@@ -64,22 +61,30 @@ func TestFileToolsSandboxWritable(t *testing.T) {
 
 	// copy：to 越界 → 失败；from 越界（删除语义）→ 失败。
 	if text, isErr := callTool(t, cs, "file_copy", map[string]any{
-		"purpose": "sandbox 测试",
 		"targets": []any{map[string]any{"from": okPath, "to": filepath.Join(denied, "copy.txt")}},
 	}, meta); !isErr || !strings.Contains(text, "sandbox:") {
 		t.Fatalf("copy 目标越界应失败: isErr=%v text=%s", isErr, text)
 	}
 	if text, isErr := callTool(t, cs, "file_move", map[string]any{
-		"purpose": "sandbox 测试",
 		"targets": []any{map[string]any{"from": outside, "to": filepath.Join(allowed, "moved.txt")}},
 	}, meta); !isErr || !strings.Contains(text, "sandbox:") {
 		t.Fatalf("move 源越界应失败: isErr=%v text=%s", isErr, text)
+	}
+	// patch / delete 同属写工具：目标越界同样在预检阶段整次拒绝（不进入 handler）。
+	if text, isErr := callTool(t, cs, "file_patch", map[string]any{
+		"targets": []any{map[string]any{"path": outside, "patch": "@@ -1,1 +1,1 @@\n-x\n+y\n"}},
+	}, meta); !isErr || !strings.Contains(text, "sandbox:") {
+		t.Fatalf("patch 目标越界应失败: isErr=%v text=%s", isErr, text)
+	}
+	if text, isErr := callTool(t, cs, "file_delete", map[string]any{
+		"targets": []any{map[string]any{"path": outside}},
+	}, meta); !isErr || !strings.Contains(text, "sandbox:") {
+		t.Fatalf("delete 目标越界应失败: isErr=%v text=%s", isErr, text)
 	}
 
 	// 未启用沙箱（无 meta.sandbox）→ 不校验：白名单外写入成功。
 	freePath := filepath.Join(denied, "free.txt")
 	if text, isErr := callTool(t, cs, "file_write", map[string]any{
-		"purpose": "sandbox 测试",
 		"targets": []any{map[string]any{"path": freePath, "content": "free\n"}},
 	}, nil); isErr {
 		t.Fatalf("未启用沙箱时不应限制写入: %s", text)

@@ -673,8 +673,13 @@ func TestModuleSummary(t *testing.T) {
 		t.Errorf("expected 3 go files, got %d", lc["go"])
 	}
 	tc5 := sum["topComplexity5"].([]Symbol)
-	if len(tc5) != 5 {
-		t.Errorf("expected 5 top complexity symbols, got %d", len(tc5))
+	if len(tc5) != 3 {
+		t.Errorf("expected 3 top complexity functions, got %d", len(tc5))
+	}
+	for _, s := range tc5 {
+		if s.Kind != "func" && s.Kind != "method" && s.Kind != "constructor" {
+			t.Errorf("topComplexity5 不应含非函数: %+v", s)
+		}
 	}
 	if tc5[0].Complexity != 7 {
 		t.Errorf("expected top complexity 7, got %d", tc5[0].Complexity)
@@ -2060,7 +2065,7 @@ func TestCallGraphTools(t *testing.T) {
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
-		if m := out.(map[string]any); m["total"].(int) != 1 {
+		if m := out.(map[string]any); m["total"].(int) != 3 || m["returned"].(int) != 1 || m["truncated"] != true {
 			t.Errorf("limit=1 failed: %v", m)
 		}
 	})

@@ -172,6 +172,8 @@
       };
       const t = body.task || {};
       addKV('任务 ID', t.id);
+      addKV('调度', (t.once || t.schedule_type === 'once')
+        ? ('一次性 · ' + fmt(t.run_at)) : ('cron · ' + t.cron));
       addKV('work_dir', t.work_dir);
       addKV('沙箱状态', sandboxText(body.sandbox), body.sandbox && body.sandbox.available === false);
       addKV('会话', sessionText(body.session), !(body.session && body.session.available));
@@ -208,9 +210,14 @@
         tdDesc.textContent = t.description;
         const tdCron = document.createElement('td');
         tdCron.className = 'cron';
-        tdCron.textContent = t.cron;
+        tdCron.textContent = (t.once || t.schedule_type === 'once')
+          ? ('一次性 · ' + fmt(t.run_at)) : t.cron;
+        tdCron.title = (t.once || t.schedule_type === 'once')
+          ? ('一次性执行：' + fmt(t.run_at)) : ('cron: ' + t.cron);
         const tdNext = document.createElement('td');
-        tdNext.textContent = t.enabled ? fmt(t.next_run_at) : '已停用';
+        tdNext.textContent = t.enabled
+          ? fmt(t.next_run_at)
+          : (t.disabled_reason ? '已停用（' + t.disabled_reason + '）' : '已停用');
         const tdLast = document.createElement('td');
         tdLast.textContent = lastText(t.last_run);
         if (t.last_run && t.last_run.ok === false) tdLast.className = 'err';

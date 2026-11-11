@@ -29,7 +29,6 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
-	"unicode/utf8"
 
 	pluginsdk "github.com/lsong98sh/chonkpilot-plugin-framework/sdk"
 	"github.com/lsong98sh/chonkpilot-util/namex"
@@ -41,15 +40,32 @@ const (
 	maxRedirectsMax   = 20
 )
 
-func (s *searcher) download(ctx context.Context, args map[string]any, cx pluginsdk.CallContext) (any, error) {
+func (s *searcher) download(ctx context.Context, args map[string]any, cx pluginsdk.CallContext) (result any, err error) {
+	defer func() {
+		if err != nil {
+			s.record(0, err)
+		} else {
+			s.record(1, nil)
+		}
+	}()
 	cfg := s.cfg.Settings()
 	rawURL := strings.TrimSpace(str(args["url"]))
 	if rawURL == "" {
 		return nil, errors.New("url 不能为空")
 	}
+	if len(rawURL) > deepSeekMaxURL {
+		return nil, fmt.Errorf("url 超过 %d 字节", deepSeekMaxURL)
+	}
 	u, err := url.Parse(rawURL)
-	if err != nil || (u.Scheme != "http" && u.Scheme != "https") {
-		return nil, errors.New("url 必须是 http/https 绝对地址")
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		return nil, errors.New("url 必须是含 host 的 http/https 绝对地址")
+	}
+	// P0 SSRF：默认拒绝 loopback/私网/链路本地/localhost/*.local 等目标；
+	// 配置 `plugins.web.allow-private` 开启后放行内网（调试场景）。
+	if !cfg.AllowPrivate {
+		if err := checkURLNotPrivate(ctx, u); err != nil {
+			return nil, err
+		}
 	}
 
 	method := strings.ToUpper(strings.TrimSpace(str(args["method"])))
@@ -68,26 +84,36 @@ func (s *searcher) download(ctx context.Context, args map[string]any, cx plugins
 
 	// 返回内容上限（非下载模式）：maxBytes 优先，其次配置 fetchMaxMB。
 	maxBytes := int64(cfg.FetchMaxMB) << 20
-	if n := toInt(args["maxBytes"]); n > 0 {
+	if n, ok, ierr := intArgStrict(args, "maxBytes"); ierr != nil {
+		return nil, ierr
+	} else if ok && n > 0 {
 		maxBytes = int64(n)
 	}
 	if maxBytes <= 0 {
 		maxBytes = 4 << 20
 	}
+	// P1：硬上限 8MiB，禁止参数任意放大导致内容模式一次读爆内存/上下文。
+	if maxBytes > contentHardMaxBytes {
+		return nil, fmt.Errorf("maxBytes 超过硬上限 %dMiB（收到 %d 字节）；请调低，或改用落盘模式 maxMB", contentHardMaxBytes>>20, maxBytes)
+	}
 	// 下载模式上限：maxMB 优先，其次配置 downloadMaxMB。
 	maxMB := cfg.DownloadMaxMB
-	if n := toInt(args["maxMB"]); n > 0 {
+	if n, ok, ierr := intArgStrict(args, "maxMB"); ierr != nil {
+		return nil, ierr
+	} else if ok && n > 0 {
 		maxMB = n
 	}
 	if maxMB <= 0 {
-		maxMB = 100
+		maxMB = downloadHardMaxMB
 	}
 	if maxMB > downloadHardMaxMB {
 		maxMB = downloadHardMaxMB
 	}
 
 	timeoutSec := cfg.FetchTimeoutSec
-	if n := toInt(args["timeoutSec"]); n > 0 {
+	if n, ok, ierr := intArgStrict(args, "timeoutSec"); ierr != nil {
+		return nil, ierr
+	} else if ok && n > 0 {
 		timeoutSec = n
 	}
 	if timeoutSec < 5 {
@@ -98,8 +124,10 @@ func (s *searcher) download(ctx context.Context, args map[string]any, cx plugins
 	}
 
 	maxRedirects := cfg.MaxRedirects
-	if _, has := args["maxRedirects"]; has {
-		maxRedirects = toInt(args["maxRedirects"])
+	if n, ok, ierr := intArgStrict(args, "maxRedirects"); ierr != nil {
+		return nil, ierr
+	} else if ok {
+		maxRedirects = n
 	}
 	if maxRedirects < maxRedirectsMin {
 		maxRedirects = maxRedirectsMin
@@ -117,9 +145,21 @@ func (s *searcher) download(ctx context.Context, args map[string]any, cx plugins
 		return nil, fmt.Errorf("构造请求失败: %w", err)
 	}
 	req.Header.Set("User-Agent", "ChonkPilot/1.0")
-	if hs, ok := args["headers"].(map[string]any); ok {
+	if raw, has := args["headers"]; has && raw != nil {
+		hs, ok := raw.(map[string]any)
+		if !ok {
+			return nil, errors.New("headers 必须是对象（值须为字符串）")
+		}
 		for k, v := range hs {
-			if sv, ok := v.(string); ok && k != "" {
+			// P0：headers 不得覆盖 Host（Host 由 URL 决定，防止绕过 SSRF 校验/改写目标）。
+			if strings.EqualFold(strings.TrimSpace(k), "Host") {
+				return nil, errors.New("headers 不允许覆盖 Host（已拒绝）")
+			}
+			sv, ok := v.(string)
+			if !ok {
+				return nil, fmt.Errorf("headers[%q] 的值必须是字符串", k)
+			}
+			if k != "" {
 				req.Header.Set(k, sv)
 			}
 		}
@@ -128,12 +168,18 @@ func (s *searcher) download(ctx context.Context, args map[string]any, cx plugins
 	redirects := 0
 	client := &http.Client{
 		Timeout: time.Duration(timeoutSec) * time.Second,
-		CheckRedirect: func(_ *http.Request, via []*http.Request) error {
+		CheckRedirect: func(next *http.Request, via []*http.Request) error {
 			if maxRedirects == 0 {
 				return http.ErrUseLastResponse // 不跟随：原样返回 3xx
 			}
 			if len(via) > maxRedirects {
 				return fmt.Errorf("重定向超过上限 %d 次", maxRedirects)
+			}
+			// P0：重定向每一跳都重新校验目标（含 scheme），防止 302 → 内网。
+			if !cfg.AllowPrivate {
+				if err := checkURLNotPrivate(ctx, next.URL); err != nil {
+					return err
+				}
 			}
 			redirects = len(via)
 			return nil
@@ -150,14 +196,24 @@ func (s *searcher) download(ctx context.Context, args map[string]any, cx plugins
 		finalURL = resp.Request.URL.String()
 	}
 
-	out := func() map[string]any {
-		return map[string]any{
+	// P1：4xx/5xx 一律错误返回，错误页既不落盘也不当成功内容返回。
+	if resp.StatusCode >= 400 {
+		return nil, fmt.Errorf("web_download：目标返回 HTTP %d（%s，%s）；错误页既不落盘也不当成功返回，请检查 URL，或改用 web_fetch 查看页面",
+			resp.StatusCode, resp.Status, finalURL)
+	}
+
+	baseOut := func() map[string]any {
+		m := map[string]any{
 			"url":          u.String(),
 			"final_url":    finalURL,
 			"status":       resp.StatusCode,
 			"content_type": resp.Header.Get("Content-Type"),
 			"redirects":    redirects,
 		}
+		if resp.ContentLength >= 0 {
+			m["content_length"] = resp.ContentLength
+		}
+		return m
 	}
 
 	if saveMode {
@@ -219,7 +275,7 @@ func (s *searcher) download(ctx context.Context, args map[string]any, cx plugins
 		if werr != nil {
 			return nil, werr
 		}
-		res := out()
+		res := baseOut()
 		res["path"] = path
 		res["bytes"] = written
 		res["saved_to"] = path
@@ -239,17 +295,42 @@ func (s *searcher) download(ctx context.Context, args map[string]any, cx plugins
 	if truncated {
 		data = data[:maxBytes]
 	}
-	res := out()
+	res := baseOut()
 	res["bytes"] = len(data)
 	res["truncated"] = truncated
-	if utf8.Valid(data) {
-		res["content"] = string(data)
+	res["limit_bytes"] = maxBytes
+	if text, enc, ok := decodeContent(data, resp.Header.Get("Content-Type")); ok {
+		// 文本（UTF-8 或按 Content-Type charset 解码后的 UTF-8）。
+		res["content"] = text
+		res["encoding"] = enc
 	} else {
-		// 二进制（未指定保存路径）→ base64（用户口径 2026-10-31）。
+		// 二进制 / 未知编码（未指定保存路径）→ base64（用户口径 2026-10-31）。
 		res["content_base64"] = base64.StdEncoding.EncodeToString(data)
 		res["encoding"] = "base64"
 	}
 	return res, nil
+}
+
+// intArgStrict 读取整数参数（兼容 int/int64/float64；小数/字符串/其它类型报错），
+// 避免 maxRedirects=null/"abc" 被静默当作 0。
+func intArgStrict(args map[string]any, key string) (int, bool, error) {
+	raw, ok := args[key]
+	if !ok || raw == nil {
+		return 0, false, nil
+	}
+	switch v := raw.(type) {
+	case int:
+		return v, true, nil
+	case int64:
+		return int(v), true, nil
+	case float64:
+		if v != float64(int64(v)) {
+			return 0, false, fmt.Errorf("%s 必须是整数", key)
+		}
+		return int(v), true, nil
+	default:
+		return 0, false, fmt.Errorf("%s 必须是整数", key)
+	}
 }
 
 func filenameFromDisposition(cd string) string {
@@ -299,16 +380,17 @@ func uniquePath(path string) string {
 	return fmt.Sprintf("%s-%d%s", base, time.Now().UnixMilli(), ext)
 }
 
-// writeStream 把响应体流式写入 path（先写 .part，超限/失败即清理）。
+// writeStream 把响应体流式写入 path（先写唯一 .part 临时文件，超限/失败即清理）。
 func writeStream(path string, r io.Reader, maxBytes int64) (int64, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return 0, fmt.Errorf("创建目录失败: %w", err)
 	}
-	tmp := path + ".part"
-	f, err := os.Create(tmp)
+	f, err := os.CreateTemp(filepath.Dir(path), filepath.Base(path)+".part.*")
 	if err != nil {
 		return 0, fmt.Errorf("创建文件失败: %w", err)
 	}
+	tmp := f.Name()
+	_ = f.Chmod(0o644)
 	written, copyErr := io.Copy(f, io.LimitReader(r, maxBytes+1))
 	closeErr := f.Close()
 	if copyErr != nil {
@@ -360,8 +442,8 @@ func resolveSavePath(p, urlPath string) (string, error) {
 		return "", errors.New("saveAs 必须是绝对路径或以 ~/ 开头")
 	}
 	if st, err := os.Stat(p); err == nil && st.IsDir() {
-		name := filepath.Base(urlPath)
-		if name == "" || name == "/" || name == "." {
+		name := sanitizeFilename(filepath.Base(urlPath))
+		if name == "" || name == "." || name == ".." {
 			name = "index.html"
 		}
 		p = filepath.Join(p, name)

@@ -595,6 +595,13 @@ func (w *Workspace) readState() (string, error) {
 // Query 执行 FTS 检索，返回文件级命中（去重后按相关度，最多 topK 个文件）。
 // match = 自然语言匹配串；expr = 布尔/高级表达式（二者至少其一）。
 func (w *Workspace) Query(match, expr string, topK int, pathFilter string) ([]ftsHit, error) {
+	hits, _, _, err := w.QueryPage(match, expr, topK, pathFilter)
+	return hits, err
+}
+
+// QueryPage 是 Query 的分页统计版本：matched = 候选块内命中的**唯一文件数**，
+// truncated = 有更多命中（matched > 返回数，或候选块已达 500 上限；后者为保守值）。
+func (w *Workspace) QueryPage(match, expr string, topK int, pathFilter string) (hits []ftsHit, matched int, truncated bool, err error) {
 	if topK <= 0 {
 		topK = 20
 	}
@@ -602,21 +609,21 @@ func (w *Workspace) Query(match, expr string, topK int, pathFilter string) ([]ft
 	defer w.zmu.Unlock()
 	coll := w.coll.Load()
 	if coll == nil {
-		return nil, ErrNotInitialized
+		return nil, 0, false, ErrNotInitialized
 	}
 	// 多取文档块，再做文件级去重，保证 topK 个文件有候选
 	rawTopK := topK * 5
 	if rawTopK > 500 {
 		rawTopK = 500
 	}
-	hits, err := searchChunks(coll, match, expr, rawTopK)
+	raw, err := searchChunks(coll, match, expr, rawTopK)
 	if err != nil {
-		return nil, err
+		return nil, 0, false, err
 	}
 	filter := strings.ToLower(w.norm(pathFilter))
 	seen := map[string]bool{}
 	out := make([]ftsHit, 0, topK)
-	for _, h := range hits {
+	for _, h := range raw {
 		if filter != "" && !strings.Contains(strings.ToLower(h.Path), filter) {
 			continue
 		}
@@ -624,11 +631,11 @@ func (w *Workspace) Query(match, expr string, topK int, pathFilter string) ([]ft
 			continue
 		}
 		seen[h.Path] = true
-		h.Path = w.abs(h.Path)
-		out = append(out, h)
-		if len(out) >= topK {
-			break
+		if len(out) < topK {
+			h.Path = w.abs(h.Path)
+			out = append(out, h)
 		}
 	}
-	return out, nil
+	matched = len(seen)
+	return out, matched, matched > len(out) || len(raw) >= rawTopK, nil
 }

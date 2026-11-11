@@ -90,6 +90,93 @@ func TestStoreCorruptFileBackedUp(t *testing.T) {
 	}
 }
 
+// AddLimited 的上限判定与写入同锁；达到上限后不再落地。
+func TestStoreAddLimited(t *testing.T) {
+	s := newTestStore(t)
+	if err := s.AddLimited(sampleTask("ct_a"), 1); err != nil {
+		t.Fatalf("first add: %v", err)
+	}
+	if err := s.AddLimited(sampleTask("ct_b"), 1); err == nil {
+		t.Fatal("超过上限应拒绝")
+	}
+	list := s.List()
+	if len(list) != 1 || list[0].ID != "ct_a" {
+		t.Fatalf("list=%+v", list)
+	}
+}
+
+// 落盘失败必须回滚内存，避免「报告失败但任务实际存在」。
+func TestStoreAddRollsBackOnPersistFailure(t *testing.T) {
+	dir := t.TempDir()
+	s := newStore(dir)
+	if err := s.Load(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(s.path, 0o700); err != nil { // 让 rename(tmp → tasks.json) 失败
+		t.Fatal(err)
+	}
+	if err := s.Add(sampleTask("ct_x")); err == nil {
+		t.Fatal("落盘失败应返回错误")
+	}
+	if list := s.List(); len(list) != 0 {
+		t.Fatalf("失败后内存应回滚: %+v", list)
+	}
+}
+
+// 工具面更新（UpdateTx）在落盘失败时回滚内存。
+func TestStoreUpdateTxRollsBackOnPersistFailure(t *testing.T) {
+	dir := t.TempDir()
+	s := newStore(dir)
+	if err := s.Load(); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Add(sampleTask("ct_u")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(s.path); err != nil { // 先移除已落盘文件，再用同名目录让 rename 失败
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(s.path, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	_, err := s.UpdateTx("ct_u", func(cur *Task) error {
+		cur.Cron = "0 0 * * *"
+		cur.Description = "changed"
+		return nil
+	})
+	if err == nil {
+		t.Fatal("落盘失败应返回错误")
+	}
+	got, _ := s.Get("ct_u")
+	if got.Cron != "*/5 * * * *" || got.Description != "通知：x" {
+		t.Fatalf("失败后应回滚: %+v", got)
+	}
+}
+
+// Delete 落盘失败时恢复被删项，避免“报失败但当前进程已看不到、重启复活”。
+func TestStoreDeleteRollsBackOnPersistFailure(t *testing.T) {
+	dir := t.TempDir()
+	s := newStore(dir)
+	if err := s.Load(); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Add(sampleTask("ct_del")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(s.path); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(s.path, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Delete("ct_del"); err == nil {
+		t.Fatal("落盘失败应返回错误")
+	}
+	if _, ok := s.Get("ct_del"); !ok {
+		t.Fatal("失败后任务应仍在内存")
+	}
+}
+
 func TestStoreRecentRuns(t *testing.T) {
 	s := newTestStore(t)
 	for i := 0; i < 3; i++ {

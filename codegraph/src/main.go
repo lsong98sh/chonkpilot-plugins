@@ -12,13 +12,17 @@ package main
 
 import (
 	"context"
+	"embed"
 	"encoding/json"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"os"
+	"path"
 	"strings"
 	"time"
 
+	"github.com/lsong98sh/chonkpilot-plugin-framework/contract"
 	"github.com/lsong98sh/chonkpilot-plugin-framework/sdk"
 	codegraph "github.com/lsong98sh/chonkpilot-plugins/codegraph/engines/treesitter/server"
 	vfts "github.com/lsong98sh/chonkpilot-plugins/codegraph/engines/vfts/server"
@@ -26,6 +30,12 @@ import (
 )
 
 const pluginVersion = "1.0.0"
+
+// toolContractsFS 内嵌 9 个 LLM 可见查询工具的 `.tool.md`（契约是 schema/策略的唯一源）。
+// 管理工具（hot=false，LLM 不可见）不纳入 md，仍由引擎内部注册。
+//
+//go:embed tools/codegraph/*.tool.md
+var toolContractsFS embed.FS
 
 // hotTools 是注入 LLM 的工具（与管理工具 codegraph_configure / codegraph_status 区分）。
 var hotTools = []string{
@@ -40,7 +50,65 @@ var hotTools = []string{
 	"vfts_query",
 }
 
+// loadToolContracts 解析内嵌 `.tool.md`（9 个 LLM 可见工具）并按 name 索引。
+func loadToolContracts() (map[string]contract.Tool, error) {
+	paths, err := fs.Glob(toolContractsFS, "tools/codegraph/*.tool.md")
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[string]contract.Tool, len(paths))
+	for _, p := range paths {
+		raw, err := toolContractsFS.ReadFile(p)
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", p, err)
+		}
+		t, err := contract.Parse(string(raw))
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", p, err)
+		}
+		if t.Name == "" {
+			return nil, fmt.Errorf("%s: 缺少 name", p)
+		}
+		if t.Name != strings.TrimSuffix(path.Base(p), ".tool.md") {
+			return nil, fmt.Errorf("%s: name=%q 与文件名不一致", p, t.Name)
+		}
+		out[t.Name] = t
+	}
+	if len(out) != len(hotTools) {
+		return nil, fmt.Errorf("内嵌契约数量 = %d，期望 %d（hot 工具必须各有一份 md）", len(out), len(hotTools))
+	}
+	for _, name := range hotTools {
+		if _, ok := out[name]; !ok {
+			return nil, fmt.Errorf("缺少 hot 工具契约: %s", name)
+		}
+	}
+	return out, nil
+}
+
+// codegraphContracts 把 md 契约转成引擎注册面（8 个 codegraph_* 查询工具；vfts_query 单独注册）。
+func codegraphContracts(all map[string]contract.Tool) []codegraph.ContractTool {
+	out := make([]codegraph.ContractTool, 0, len(all))
+	for _, name := range hotTools {
+		if !strings.HasPrefix(name, "codegraph_") {
+			continue
+		}
+		t := all[name]
+		out = append(out, codegraph.ContractTool{
+			Name:        t.Name,
+			Description: t.Description,
+			Schema:      t.Schema,
+			Meta:        contract.MetaFor(t),
+		})
+	}
+	return out
+}
+
 func main() {
+	contracts, err := loadToolContracts()
+	if err != nil {
+		slog.Error("codegraph: 解析内嵌工具契约失败", "err", err)
+		os.Exit(1)
+	}
 	p, err := pluginsdk.New(pluginsdk.Options{
 		ID:      "codegraph",
 		Name:    "代码知识库",
@@ -62,16 +130,16 @@ func main() {
 	cfg := newConfigManager(p)
 
 	p.OnMCPServer(func(srv *mcp.Server) error {
-		if err := codegraph.RegisterTools(srv); err != nil {
+		// codegraph 8 个查询工具：schema/description/_meta 全部取自内嵌 .tool.md；
+		// 管理工具（hot=false）仍由引擎内部注册。
+		if err := codegraph.RegisterToolsWithContract(srv, codegraphContracts(contracts)); err != nil {
 			return fmt.Errorf("codegraph 注册失败: %w", err)
 		}
-		// 管理工具（hot=false）由引擎原样注册（带 workdir，LLM 不可见）；
-		// vfts_query 由插件自己注册 —— 工具表面**不带 workdir**（2B §3.5），由插件按
-		// `_meta.chonkpilot.work_dir` 注入。
+		// vfts 管理工具（hot=false）由引擎内部注册；vfts_query 走 md 契约（含 workdir 可选）。
 		if err := vfts.RegisterManagementTools(srv); err != nil {
 			return fmt.Errorf("vfts 注册失败: %w", err)
 		}
-		registerVftsQuery(srv, cfg)
+		registerVftsQuery(srv, cfg, contracts[vftsQueryToolName])
 		return nil
 	})
 	p.MCPHot(hotTools...)

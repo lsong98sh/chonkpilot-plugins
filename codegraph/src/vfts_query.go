@@ -14,37 +14,25 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/lsong98sh/chonkpilot-plugin-framework/contract"
 	"github.com/lsong98sh/chonkpilot-plugin-framework/sdk"
+	codegraph "github.com/lsong98sh/chonkpilot-plugins/codegraph/engines/treesitter/server"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
 // vftsQueryToolName 与引擎同名（gateway 以 namespace="-" 原样暴露给 LLM）。
 const vftsQueryToolName = "vfts_query"
 
-// vftsQueryDescription 与引擎 vfts_query 同描述（scope/会话分支说明一致）。
-const vftsQueryDescription = "在 vfts 全文索引中检索：match 为自然语言匹配串，query 为布尔/高级表达式" +
-	"（二者至少给其一，query 不支持字段前缀）。scope=file（默认）检索文件：返回命中文件 + 片段/行号" +
-	"（topK，按相关度）；scope=session 检索**会话正文索引**：按 ts 升序返回命中消息" +
-	"（session_id/dialog_id/turn_id/message_id/role/ts/snippet/score），snippet 为命中词前后约 240 字符正文。"
-
-// vftsQuerySchema 与引擎同形，**去掉 workdir**（由插件注入）。
-var vftsQuerySchema = map[string]any{
-	"type": "object",
-	"properties": map[string]any{
-		"scope":      map[string]any{"type": "string", "enum": []string{"file", "session"}, "description": "检索范围（默认 file；session = 会话正文索引）"},
-		"session_id": map[string]any{"type": "string", "description": "scope=session 时按会话过滤（缺省 = 当前会话）"},
-		"role":       map[string]any{"type": "string", "enum": []string{"user", "assistant"}, "description": "scope=session 时按角色过滤（缺省 = 两者）"},
-		"match":      map[string]any{"type": "string", "description": "自然语言匹配串（如：全文索引）"},
-		"query":      map[string]any{"type": "string", "description": "布尔/高级表达式（如：fox AND brown；不支持 content: 字段前缀）"},
-		"topK":       map[string]any{"type": "integer", "description": "返回命中数上限（默认 20）"},
-		"path":       map[string]any{"type": "string", "description": "文件路径子串过滤（可选，scope=file）"},
-	},
-}
-
 // registerVftsQuery 把插件的 `vfts_query` 注册进插件自带 MCP server（hot=true）。
-func registerVftsQuery(srv *mcp.Server, cfg *configManager) {
-	t := &mcp.Tool{Name: vftsQueryToolName, Description: vftsQueryDescription, InputSchema: vftsQuerySchema}
-	t.Meta = mcp.Meta{"hot": true}
+// schema / description / `_meta` 全部来自内嵌 `vfts_query.tool.md`。
+func registerVftsQuery(srv *mcp.Server, cfg *configManager, tool contract.Tool) {
+	schema := tool.Schema
+	if schema == nil {
+		schema = map[string]any{"type": "object", "properties": map[string]any{}}
+	}
+	t := &mcp.Tool{Name: vftsQueryToolName, Description: tool.Description, InputSchema: schema}
+	t.Meta = mcp.Meta(contract.MetaFor(tool))
+	t.Meta["hot"] = true
 	srv.AddTool(t, func(ctx context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		args := map[string]any{}
 		if req != nil && len(req.Params.Arguments) > 0 {
@@ -52,11 +40,7 @@ func registerVftsQuery(srv *mcp.Server, cfg *configManager) {
 				return errResultOf(fmt.Sprintf("参数解析失败: %v", err)), nil
 			}
 		}
-		var meta map[string]any
-		if req != nil {
-			meta = map[string]any(req.Params.Meta)
-		}
-		out, err := cfg.vftsQuery(ctx, meta, args)
+		out, err := cfg.vftsQuery(ctx, req, args)
 		if err != nil {
 			return errResultOf(err.Error()), nil
 		}
@@ -82,13 +66,134 @@ func callMetaNS(meta map[string]any) map[string]any {
 	return ns
 }
 
+// vftsMaxTopK 单次查询返回上限（file=文件数，session=消息条数）。
+const vftsMaxTopK = 100
+
+// validateVftsQueryArgs 严格校验并归一化 vfts_query 参数：
+// 未知键/类型错误显式失败；scope/role 归一化并校验；match/query 互斥且至少其一；
+// topK 1..100（超出截到 100）。
+func validateVftsQueryArgs(args map[string]any) (map[string]any, error) {
+	allowed := map[string]bool{
+		"workdir": true, "scope": true, "session_id": true, "role": true,
+		"match": true, "query": true, "topK": true, "path": true,
+	}
+	for k := range args {
+		if !allowed[k] {
+			return nil, fmt.Errorf("不支持的参数: %s", k)
+		}
+	}
+	for _, k := range []string{"workdir", "scope", "session_id", "role", "match", "query", "path"} {
+		if v, ok := args[k]; ok && v != nil {
+			if _, ok := v.(string); !ok {
+				return nil, fmt.Errorf("%s 必须是字符串", k)
+			}
+		}
+	}
+	out := map[string]any{}
+	for _, k := range []string{"workdir", "session_id", "path"} {
+		if v := strings.TrimSpace(pluginsdk.Str(args[k])); v != "" {
+			out[k] = v
+		}
+	}
+	scope := strings.ToLower(strings.TrimSpace(pluginsdk.Str(args["scope"])))
+	if scope == "" {
+		scope = "file"
+	}
+	if scope != "file" && scope != "session" {
+		return nil, fmt.Errorf("scope 只允许 file / session（收到 %q）", scope)
+	}
+	out["scope"] = scope
+	role := strings.ToLower(strings.TrimSpace(pluginsdk.Str(args["role"])))
+	if role != "" && role != "user" && role != "assistant" {
+		return nil, fmt.Errorf("role 只允许 user / assistant（收到 %q）", role)
+	}
+	if role != "" {
+		out["role"] = role
+	}
+	match := strings.TrimSpace(pluginsdk.Str(args["match"]))
+	expr := strings.TrimSpace(pluginsdk.Str(args["query"]))
+	if match == "" && expr == "" {
+		return nil, fmt.Errorf("需要 match 或 query 至少其一")
+	}
+	if match != "" && expr != "" {
+		return nil, fmt.Errorf("match 与 query 互斥（只给其一）")
+	}
+	if match != "" {
+		out["match"] = match
+	}
+	if expr != "" {
+		out["query"] = expr
+	}
+	topK := 20
+	if v, ok, err := vftsIntArg(args, "topK"); err != nil {
+		return nil, err
+	} else if ok {
+		if v < 1 {
+			return nil, fmt.Errorf("topK 必须 >= 1")
+		}
+		topK = v
+	}
+	if topK > vftsMaxTopK {
+		topK = vftsMaxTopK
+	}
+	out["topK"] = topK
+	return out, nil
+}
+
+// vftsIntArg 读取整数参数（兼容 int/int64/float64；小数报错）。
+func vftsIntArg(args map[string]any, key string) (int, bool, error) {
+	raw, ok := args[key]
+	if !ok || raw == nil {
+		return 0, false, nil
+	}
+	switch v := raw.(type) {
+	case int:
+		return v, true, nil
+	case int64:
+		return int(v), true, nil
+	case float64:
+		if v != float64(int64(v)) {
+			return 0, false, fmt.Errorf("%s 必须是整数", key)
+		}
+		return int(v), true, nil
+	default:
+		return 0, false, fmt.Errorf("%s 必须是整数", key)
+	}
+}
+
 // vftsQuery 执行一次 vfts_query（workdir 由调用上下文注入；session_id 缺省取上下文会话）。
-func (m *configManager) vftsQuery(ctx context.Context, meta, args map[string]any) (any, error) {
-	ns := callMetaNS(meta)
-	workdir, err := m.workdirFromMeta(ns)
+//
+// workdir 规则与 codegraph 查询工具一致（codegraph.ResolveWorkdirFromMeta）：
+// args 显式传入必须是当前项目内的绝对路径；未传则取 `_meta.chonkpilot.work_dir`；
+// 两者都没有时才回退到已登记实例/唯一工作区。
+func (m *configManager) vftsQuery(ctx context.Context, req *mcp.CallToolRequest, args map[string]any) (any, error) {
+	norm, err := validateVftsQueryArgs(args)
 	if err != nil {
 		return nil, err
 	}
+	args = norm
+	var meta map[string]any
+	if req != nil && req.Params != nil {
+		meta = map[string]any(req.Params.Meta)
+	}
+	ns := callMetaNS(meta)
+
+	var workdir string
+	rawWD := strings.TrimSpace(pluginsdk.Str(args["workdir"]))
+	metaWD := codegraph.MetaWorkdir(req)
+	if rawWD != "" || metaWD != "" {
+		if err := codegraph.ResolveWorkdirFromMeta(req, args); err != nil {
+			return nil, err
+		}
+		workdir = strings.TrimSpace(pluginsdk.Str(args["workdir"]))
+	} else {
+		wd, err := m.workdirFromMeta(ns)
+		if err != nil {
+			return nil, err
+		}
+		workdir = wd
+	}
+
 	call := map[string]any{"workdir": workdir}
 	for _, k := range []string{"scope", "match", "query", "topK", "path", "role"} {
 		if v, ok := args[k]; ok && v != nil && v != "" {

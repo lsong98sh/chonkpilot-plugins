@@ -111,7 +111,14 @@ func (w *Workspace) setColl(c *zvec.Collection) {
 func (w *Workspace) isLoaded() bool { return w.coll.Load() != nil }
 
 // Open 获取（进程内复用或从盘恢复）指定 workdir 的工作区。
-func Open(dir string) (*Workspace, error) {
+//
+// 写路径（index / configure / session index）：确保落盘目录存在。
+func Open(dir string) (*Workspace, error) { return open(dir, true) }
+
+// OpenReadOnly 获取已有工作区，**不创建落盘目录**（查询类工具专用）。
+func OpenReadOnly(dir string) (*Workspace, error) { return open(dir, false) }
+
+func open(dir string, ensureStore bool) (*Workspace, error) {
 	abs, err := filepath.Abs(dir)
 	if err != nil {
 		return nil, fmt.Errorf("abs %s: %w", dir, err)
@@ -127,11 +134,19 @@ func Open(dir string) (*Workspace, error) {
 	wsMu.Lock()
 	defer wsMu.Unlock()
 	if w, ok := wsReg[wsKey(abs)]; ok {
+		// 缓存命中时写路径仍要补建目录（可能是查询路径先以只读方式登记了该工作区）。
+		if ensureStore {
+			if err := os.MkdirAll(filepath.FromSlash(w.Store), 0o755); err != nil {
+				return nil, fmt.Errorf("mkdir store: %w", err)
+			}
+		}
 		return w, nil
 	}
 	w := &Workspace{Dir: abs, Store: StoreDir(abs), SessionStore: SessionStoreDir(abs)}
-	if err := os.MkdirAll(filepath.FromSlash(w.Store), 0o755); err != nil {
-		return nil, fmt.Errorf("mkdir store: %w", err)
+	if ensureStore {
+		if err := os.MkdirAll(filepath.FromSlash(w.Store), 0o755); err != nil {
+			return nil, fmt.Errorf("mkdir store: %w", err)
+		}
 	}
 	_ = w.loadMeta()
 	wsReg[wsKey(abs)] = w

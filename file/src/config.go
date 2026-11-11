@@ -27,73 +27,83 @@ import (
 	"sync"
 
 	"github.com/lsong98sh/chonkpilot-plugin-framework/sdk"
+	"github.com/lsong98sh/chonkpilot-plugins/file/lib/filetool"
 	"github.com/lsong98sh/chonkpilot-util/configkit"
 )
 
 // ─── 键命名空间（唯一源）────────────────────────────────────────────
 const (
-	KeyDefaultPurpose  = "plugins.file.default-purpose"
 	KeyDefaultEncoding = "plugins.file.default-encoding"
 	KeyMaxTargets      = "plugins.file.max-targets"
+	KeyMaxBytes        = "plugins.file.max-bytes"
 )
 
-// maxTargets 校验区间（与旧 manifest 声明一致）。
+// maxTargets / maxBytes 校验区间。
+//
+// maxTargets 的默认值/上限与 filetool.TargetsHardLimit、契约 targets.maxItems 单一来源：
+// 三处必须相等（`TestTargetsLimitSingleSource` 守卫）；插件配置只能**调低**，调低后
+// LLM 请求超出配置值直接参数错误，不再静默截断。
 const (
-	defaultMaxTargets = 200
+	defaultMaxTargets = filetool.TargetsHardLimit
 	minMaxTargets     = 1
-	maxMaxTargets     = 2000
+	maxMaxTargets     = filetool.TargetsHardLimit
+
+	defaultMaxBytes = 1 << 20 // 1 MiB
+	minMaxBytes     = 1
+	maxMaxBytes     = 32 << 20 // 32 MiB
 )
 
 // allKeys 是本插件的用户配置键全集（稳定序；load 恒回显这些键的有效值）。
-var allKeys = []string{KeyDefaultPurpose, KeyDefaultEncoding, KeyMaxTargets}
+var allKeys = []string{KeyDefaultEncoding, KeyMaxTargets, KeyMaxBytes}
 
 // legacyKeyMap 旧宿主键 → 新命名空间键（**迁移专用**；除 migrateLocked 外不得读旧键）。
+// `defaultPurpose` 已随 purpose 契约下架，不再迁移（旧值直接忽略）。
 var legacyKeyMap = []struct{ Old, New string }{
-	{"defaultPurpose", KeyDefaultPurpose},
 	{"defaultEncoding", KeyDefaultEncoding},
 	{"maxTargets", KeyMaxTargets},
 }
 
 // configFields 是配置页字段声明（页面据 type/min/max/secret 动态渲染）。
 var configFields = []fieldSpec{
-	{Key: KeyDefaultPurpose, Type: "string", Label: "默认 purpose（缺省补全，LLM 可覆盖）"},
-	{Key: KeyDefaultEncoding, Type: "string", Label: "默认编码（空 = 自动识别，如 utf-8）"},
-	{Key: KeyMaxTargets, Type: "integer", Label: "单次 targets 上限（超出截断）", Min: configkit.IntPtr(minMaxTargets), Max: configkit.IntPtr(maxMaxTargets)},
+	{Key: KeyDefaultEncoding, Type: "select", Label: "默认字符集（写入新文件 / patch ANSI 时使用；空=自动）", Options: []string{"", "utf-8", "utf-16le", "utf-16be", "gbk", "gb18030", "shift_jis", "big5", "euc-kr"}},
+	{Key: KeyMaxTargets, Type: "integer", Label: "单次 targets 上限（超出即参数错误）", Min: configkit.IntPtr(minMaxTargets), Max: configkit.IntPtr(maxMaxTargets)},
+	{Key: KeyMaxBytes, Type: "integer", Label: "单次调用内容上限（字节；所有文件合计，默认 1MiB）", Min: configkit.IntPtr(minMaxBytes), Max: configkit.IntPtr(maxMaxBytes)},
 }
 
 // fieldSpec 是配置页字段（JSON 形状与旧 manifest config.fields 兼容）。
 type fieldSpec struct {
-	Key    string `json:"key"`
-	Type   string `json:"type"`
-	Label  string `json:"label"`
-	Min    *int   `json:"min,omitempty"`
-	Max    *int   `json:"max,omitempty"`
-	Secret bool   `json:"secret,omitempty"`
+	Key     string   `json:"key"`
+	Type    string   `json:"type"`
+	Label   string   `json:"label"`
+	Min     *int     `json:"min,omitempty"`
+	Max     *int     `json:"max,omitempty"`
+	Secret  bool     `json:"secret,omitempty"`
+	Options []string `json:"options,omitempty"`
 }
 
 // ─── 配置模型 ────────────────────────────────────────────────────
 
 // settings 是本插件配置的内存视图（落盘形态 = allKeys 的字符串 KV）。
 type settings struct {
-	DefaultPurpose  string
 	DefaultEncoding string
 	MaxTargets      int
+	MaxBytes        int
 }
 
 // defaultSettings 缺键兜底（与实际生效值一致）。
 func defaultSettings() settings {
-	return settings{DefaultPurpose: "文件操作", MaxTargets: defaultMaxTargets}
+	return settings{MaxTargets: defaultMaxTargets, MaxBytes: defaultMaxBytes}
 }
 
 // settingsOf 由「已存在的 KV 键」构造配置快照（缺失 / 越界按默认）。
 func settingsOf(values map[string]string) settings {
 	s := defaultSettings()
-	if v := strings.TrimSpace(values[KeyDefaultPurpose]); v != "" {
-		s.DefaultPurpose = v
-	}
 	s.DefaultEncoding = strings.TrimSpace(values[KeyDefaultEncoding])
 	if n, err := strconv.Atoi(strings.TrimSpace(values[KeyMaxTargets])); err == nil && n >= minMaxTargets && n <= maxMaxTargets {
 		s.MaxTargets = n
+	}
+	if n, err := strconv.Atoi(strings.TrimSpace(values[KeyMaxBytes])); err == nil && n >= minMaxBytes && n <= maxMaxBytes {
+		s.MaxBytes = n
 	}
 	return s
 }
@@ -101,9 +111,9 @@ func settingsOf(values map[string]string) settings {
 // values 把快照展开成 `键 → 字符串` 的有效值（load 回显用）。
 func (s settings) values() map[string]string {
 	return map[string]string{
-		KeyDefaultPurpose:  s.DefaultPurpose,
 		KeyDefaultEncoding: s.DefaultEncoding,
 		KeyMaxTargets:      strconv.Itoa(s.MaxTargets),
+		KeyMaxBytes:        strconv.Itoa(s.MaxBytes),
 	}
 }
 
@@ -397,21 +407,9 @@ func isKnownKey(key string) bool {
 // normalizeValue 校验并归一单个配置值（非法 → 明确错误，不静默截断）。
 func normalizeValue(key string, raw any) (string, error) {
 	switch key {
-	case KeyDefaultPurpose:
-		s := strings.TrimSpace(pluginsdk.Str(raw))
-		if s == "" {
-			return "", fmt.Errorf("config_invalid: %s 不能为空", key)
-		}
-		if len([]rune(s)) > 64 {
-			return "", fmt.Errorf("config_invalid: %s 过长（上限 64 字符，收到 %d）", key, len([]rune(s)))
-		}
-		if strings.ContainsRune(s, 0) {
-			return "", fmt.Errorf("config_invalid: %s 含非法字符 NUL", key)
-		}
-		return s, nil
 	case KeyDefaultEncoding:
-		s := strings.ToLower(strings.TrimSpace(pluginsdk.Str(raw)))
-		if s == "" {
+		s := filetool.NormalizeEncoding(pluginsdk.Str(raw))
+		if s == "" || s == "auto" {
 			return "", nil
 		}
 		if len(s) > 32 {
@@ -423,12 +421,22 @@ func normalizeValue(key string, raw any) (string, error) {
 				return "", fmt.Errorf("config_invalid: %s 含非法字符 %q（只允许字母/数字/-/_）", key, string(r))
 			}
 		}
+		if !filetool.SupportedEncoding(s) {
+			return "", fmt.Errorf("config_invalid: %s 不支持的编码 %q（可选 utf-8/utf-16le/utf-16be/gbk/gb18030/shift_jis/big5/euc-kr，空=自动）", key, s)
+		}
 		return s, nil
 	case KeyMaxTargets:
 		s := strings.TrimSpace(pluginsdk.Str(raw))
 		n, err := strconv.Atoi(s)
 		if err != nil || n < minMaxTargets || n > maxMaxTargets {
 			return "", fmt.Errorf("config_invalid: %s 必须是 %d–%d 的整数（收到 %q）", key, minMaxTargets, maxMaxTargets, s)
+		}
+		return strconv.Itoa(n), nil
+	case KeyMaxBytes:
+		s := strings.TrimSpace(pluginsdk.Str(raw))
+		n, err := strconv.Atoi(s)
+		if err != nil || n < minMaxBytes || n > maxMaxBytes {
+			return "", fmt.Errorf("config_invalid: %s 必须是 %d–%d 的整数（收到 %q）", key, minMaxBytes, maxMaxBytes, s)
 		}
 		return strconv.Itoa(n), nil
 	}
@@ -455,6 +463,10 @@ func explicitKeys(values map[string]string) []string {
 // 幂等：重复执行不会重复写（新键写入后即跳过）。
 func (m *configManager) migrateLocked() bool {
 	defaults := defaultSettings().values()
+	// 旧版本默认值：这些值不是用户显式设置，迁移时跳过（避免升级后被旧默认“钉死”）。
+	legacyDefaults := map[string]string{
+		KeyMaxTargets: "200", // 2026-11-08 前 defaultMaxTargets
+	}
 	changed := false
 	for _, lm := range legacyKeyMap {
 		if _, ok := m.values[lm.New]; ok {
@@ -469,7 +481,7 @@ func (m *configManager) migrateLocked() bool {
 			m.logf("配置迁移跳过非法旧值 %s：%v", lm.Old, err)
 			continue
 		}
-		if val == defaults[lm.New] {
+		if val == defaults[lm.New] || val == legacyDefaults[lm.New] {
 			continue
 		}
 		m.values[lm.New] = val

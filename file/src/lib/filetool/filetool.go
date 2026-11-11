@@ -1,10 +1,11 @@
 // Package filetool 是文件域 11 个原子工具的实现（GATEWAY-2 / L2）。
 //
-// 参数模型统一为 {purpose, targets[]}：单文件也是长度 1 的数组。
+// 参数模型统一为 {targets[]}：单文件也是长度 1 的数组。
+// 调用展示名由宿主 gateway 注入的 `tool_call_display_name` 承担，本包不再要求 `purpose`。
 // 与旧 filesys_run（DSL 动作流）的区别：
 //   - 无流控、无句柄、无脚本解析，一次调用只做一类动作；
 //   - 参数级违规 = 整体失败；运行期错误 = 逐项 failed；
-//   - 结果恒为结构化 JSON（purpose / results[] / summary），由 mcp-server 透传。
+//   - 结果恒为结构化 JSON（results[] / summary），由 mcp-server 透传。
 //
 // 路径规则复用 fileops.ValidateFilePath（绝对路径 / ~/ / !/），相对路径一律拒绝。
 package filetool
@@ -16,15 +17,15 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"path/filepath"
 	"strings"
 
 	"github.com/lsong98sh/chonkpilot-plugins/file/lib/cli"
 	"github.com/lsong98sh/chonkpilot-plugins/file/lib/fileops"
 )
 
-// maxTargets 是 targets 数组的硬上限（与 file_find.limit 同口径）。
-const maxTargets = 2000
+// TargetsHardLimit 是 targets 数组的硬上限（与 file_find.limit 同口径）。
+// 导出给插件配置/契约一致性测试复用，避免三处各写一个 2000。
+const TargetsHardLimit = 2000
 
 const (
 	statusOK      = "ok"
@@ -67,17 +68,11 @@ func Dispatch(tool string, args map[string]any) *cli.Result {
 
 // request 是解析后的统一入参。
 type request struct {
-	purpose string
 	targets []map[string]any
 }
 
-// parseRequest 校验 purpose / targets 的形状（参数级违规 → 整体失败）。
+// parseRequest 校验 targets 的形状（参数级违规 → 整体失败）。
 func parseRequest(args map[string]any) (*request, string) {
-	purpose, _ := args["purpose"].(string)
-	purpose = strings.TrimSpace(purpose)
-	if purpose == "" {
-		return nil, "purpose is required"
-	}
 	raw, ok := args["targets"]
 	if !ok {
 		return nil, "targets is required"
@@ -86,8 +81,8 @@ func parseRequest(args map[string]any) (*request, string) {
 	if !ok {
 		return nil, "targets must be an array"
 	}
-	if len(arr) == 0 || len(arr) > maxTargets {
-		return nil, fmt.Sprintf("targets length must be 1..%d", maxTargets)
+	if len(arr) == 0 || len(arr) > TargetsHardLimit {
+		return nil, fmt.Sprintf("targets length must be 1..%d", TargetsHardLimit)
 	}
 	out := make([]map[string]any, 0, len(arr))
 	for i, it := range arr {
@@ -97,11 +92,20 @@ func parseRequest(args map[string]any) (*request, string) {
 		}
 		out = append(out, m)
 	}
-	return &request{purpose: purpose, targets: out}, ""
+	return &request{targets: out}, ""
 }
 
-// finish 汇总逐项结果并输出结构化 JSON。部分失败仍返回完整结果（不吞掉成功项）。
-func finish(tool, purpose string, results []map[string]any) *cli.Result {
+// finish 汇总逐项结果并输出结构化 JSON。
+//
+// 顶层 `ok` 是**整次调用是否无失败项**的唯一判据（failN == 0）。
+//
+// IsError 语义（file 域批量约定，2026-11-08 复核保留）：
+//   - 参数级违规（targets 形状/上限、maxBytes 越界）→ IsError=true（paramErr）；
+//   - 逐项运行期失败（含全部 target 失败）→ IsError=false，仍输出结构化 JSON；
+//     整体是否成功看顶层 `ok`，逐项原因看 `status/error`。
+//
+// 这样单文件错误不中断整批、也不把逐项错误放大成 provider 故障。
+func finish(tool string, results []map[string]any) *cli.Result {
 	okN, failN, skipN := 0, 0, 0
 	for _, r := range results {
 		switch r["status"] {
@@ -114,7 +118,7 @@ func finish(tool, purpose string, results []map[string]any) *cli.Result {
 		}
 	}
 	env := map[string]any{
-		"purpose": purpose,
+		"ok":      failN == 0,
 		"results": results,
 		"summary": map[string]any{
 			"total":   len(results),
@@ -126,10 +130,6 @@ func finish(tool, purpose string, results []map[string]any) *cli.Result {
 	b, err := json.Marshal(env)
 	if err != nil {
 		return cli.Err(tool, "marshal result: "+err.Error())
-	}
-	// 部分失败：退出码置 1（让上层知道有问题），但 stdout 仍是完整 JSON。
-	if failN > 0 {
-		return &cli.Result{Tool: tool, Success: false, Output: string(b), Error: fmt.Sprintf("%d target(s) failed", failN)}
 	}
 	return cli.Ok(tool, string(b), nil)
 }
@@ -166,38 +166,6 @@ func md5File(path string) (string, error) {
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
-// writeAtomic 原子写：同目录临时文件 + rename（失败不留半截文件）。
-func writeAtomic(path string, data []byte) error {
-	dir := filepath.Dir(path)
-	f, err := os.CreateTemp(dir, ".ck-tmp-*")
-	if err != nil {
-		return err
-	}
-	tmp := f.Name()
-	cleanup := true
-	defer func() {
-		if cleanup {
-			_ = os.Remove(tmp)
-		}
-	}()
-	if _, err := f.Write(data); err != nil {
-		_ = f.Close()
-		return err
-	}
-	if err := f.Sync(); err != nil {
-		_ = f.Close()
-		return err
-	}
-	if err := f.Close(); err != nil {
-		return err
-	}
-	if err := os.Rename(tmp, path); err != nil {
-		return err
-	}
-	cleanup = false
-	return nil
-}
-
 // itemErr 构造单项失败结果。
 func itemErr(fields map[string]any, err string) map[string]any {
 	if fields == nil {
@@ -215,6 +183,8 @@ func itemSkip(fields map[string]any, reason string) map[string]any {
 	}
 	fields["status"] = statusSkipped
 	fields["reason"] = reason
+	// 兼容早期契约示例（skipped 用 error）：同时给出 error，模型两种字段都能读到。
+	fields["error"] = reason
 	return fields
 }
 
@@ -244,6 +214,19 @@ func asInt(m map[string]any, key string, def int) int {
 		return int(v)
 	}
 	return def
+}
+
+// intArg 取整数参数并区分「未提供」（ok=false）。非数字类型按未提供处理。
+func intArg(m map[string]any, key string) (int, bool) {
+	switch v := m[key].(type) {
+	case float64:
+		return int(v), true
+	case int:
+		return v, true
+	case int64:
+		return int(v), true
+	}
+	return 0, false
 }
 
 // asBool 取布尔参数（缺省 def）。

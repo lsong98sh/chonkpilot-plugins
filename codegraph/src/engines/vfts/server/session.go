@@ -622,8 +622,18 @@ func (w *Workspace) RecordSessionFingerprints(fps map[string]string) error {
 }
 
 // QuerySessions 检索会话集合：session_id 空 = 全部会话；role 空 = user+assistant 均返回。
-// 命中按 ts 升序返回（会话内上下跳转口径），最多 topK 条。
+// 命中按相关度取 topK，再按 ts 升序展示（会话内上下跳转口径）。
 func (w *Workspace) QuerySessions(match, expr string, topK int, sessionID, role string) ([]SessionHit, error) {
+	hits, _, _, _, err := w.QuerySessionsPage(match, expr, topK, sessionID, role)
+	return hits, err
+}
+
+// QuerySessionsPage 是 QuerySessions 的统计版本：
+// matched = 本地 session_id/role 过滤后的命中数（截断前），truncated = matched > 返回数
+// 或候选已达上限（保守值）；filterApplied 表示 session_id 的服务端 filter 是否生效
+// （false 时已回退为“全量候选 + 本地过滤”，目标会话可能少召回）。
+// 语义修正：先按相关度取 topK，再按 ts 升序展示（此前先 ts 排序再截断会丢掉高分晚消息）。
+func (w *Workspace) QuerySessionsPage(match, expr string, topK int, sessionID, role string) ([]SessionHit, int, bool, bool, error) {
 	if topK <= 0 {
 		topK = 20
 	}
@@ -632,17 +642,17 @@ func (w *Workspace) QuerySessions(match, expr string, topK int, sessionID, role 
 	defer w.smu.Unlock()
 	coll, err := w.openSessionCollLocked()
 	if err != nil {
-		return nil, err
+		return nil, 0, false, false, err
 	}
 	rawTopK := topK * 20
 	if rawTopK > 1000 {
 		rawTopK = 1000
 	}
-	hits, err := searchSessionChunks(coll, match, expr, rawTopK, sessionID)
+	hits, filterApplied, err := searchSessionChunks(coll, match, expr, rawTopK, sessionID)
 	if err != nil {
-		return nil, err
+		return nil, 0, false, false, err
 	}
-	out := make([]SessionHit, 0, topK)
+	filtered := make([]SessionHit, 0, topK)
 	for _, h := range hits {
 		if sessionID != "" && h.SessionID != sessionID {
 			continue
@@ -650,17 +660,19 @@ func (w *Workspace) QuerySessions(match, expr string, topK int, sessionID, role 
 		if role != "" && h.Role != role {
 			continue
 		}
-		out = append(out, SessionHit{
+		filtered = append(filtered, SessionHit{
 			SessionID: h.SessionID, DialogID: h.DialogID, TurnID: h.TurnID,
 			MessageID: h.MessageID, Role: h.Role, TS: h.TS,
 			Snippet: h.Snippet, Score: h.Score,
 		})
 	}
-	sort.SliceStable(out, func(i, j int) bool { return out[i].TS < out[j].TS })
-	if len(out) > topK {
-		out = out[:topK]
+	matched := len(filtered)
+	if len(filtered) > topK {
+		filtered = filtered[:topK]
 	}
-	return out, nil
+	sort.SliceStable(filtered, func(i, j int) bool { return filtered[i].TS < filtered[j].TS })
+	truncated := matched > len(filtered) || len(hits) >= rawTopK
+	return filtered, matched, truncated, filterApplied, nil
 }
 
 // rawSessionHit 会话检索的原始命中（未排序/未按 role 过滤）。
@@ -679,14 +691,16 @@ type rawSessionHit struct {
 //
 // 过滤：先带服务端 filter（session_id == '…'；可用则缩小候选、保证召回）；若该能力不可用
 // （SetFilter / Query 报错）→ 去掉 filter 重试。两条路径的命中在 QuerySessions 里都会再按
-// session_id / role 过滤，**正确性不依赖 filter 是否被支持**。
-func searchSessionChunks(coll *zvec.Collection, match, expr string, topK int, sessionID string) ([]rawSessionHit, error) {
+// session_id / role 过滤，**正确性不依赖 filter 是否被支持**；返回的 bool 表示服务端 filter
+// 是否真正生效（false = 回退路径，目标会话可能被其它会话挤出候选）。
+func searchSessionChunks(coll *zvec.Collection, match, expr string, topK int, sessionID string) ([]rawSessionHit, bool, error) {
 	withFilter := sessionID != ""
 	hits, err := searchSessionOnce(coll, match, expr, topK, sessionID, withFilter)
 	if err != nil && withFilter {
-		return searchSessionOnce(coll, match, expr, topK, sessionID, false)
+		h2, err2 := searchSessionOnce(coll, match, expr, topK, sessionID, false)
+		return h2, false, err2
 	}
-	return hits, err
+	return hits, withFilter, err
 }
 
 // searchSessionOnce 单次会话查询（filterOn 决定是否下发服务端过滤表达式）。

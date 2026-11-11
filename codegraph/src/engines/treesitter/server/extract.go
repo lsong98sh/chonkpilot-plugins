@@ -127,7 +127,7 @@ func parseFile(langName, path string, src []byte) (*FileInfo, error) {
 				cc := 1
 				var calls []string
 				if kind == "func" || kind == "method" || kind == "constructor" {
-					cc = complexityOf(dec, n)
+					cc = complexityOf(langName, dec, n)
 					calls = callsWithin(langName, n, src)
 				}
 				fi.Symbols = append(fi.Symbols, Symbol{
@@ -201,16 +201,28 @@ func nodeText(src []byte, n *ts.Node) string {
 }
 
 // complexityOf 圈复杂度：1 + 子树内决策点计数（启发式，按语言决策节点集）。
-func complexityOf(dec map[string]bool, n *ts.Node) int {
+// complexityOf 圈复杂度 = 1 + 子树内决策节点数。
+// 剪枝与 callsWithin 一致：遇到内层定义/匿名函数作用域即不进入——内层函数/闭包的决策点
+// 不计入外层符号。
+func complexityOf(lang string, dec map[string]bool, n *ts.Node) int {
+	if n == nil {
+		return 1
+	}
+	df := defKinds[lang]
+	ns := nestedScopeKinds[lang]
 	count := 1
 	var walk func(x *ts.Node)
 	walk = func(x *ts.Node) {
-		if x != n && dec[x.Kind()] {
+		k := x.Kind()
+		if dec[k] {
 			count++
+		}
+		if _, isDef := df[k]; isDef || ns[k] {
+			return
 		}
 		walkChildren(x, walk)
 	}
-	walk(n)
+	walkChildren(n, walk)
 	return count
 }
 
@@ -370,19 +382,27 @@ func extractImports(lang string, n *ts.Node, src []byte) []string {
 	var out []string
 	switch lang {
 	case "go":
+		// import_declaration 的直接子节点：单个 import_spec，或分组 import_spec_list。
+		var collect func(c *ts.Node)
+		collect = func(c *ts.Node) {
+			switch c.Kind() {
+			case "import_spec":
+				p := c.ChildByFieldName("path")
+				if p == nil {
+					return
+				}
+				t := unquote(strings.TrimSpace(nodeText(src, p)))
+				if t != "" && t != "_" && t != "." {
+					out = append(out, t)
+				}
+			case "import_spec_list":
+				for i := 0; i < int(c.NamedChildCount()); i++ {
+					collect(c.NamedChild(uint(i)))
+				}
+			}
+		}
 		for i := 0; i < int(n.NamedChildCount()); i++ {
-			c := n.NamedChild(uint(i))
-			if c.Kind() != "import_spec" {
-				continue
-			}
-			p := c.ChildByFieldName("path")
-			if p == nil {
-				continue
-			}
-			t := unquote(strings.TrimSpace(nodeText(src, p)))
-			if t != "" && t != "_" && t != "." {
-				out = append(out, t)
-			}
+			collect(n.NamedChild(uint(i)))
 		}
 	case "javascript", "typescript", "tsx":
 		if srcN := n.ChildByFieldName("source"); srcN != nil {
@@ -417,7 +437,10 @@ func extractImports(lang string, n *ts.Node, src []byte) []string {
 		}
 	case "rust":
 		t := strings.TrimSpace(nodeText(src, n))
-		t = strings.TrimSpace(strings.TrimPrefix(t, "use"))
+		// 兼容 `use x;` / `pub use x;` / `pub(crate) use x;`：取 use 关键字之后的路径。
+		if i := strings.Index(t, "use"); i >= 0 {
+			t = t[i+len("use"):]
+		}
 		t = strings.TrimSuffix(strings.TrimSpace(t), ";")
 		t = strings.Join(strings.Fields(t), "")
 		if t != "" && t != "crate" && t != "self" && t != "super" {

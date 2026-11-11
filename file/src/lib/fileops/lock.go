@@ -27,6 +27,12 @@ const aliveHardStaleAge = 10 * time.Minute
 // lockRetryCount 修改类操作默认加锁重试次数（30s：100ms × 300，见 acquireLock）。
 const lockRetryCount = 300
 
+// AcquireLock 对 path 对应的文件加跨进程锁（`<path>.chonk.lock`），返回释放函数。
+// 供插件写工具（file_write 等）复用；调用方须保证父目录存在。
+func AcquireLock(path string) (release func(), err error) {
+	return acquireLock(path, lockRetryCount)
+}
+
 // acquireLock 对 path 对应的文件加跨进程锁（`<path>.chonk.lock`）。
 // 采用 O_CREATE|O_EXCL 原子创建，失败则重试（最多 retry 次，间隔 100ms）。
 // 陈旧锁突破策略（C-26）：解析锁文件首行 token（host:pid:random）——pid 已死立即突破

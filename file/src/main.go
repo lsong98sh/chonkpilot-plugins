@@ -3,7 +3,7 @@
 // 契约源 = 本仓 `file/tools/file/*.tool.md`（构建期拷到 `<pluginRoot>/tools/file/`）。
 // 本插件写法：
 //   - 契约解析/注册/参数封装 → framework `contract`（复用层）
-//   - 默认参数（purpose / encoding / targets 上限）→ 本文件
+//   - 默认参数（maxBytes / encoding / targets 上限）→ 本文件
 //   - 执行 → 同仓 `file/lib/toolset`（工具实现随插件，2026-10-25 PLUGIN-SPLIT-1）
 //
 // 主仓不再持有 file 工具实现：`file_*` 由 gateway 调用本插件的 MCP server 执行。
@@ -11,6 +11,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -86,7 +87,9 @@ func main() {
 
 // call 是业务分派：补默认参数 → toolset 进程内执行。
 func (f *filePlugin) call(ctx context.Context, name string, args map[string]any) (string, bool, error) {
-	f.applyDefaults(args)
+	if err := f.applyDefaults(args); err != nil {
+		return err.Error(), true, nil
+	}
 	text, isErr := dispatch(ctx, name, args)
 	return text, isErr, nil
 }
@@ -123,29 +126,28 @@ func applyCallMeta(ctx context.Context) {
 }
 
 // applyDefaults 用插件配置补默认参数（显式入参优先；LLM 可逐次覆盖）。
-func (f *filePlugin) applyDefaults(args map[string]any) {
+//
+// targets 上限统一为 `plugins.file.max-targets`（默认/上限 = filetool.TargetsHardLimit）：
+// 超出即参数错误，**不再静默截断**（静默丢目标会让批量写/删/读少做且模型无从发现）。
+func (f *filePlugin) applyDefaults(args map[string]any) error {
 	cfg := f.cfg.Settings()
+	// file_read 的 maxBytes 是**本次调用所有文件合计**的 content 上限；其它工具不消费该键。
 	pluginsdk.MergeMissing(args, map[string]any{
-		"purpose": cfg.DefaultPurpose,
+		"maxBytes": cfg.MaxBytes,
 	})
-	if cfg.DefaultEncoding != "" {
-		// 编码是**逐 target** 参数（filetool 读 targets[i].encoding）：把默认值注入缺省项，
-		// 而不是塞到顶层（顶层 encoding 无任何消费方）。2026-10-31 审查订正。
-		if targets, ok := args["targets"].([]any); ok {
-			for _, it := range targets {
-				if m, ok := it.(map[string]any); ok {
-					if _, exists := m["encoding"]; !exists {
-						m["encoding"] = cfg.DefaultEncoding
-					}
-				}
-			}
-		}
-	}
 	if maxTargets := cfg.MaxTargets; maxTargets > 0 {
 		if targets, ok := args["targets"].([]any); ok && len(targets) > maxTargets {
-			args["targets"] = targets[:maxTargets]
+			return fmt.Errorf("targets length %d exceeds plugins.file.max-targets %d; split into batches or raise the limit",
+				len(targets), maxTargets)
 		}
 	}
+	if cfg.DefaultEncoding != "" {
+		// 默认字符集是**写入侧策略**，不是逐 target 的显式 encoding：
+		// 注入顶层 `defaultEncoding`，由 file_write（新文件/ANSI 旧文件）与 file_patch（ANSI）
+		// 决定是否使用；file_read 仍自动识别，不被配置强制覆盖。2026-11-11。
+		pluginsdk.MergeMissing(args, map[string]any{"defaultEncoding": cfg.DefaultEncoding})
+	}
+	return nil
 }
 
 func (f *filePlugin) status(_ context.Context) map[string]any {
@@ -153,9 +155,9 @@ func (f *filePlugin) status(_ context.Context) map[string]any {
 	return map[string]any{
 		"tools":           len(f.tools),
 		"root":            filepath.Join(f.root, "tools", "file"),
-		"defaultPurpose":  cfg.DefaultPurpose,
 		"defaultEncoding": cfg.DefaultEncoding,
 		"maxTargets":      cfg.MaxTargets,
+		"maxBytes":        cfg.MaxBytes,
 	}
 }
 

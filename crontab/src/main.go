@@ -1,8 +1,9 @@
-// chonkpilot-crontab —— 定时任务插件（crontab_add / update / list / enable / disable / delete）。
+// chonkpilot-crontab —— 定时任务插件（crontab_add / update / list / toggle / delete）。
 //
 // 形态：独立 exe（插件桥 UDS + 自建 MCP HTTP）；任务为**本机全局**，不区分项目。
-// 动作二选一：`run`（执行命令，可选完成通知）/ `notify`（系统通知，param = HTML）。
-// 调度：1s ticker 扫描（单 goroutine），同任务不重入；状态落 <插件数据目录>/tasks.json。
+// 动作三选一：`run`（执行命令）/ `notify`（系统通知）/ `agent`（完整智能体，全工具面）。
+// 调度：周期 cron 或一次性 at/delay；1s ticker 扫描（单 goroutine），同任务不重入；
+// 一次性任务执行一次后自动停用。状态落 <插件数据目录>/tasks.json。
 // UI：任务页 / 状态栏徽标 / 配置页（webui，embed）；数字变化经 plugin-event 主动推送，零轮询。
 package main
 
@@ -11,6 +12,7 @@ import (
 	"crypto/rand"
 	"embed"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -25,6 +27,7 @@ import (
 	"github.com/lsong98sh/chonkpilot-plugin-framework/contract"
 	pluginsdk "github.com/lsong98sh/chonkpilot-plugin-framework/sdk"
 	"github.com/lsong98sh/chonkpilot-util/safepath"
+	"github.com/lsong98sh/chonkpilot-util/strx"
 )
 
 const pluginVersion = "1.0.0"
@@ -87,7 +90,10 @@ func main() {
 		return resolveSandbox(ctx, p, workDir)
 	}
 	// SANDBOX-WRITE-1 P4（C11）：会话归属经宿主能力面（插件不直接开库）。
-	run.sessions = newBridgeSessions(p)
+	// 同一宿主桥同时提供 agent 动作（plugin/v1/agent.run）。
+	bridge := newBridgeSessions(p)
+	run.sessions = bridge
+	run.agents = bridge
 	// SANDBOX-WRITE-1 P3：执行前确保项目已打开（未打开 → 宿主隐藏打开，C13/C17）。
 	run.ensureWorkdir = func(ctx context.Context, workDir string) (string, error) {
 		return ensureWorkdir(ctx, p, workDir)
@@ -165,12 +171,11 @@ func loadContracts() ([]contract.Tool, error) {
 // registerTools 按契约注册工具（handler 表按工具名分派），返回缺少实现的工具名。
 func registerTools(p *pluginsdk.Plugin, t *crontabPlugin, tools []contract.Tool) []string {
 	handlers := map[string]pluginsdk.ToolFunc{
-		"crontab_add":     t.add,
-		"crontab_update":  t.update,
-		"crontab_list":    t.list,
-		"crontab_enable":  t.enable,
-		"crontab_disable": t.disable,
-		"crontab_delete":  t.delete,
+		"crontab_add":    t.add,
+		"crontab_update": t.update,
+		"crontab_list":   t.list,
+		"crontab_toggle": t.toggle,
+		"crontab_delete": t.delete,
 	}
 	seen := make(map[string]bool, len(handlers))
 	for _, tool := range tools {
@@ -178,10 +183,7 @@ func registerTools(p *pluginsdk.Plugin, t *crontabPlugin, tools []contract.Tool)
 		if !ok {
 			continue
 		}
-		p.Tool(tool.Name, tool.Description, tool.Schema, fn)
-		if tool.Hot {
-			p.HotTool(tool.Name)
-		}
+		p.ToolWithMeta(tool.Name, tool.Description, tool.Schema, contract.MetaFor(tool), withJSONError(fn))
 		seen[tool.Name] = true
 	}
 	var missing []string
@@ -194,11 +196,29 @@ func registerTools(p *pluginsdk.Plugin, t *crontabPlugin, tools []contract.Tool)
 	return missing
 }
 
+// withJSONError 把 handler 的 Go error 转成 `{"ok":false,"error":"…"}` 文本。
+// MCP 仍置 isError=true（SDK 对非 nil error 的统一行为），正文因此同时满足契约的
+// 机器可解析字段与调用方的错误信号。
+func withJSONError(fn pluginsdk.ToolFunc) pluginsdk.ToolFunc {
+	return func(ctx context.Context, args map[string]any, cx pluginsdk.CallContext) (any, error) {
+		out, err := fn(ctx, args, cx)
+		if err == nil {
+			return out, nil
+		}
+		b, _ := json.Marshal(map[string]any{"ok": false, "error": err.Error()})
+		return nil, errors.New(string(b))
+	}
+}
+
 // ── 工具：crontab_add ─────────────────────────
 
 func (t *crontabPlugin) add(_ context.Context, args map[string]any, cx pluginsdk.CallContext) (any, error) {
-	cronExpr := strings.TrimSpace(asString(args["cron"]))
-	if _, err := parseCron(cronExpr); err != nil {
+	if err := rejectUnknownArgs(args, "cron", "at", "delay", "action", "sandbox"); err != nil {
+		return nil, err
+	}
+	now := time.Now()
+	sched, err := parseScheduleInput(args["cron"], args["at"], args["delay"], now)
+	if err != nil {
 		return nil, err
 	}
 	spec, err := ParseActionInput(args["action"])
@@ -210,24 +230,25 @@ func (t *crontabPlugin) add(_ context.Context, args map[string]any, cx pluginsdk
 		return nil, err
 	}
 	cfg := t.cfg.Settings()
-	if len(t.store.List()) >= cfg.MaxTasks {
-		return nil, fmt.Errorf("任务数已达上限（%d）", cfg.MaxTasks)
-	}
-	if !allowedWorkDir(cfg, cx.WorkDir) {
-		return nil, fmt.Errorf("work_dir 不在允许的目录白名单内: %s", cx.WorkDir)
+	if err := validateWorkDirForAction(cfg, cx.WorkDir, spec.Type); err != nil {
+		return nil, err
 	}
 	action, err := spec.Canonical()
 	if err != nil {
 		return nil, err
 	}
-	now := time.Now()
-	next, err := nextRun(cronExpr, now)
-	if err != nil {
-		return nil, err
+	next := sched.RunAt
+	if !sched.Once {
+		next, err = nextRun(sched.Cron, now)
+		if err != nil {
+			return nil, err
+		}
 	}
 	task := Task{
 		ID:          newTaskID(),
-		Cron:        cronExpr,
+		Cron:        sched.Cron,
+		Once:        sched.Once,
+		RunAt:       sched.RunAt,
 		Action:      action,
 		Description: spec.Description(),
 		Enabled:     true,
@@ -240,15 +261,20 @@ func (t *crontabPlugin) add(_ context.Context, args map[string]any, cx pluginsdk
 		NextRunAt: next,
 		Sandbox:   sandbox,
 	}
-	if err := t.store.Add(task); err != nil {
+	// 上限判定与写入在同一把锁内，避免并发 add 越过 max-tasks。
+	if err := t.store.AddLimited(task, cfg.MaxTasks); err != nil {
 		return nil, err
 	}
 	t.notifyChanged(context.Background())
-	if cfg.CreateToast {
-		body := fmt.Sprintf("已创建：%s\n下次执行：%s", task.Description, formatUnix(next))
-		if nerr := t.notifier.Notify("ChonkPilot 定时任务", body, ""); nerr != nil {
-			t.p.Logger().Info("crontab: 创建通知失败", "err", nerr)
-		}
+	if cfg.CreateToast && t.notifier != nil {
+		body := fmt.Sprintf("已创建：%s\n%s", task.Description, scheduleLabel(task))
+		// 通知走 PowerShell，可能阻塞数秒；必须在落盘成功后异步执行，
+		// 否则会拖长 tool 调用并触发 gateway 超时重试（重复建任务）。
+		go func() {
+			if nerr := t.notifier.Notify("ChonkPilot 定时任务", body, ""); nerr != nil && t.p != nil {
+				t.p.Logger().Info("crontab: 创建通知失败", "err", nerr)
+			}
+		}()
 	}
 	return map[string]any{"ok": true, "task": taskView(task)}, nil
 }
@@ -256,21 +282,40 @@ func (t *crontabPlugin) add(_ context.Context, args map[string]any, cx pluginsdk
 // ── 工具：crontab_update ──────────────────────
 
 func (t *crontabPlugin) update(_ context.Context, args map[string]any, _ pluginsdk.CallContext) (any, error) {
+	if err := rejectUnknownArgs(args, "task_id", "cron", "at", "delay", "action", "sandbox"); err != nil {
+		return nil, err
+	}
 	id := strings.TrimSpace(asString(args["task_id"]))
 	if id == "" {
 		return nil, errors.New("task_id 不能为空")
 	}
-	if _, ok := t.store.Get(id); !ok {
+	existing, ok := t.store.Get(id)
+	if !ok {
 		return nil, ErrTaskNotFound
 	}
-	newCron := ""
-	if raw, ok := args["cron"]; ok {
-		newCron = strings.TrimSpace(asString(raw))
-		if newCron != "" {
-			if _, err := parseCron(newCron); err != nil {
-				return nil, err
-			}
+	// 显式空串不是「保持不变」：空的调度字段没有合法语义。保持原值请省略该键。
+	// null 与省略同义（兼容客户端把未填的可选字段序列化为 null）。
+	cronText, hasCron, err := optionalTextArg(args, "cron", false)
+	if err != nil {
+		return nil, err
+	}
+	atText, hasAt, err := optionalTextArg(args, "at", true)
+	if err != nil {
+		return nil, err
+	}
+	delayText, hasDelay, err := optionalTextArg(args, "delay", false)
+	if err != nil {
+		return nil, err
+	}
+	scheduleSet := hasCron || hasAt || hasDelay
+	now := time.Now()
+	var sched scheduleInput
+	if scheduleSet {
+		s, err := parseScheduleInput(cronText, atText, delayText, now)
+		if err != nil {
+			return nil, err
 		}
+		sched = s
 	}
 	var spec *ActionSpec
 	if raw, ok := args["action"]; ok && raw != nil {
@@ -284,10 +329,41 @@ func (t *crontabPlugin) update(_ context.Context, args map[string]any, _ plugins
 	if err != nil {
 		return nil, err
 	}
-	var updated Task
-	err = t.store.Update(id, func(cur *Task) error {
-		if newCron != "" {
-			cur.Cron = newCron
+	// 动作改到 run/agent 时，复用任务创建时的 work_dir；目录失效则**在写入前**拒绝，
+	// 避免把已有任务改成「首次触发即停用」的死任务。
+	finalType := existing.Action.Type
+	if spec != nil {
+		finalType = spec.Type
+	}
+	if err := validateWorkDirForAction(t.cfg.Settings(), existing.CreatedBy.WorkDir, finalType); err != nil {
+		return nil, err
+	}
+	changed := make([]string, 0, 4)
+	if hasCron {
+		changed = append(changed, "cron")
+	}
+	if hasAt {
+		changed = append(changed, "at")
+	}
+	if hasDelay {
+		changed = append(changed, "delay")
+	}
+	if spec != nil {
+		changed = append(changed, "action")
+	}
+	if sandboxSet {
+		changed = append(changed, "sandbox")
+	}
+	// UpdateTx：mutate / 落盘任一失败都回滚内存，避免「报告失败但状态已改」。
+	updated, err := t.store.UpdateTx(id, func(cur *Task) error {
+		if scheduleSet {
+			cur.Cron, cur.Once, cur.RunAt = sched.Cron, sched.Once, sched.RunAt
+			// 改期 = 重新武装：一次性任务已执行/错过导致的终态停用，在显式改期后恢复启用。
+			if cur.DisabledReason == ReasonOnceCompleted || cur.DisabledReason == ReasonOnceMissed {
+				cur.Enabled = true
+				cur.DisabledReason = ""
+				changed = append(changed, "enabled")
+			}
 		}
 		if spec != nil {
 			action, err := spec.Canonical()
@@ -300,86 +376,219 @@ func (t *crontabPlugin) update(_ context.Context, args map[string]any, _ plugins
 		if sandboxSet {
 			cur.Sandbox = sandbox // nil = 恢复「继承插件配置」
 		}
-		if cur.Enabled {
-			n, err := nextRun(cur.Cron, time.Now())
-			if err != nil {
-				return err
+		// 只有调度真的变化时才重算 next_run_at；仅改 action/sandbox 不推进到期时间，
+		// 避免「任务已到期但尚未被 tick 认领」时丢掉本次触发。停用任务保持 0。
+		if !cur.Enabled {
+			cur.NextRunAt = 0
+		} else if scheduleSet {
+			if cur.Once {
+				cur.NextRunAt = cur.RunAt
+			} else {
+				n, err := nextRun(cur.Cron, now)
+				if err != nil {
+					return err
+				}
+				cur.NextRunAt = n
 			}
-			cur.NextRunAt = n
 		}
-		updated = *cur
 		return nil
 	})
 	if err != nil {
 		return nil, err
 	}
 	t.notifyChanged(context.Background())
-	return map[string]any{"ok": true, "task": taskView(updated)}, nil
+	return map[string]any{"ok": true, "changed": changed, "task": taskView(updated)}, nil
 }
 
 // ── 工具：crontab_list ────────────────────────
 
 func (t *crontabPlugin) list(_ context.Context, args map[string]any, _ pluginsdk.CallContext) (any, error) {
-	filter, hasFilter := boolArg(args["enabled"])
+	if err := rejectUnknownArgs(args, "task_id", "enabled", "limit", "offset", "output_tail_bytes", "order"); err != nil {
+		return nil, err
+	}
+	filter, hasFilter, err := optionalBoolArg(args, "enabled")
+	if err != nil {
+		return nil, err
+	}
+	taskID, hasTaskID, err := optionalTextArg(args, "task_id", false)
+	if err != nil {
+		return nil, err
+	}
+	order, hasOrder, err := optionalTextArg(args, "order", false)
+	if err != nil {
+		return nil, err
+	}
+	order = strings.ToLower(order)
+	if !hasOrder {
+		order = "desc" // 默认新任务优先：limit 截断时最可能隐藏旧任务，而不是刚创建的任务
+	}
+	if order != "asc" && order != "desc" {
+		return nil, errors.New(`order 必须是 "asc" 或 "desc"`)
+	}
+	limit := 50
+	if v, ok, err := optionalIntArg(args, "limit"); err != nil {
+		return nil, err
+	} else if ok {
+		if v < 1 {
+			return nil, errors.New("limit 必须 >= 1")
+		}
+		limit = v
+		if limit > 200 {
+			limit = 200
+		}
+	}
+	offset := 0
+	if v, ok, err := optionalIntArg(args, "offset"); err != nil {
+		return nil, err
+	} else if ok {
+		if v < 0 {
+			return nil, errors.New("offset 必须 >= 0")
+		}
+		offset = v
+	}
+	// output_tail_bytes 控制 list 返回的 last_run.output_tail 上限（0 = 不返回该字段）。
+	tailBytes := 512
+	if v, ok, err := optionalIntArg(args, "output_tail_bytes"); err != nil {
+		return nil, err
+	} else if ok {
+		if v < 0 {
+			return nil, errors.New("output_tail_bytes 必须 >= 0")
+		}
+		tailBytes = v
+		if tailBytes > outputTailMax {
+			tailBytes = outputTailMax
+		}
+	}
+
 	tasks := t.store.List()
+	if order == "desc" {
+		for i, j := 0, len(tasks)-1; i < j; i, j = i+1, j-1 {
+			tasks[i], tasks[j] = tasks[j], tasks[i]
+		}
+	}
 	views := make([]map[string]any, 0, len(tasks))
+	matched := 0
 	for _, task := range tasks {
+		if hasTaskID && task.ID != taskID {
+			continue
+		}
 		if hasFilter && task.Enabled != filter {
 			continue
 		}
-		views = append(views, taskView(task))
+		matched++
+		if matched <= offset {
+			continue
+		}
+		if len(views) < limit {
+			views = append(views, taskViewWithTail(task, tailBytes))
+		}
 	}
-	return map[string]any{"ok": true, "tasks": views, "count": len(views)}, nil
+	out := map[string]any{
+		"ok": true, "tasks": views, "count": len(views),
+		"total": matched, "truncated": matched > offset+len(views), "limit": limit,
+		"offset": offset, "order": order, "output_tail_bytes": tailBytes,
+	}
+	if hasTaskID {
+		out["task_id"] = taskID
+	}
+	return out, nil
 }
 
-// ── 工具：enable / disable / delete ──────────
+// ── 工具：toggle / delete ─────────────────────
 
-func (t *crontabPlugin) enable(_ context.Context, args map[string]any, _ pluginsdk.CallContext) (any, error) {
-	return t.setEnabled(args, true)
+// toggle 启用或停用任务（`enabled=true/false` 必填）。
+func (t *crontabPlugin) toggle(_ context.Context, args map[string]any, _ pluginsdk.CallContext) (any, error) {
+	if err := rejectUnknownArgs(args, "task_id", "enabled"); err != nil {
+		return nil, err
+	}
+	enabled, ok, err := optionalBoolArg(args, "enabled")
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		return nil, errors.New("enabled 不能为空（必须为 true 或 false）")
+	}
+	return t.setEnabled(args, enabled)
 }
 
-func (t *crontabPlugin) disable(_ context.Context, args map[string]any, _ pluginsdk.CallContext) (any, error) {
-	return t.setEnabled(args, false)
-}
-
+// setEnabled 是 toggle 的内部实现（UI toggle 也复用）。
+// 参数校验由调用方完成（工具入口校验 task_id/enabled；UI 入口自行解析）。
 func (t *crontabPlugin) setEnabled(args map[string]any, enabled bool) (any, error) {
 	id := strings.TrimSpace(asString(args["task_id"]))
 	if id == "" {
 		return nil, errors.New("task_id 不能为空")
 	}
-	var updated Task
-	err := t.store.Update(id, func(cur *Task) error {
-		cur.Enabled = enabled
+	// 启用前校验 run/agent 的工作目录：目录缺失时直接拒绝，
+	// 避免返回 enabled:true 后下一轮又被 work_dir_missing 自动停用。
+	if enabled {
+		task, ok := t.store.Get(id)
+		if !ok {
+			return nil, ErrTaskNotFound
+		}
+		if err := validateWorkDirForAction(t.cfg.Settings(), task.CreatedBy.WorkDir, task.Action.Type); err != nil {
+			return nil, err
+		}
+	}
+	now := time.Now()
+	changed := false
+	updated, err := t.store.UpdateTx(id, func(cur *Task) error {
+		oldEnabled, oldNext, oldReason := cur.Enabled, cur.NextRunAt, cur.DisabledReason
 		if enabled {
-			cur.DisabledReason = "" // 用户重新启用 → 清掉 work_dir_missing 等自动停用原因
-			n, err := nextRun(cur.Cron, time.Now())
-			if err != nil {
-				return err
+			// 已启用且已有 next_run_at → 保持原值，确保重复 enable 真幂等；
+			// 若已到期但尚未被 tick 认领，保留到期时间让本轮照常执行。
+			if !cur.Enabled || cur.NextRunAt == 0 {
+				if cur.Once {
+					if cur.RunAt <= 0 {
+						return errors.New("一次性任务缺少有效的 run_at，请先修改执行时间（crontab_update）或新建任务")
+					}
+					if !cur.Enabled && cur.RunAt <= now.Unix() {
+						return fmt.Errorf("一次性任务已过期（run_at=%s），请先修改执行时间（crontab_update）或新建任务",
+							formatUnix(cur.RunAt))
+					}
+					cur.NextRunAt = cur.RunAt
+				} else {
+					n, err := nextRun(cur.Cron, now)
+					if err != nil {
+						return err
+					}
+					cur.NextRunAt = n
+				}
 			}
-			cur.NextRunAt = n
+			cur.Enabled = true
+			cur.DisabledReason = "" // 用户重新启用 → 清掉 work_dir_missing 等自动停用原因
 		} else {
+			cur.Enabled = false
 			cur.NextRunAt = 0
 		}
-		updated = *cur
+		changed = cur.Enabled != oldEnabled || cur.NextRunAt != oldNext || cur.DisabledReason != oldReason
 		return nil
 	})
 	if err != nil {
 		return nil, err
 	}
 	t.notifyChanged(context.Background())
-	return map[string]any{"ok": true, "task_id": id, "enabled": updated.Enabled, "task": taskView(updated)}, nil
+	return map[string]any{"ok": true, "task_id": id, "enabled": updated.Enabled, "changed": changed, "running": updated.RunningSince > 0, "task": taskView(updated)}, nil
 }
 
 func (t *crontabPlugin) delete(_ context.Context, args map[string]any, _ pluginsdk.CallContext) (any, error) {
+	if err := rejectUnknownArgs(args, "task_id"); err != nil {
+		return nil, err
+	}
 	id := strings.TrimSpace(asString(args["task_id"]))
 	if id == "" {
 		return nil, errors.New("task_id 不能为空")
 	}
-	if _, err := t.store.Delete(id); err != nil {
+	task, err := t.store.Delete(id)
+	if err != nil {
 		return nil, err
 	}
 	t.notifyChanged(context.Background())
-	return map[string]any{"ok": true, "task_id": id, "count": len(t.store.List())}, nil
+	remaining := len(t.store.List())
+	return map[string]any{
+		"ok": true, "task_id": id, "deleted": true,
+		"remaining": remaining, "count": remaining, // count 保留为 remaining 的旧别名
+		"running": task.RunningSince > 0, // 删除不中止在飞执行：命令仍会跑完并写 runs.jsonl
+	}, nil
 }
 
 // ── UI 动作（宿主 POST /plugins/crontab/api/<action>）─────────
@@ -497,6 +706,9 @@ func (t *crontabPlugin) info(_ context.Context, _ map[string]any) (any, error) {
 
 // notifyChanged 主动推送计数变化（plugin-event → UI 徽标 / 任务页；零轮询）。
 func (t *crontabPlugin) notifyChanged(ctx context.Context) {
+	if t.p == nil {
+		return
+	}
 	tasks := t.store.List()
 	enabled := 0
 	for _, task := range tasks {
@@ -550,14 +762,31 @@ func taskView(t Task) map[string]any {
 		"id":          t.ID,
 		"description": t.Description,
 		"cron":        t.Cron,
+		"once":        t.Once,
 		"next_run_at": t.NextRunAt,
 		"enabled":     t.Enabled,
 		"type":        t.Action.Type,
 		"run_count":   t.RunCount,
 		"created_at":  t.CreatedAt,
 		"work_dir":    t.CreatedBy.WorkDir,
+		// running = 已有一次执行被认领且尚未收口；delete/toggle/update 不会取消它。
+		"running": t.RunningSince > 0,
 		// sandbox = 任务级开关（null = 继承插件配置）；effective_sandbox 由 `detail` 动作实时解析。
 		"sandbox": t.Sandbox,
+		// 调度时间是插件进程本地时区；同时给出带偏移的本地时间，避免 LLM 自行换算 epoch。
+		"timezone": timezoneLabel(t.NextRunAt, t.RunAt),
+	}
+	if t.Once {
+		v["schedule_type"] = "once"
+		v["run_at"] = t.RunAt
+		if t.RunAt > 0 {
+			v["run_at_local"] = localRFC3339(t.RunAt)
+		}
+	} else {
+		v["schedule_type"] = "cron"
+	}
+	if t.NextRunAt > 0 {
+		v["next_run_at_local"] = localRFC3339(t.NextRunAt)
 	}
 	if t.DisabledReason != "" {
 		v["disabled_reason"] = t.DisabledReason
@@ -573,6 +802,168 @@ func taskView(t Task) map[string]any {
 		v["last_run"] = t.LastRun
 	}
 	return v
+}
+
+// taskViewWithTail 把任务转为 UI / 工具返回值，并按 tailBytes 截断 last_run.output_tail。
+// tailBytes < 0 视为不限；tailBytes == 0 时不返回 output_tail 字段。
+func taskViewWithTail(t Task, tailBytes int) map[string]any {
+	v := taskView(t)
+	if t.LastRun == nil || tailBytes == 0 {
+		if v["last_run"] != nil {
+			if rec, ok := v["last_run"].(*RunRecord); ok {
+				cp := *rec
+				cp.OutputTail = ""
+				v["last_run"] = cp
+			}
+		}
+		return v
+	}
+	if rec, ok := v["last_run"].(*RunRecord); ok && tailBytes > 0 {
+		cp := *rec
+		cp.OutputTail = strx.TruncBytes(cp.OutputTail, tailBytes)
+		v["last_run"] = cp
+	}
+	return v
+}
+
+// localRFC3339 把 unix 秒转为本地时区 RFC3339（含偏移）。
+func localRFC3339(ts int64) string {
+	return time.Unix(ts, 0).In(time.Local).Format(time.RFC3339)
+}
+
+// timezoneLabel 返回本地时区缩写（优先取计划时间的 zone，避免 DST 误标）。
+func timezoneLabel(ts ...int64) string {
+	for _, n := range ts {
+		if n > 0 {
+			if name, _ := time.Unix(n, 0).In(time.Local).Zone(); name != "" {
+				return name
+			}
+		}
+	}
+	name, _ := time.Now().In(time.Local).Zone()
+	return name
+}
+
+// rejectUnknownArgs 拒绝契约未声明的顶层参数（schema additionalProperties=false 的运行时兜底）。
+func rejectUnknownArgs(args map[string]any, allowed ...string) error {
+	allow := make(map[string]bool, len(allowed))
+	for _, k := range allowed {
+		allow[k] = true
+	}
+	var unknown []string
+	for k := range args {
+		if !allow[k] {
+			unknown = append(unknown, k)
+		}
+	}
+	if len(unknown) == 0 {
+		return nil
+	}
+	sort.Strings(unknown)
+	return fmt.Errorf("不支持的参数: %s（允许：%s）", strings.Join(unknown, ", "), strings.Join(allowed, ", "))
+}
+
+// optionalTextArg 读取可选的字符串参数（update 的 cron/at/delay）：
+//   - 键缺失 / null → 未提供（保持不变）；
+//   - 显式空串 / 全空白 → 报错（空值没有合法调度语义，保持原值请省略）；
+//   - allowNumber=true 时接受 JSON number（at 的 unix 秒）。
+func optionalTextArg(args map[string]any, key string, allowNumber bool) (string, bool, error) {
+	raw, ok := args[key]
+	if !ok || raw == nil {
+		return "", false, nil
+	}
+	switch v := raw.(type) {
+	case string:
+		s := strings.TrimSpace(v)
+		if s == "" {
+			return "", false, fmt.Errorf("%s 不能为空（保持不变请省略该字段）", key)
+		}
+		return s, true, nil
+	case float64:
+		if !allowNumber {
+			return "", false, fmt.Errorf("%s 必须是字符串", key)
+		}
+		return strconv.FormatInt(int64(v), 10), true, nil
+	case int:
+		if !allowNumber {
+			return "", false, fmt.Errorf("%s 必须是字符串", key)
+		}
+		return strconv.Itoa(v), true, nil
+	case int64:
+		if !allowNumber {
+			return "", false, fmt.Errorf("%s 必须是字符串", key)
+		}
+		return strconv.FormatInt(v, 10), true, nil
+	default:
+		if allowNumber {
+			return "", false, fmt.Errorf("%s 必须是字符串或 unix 秒整数", key)
+		}
+		return "", false, fmt.Errorf("%s 必须是字符串", key)
+	}
+}
+
+// optionalBoolArg 读取可选布尔参数（接受 bool 与 true/false/1/0/yes/no/on/off 字符串）；
+// 键存在但值非法 → 报错，不再静默忽略。
+func optionalBoolArg(args map[string]any, key string) (bool, bool, error) {
+	raw, ok := args[key]
+	if !ok || raw == nil {
+		return false, false, nil
+	}
+	b, valid := boolArg(raw)
+	if !valid {
+		return false, false, fmt.Errorf("%s 必须是布尔值（true/false）", key)
+	}
+	return b, true, nil
+}
+
+// optionalIntArg 读取可选整数参数（接受 JSON 整数/整值浮点/数字字符串）；
+// 键存在但值非法 → 报错，不再静默按默认值处理。
+func optionalIntArg(args map[string]any, key string) (int, bool, error) {
+	raw, ok := args[key]
+	if !ok || raw == nil {
+		return 0, false, nil
+	}
+	switch v := raw.(type) {
+	case int:
+		return v, true, nil
+	case int64:
+		return int(v), true, nil
+	case float64:
+		if v != float64(int64(v)) {
+			return 0, false, fmt.Errorf("%s 必须是整数", key)
+		}
+		return int(v), true, nil
+	case string:
+		n, err := strconv.Atoi(strings.TrimSpace(v))
+		if err != nil {
+			return 0, false, fmt.Errorf("%s 必须是整数", key)
+		}
+		return n, true, nil
+	default:
+		return 0, false, fmt.Errorf("%s 必须是整数", key)
+	}
+}
+
+// validateWorkDirForAction 校验 run/agent 动作的工作目录：
+//   - notify 不需要项目目录（可在无项目的全局会话创建）；
+//   - run/agent 必须有存在且可访问的项目目录，且命中配置白名单。
+//
+// 在写入前拒绝，避免创建「成功但首次触发即 work_dir_missing 停用」的死任务。
+func validateWorkDirForAction(cfg settings, dir, actionType string) error {
+	if actionType == ActionNotify {
+		return nil
+	}
+	dir = strings.TrimSpace(dir)
+	if dir == "" {
+		return errors.New("run/agent 动作需要项目工作目录：当前会话没有 work_dir，请在项目中创建，或改用 notify 动作")
+	}
+	if !allowedWorkDir(cfg, dir) {
+		return fmt.Errorf("work_dir 不在允许的目录白名单内: %s", dir)
+	}
+	if !workDirExists(dir) {
+		return fmt.Errorf("work_dir 不存在或不是目录: %s", dir)
+	}
+	return nil
 }
 
 // parseSandboxArg 解析任务级 sandbox 三态参数：
@@ -658,4 +1049,12 @@ func formatUnix(ts int64) string {
 		return "-"
 	}
 	return time.Unix(ts, 0).Format("2006-01-02 15:04:05")
+}
+
+// scheduleLabel 返回任务的执行计划文案（创建通知 / UI 用）。
+func scheduleLabel(t Task) string {
+	if t.Once {
+		return "一次性执行：" + formatUnix(t.RunAt)
+	}
+	return "下次执行：" + formatUnix(t.NextRunAt)
 }

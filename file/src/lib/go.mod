@@ -9,4 +9,6 @@ require (
 	golang.org/x/text v0.43.0
 )
 
+require github.com/joshtechnologygroup/chardet v0.1.0
+
 replace github.com/lsong98sh/chonkpilot-util => ../../../../chonkpilot-util

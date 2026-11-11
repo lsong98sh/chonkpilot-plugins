@@ -37,6 +37,7 @@ const (
 	methodSessionHistory      = "plugin/v1/session.history"
 	methodSessionGet          = "plugin/v1/session.get"
 	methodInstanceResolve     = "plugin/v1/instance.resolve"
+	methodAgentRun            = "plugin/v1/agent.run"
 )
 
 // 会话归属常量（与 data 侧 facade.SessionKind* / SessionOriginScheduler 同值）。
@@ -142,6 +143,50 @@ func (b *bridgeSessions) EnsureTurn(ctx context.Context, workDir string, ref ses
 	}, &out)
 }
 
+// RunAgent 经宿主 `plugin/v1/agent.run` 启动完整智能体轮次并等待收尾。
+func (b *bridgeSessions) RunAgent(ctx context.Context, req agentRunReq) (agentRunResult, error) {
+	payload := map[string]any{
+		"work_dir":     req.WorkDir,
+		"session_id":   req.SessionID,
+		"dialog_id":    req.DialogID,
+		"kind":         req.SessionKind,
+		"prompt":       req.Prompt,
+		"title":        req.Title,
+		"display_name": req.DisplayName,
+		"timeout_sec":  req.TimeoutSec,
+	}
+	if req.InstanceID != "" {
+		payload["instance_id"] = req.InstanceID
+	}
+	if req.AgentName != "" {
+		payload["agent"] = req.AgentName
+	}
+	var out struct {
+		OK        bool   `json:"ok"`
+		State     string `json:"state"`
+		Finish    string `json:"finish"`
+		Text      string `json:"text"`
+		Error     string `json:"error"`
+		MS        int64  `json:"ms"`
+		SessionID string `json:"session_id"`
+		DialogID  string `json:"dialog_id"`
+		TurnID    string `json:"turn_id"`
+		Partial   bool   `json:"partial"`
+	}
+	// 桥调用超时必须覆盖宿主侧的等待上限（宿主按 timeout_sec 收尾；桥缺省约 15s）。
+	wait := time.Duration(req.TimeoutSec) * time.Second
+	if wait > 0 {
+		wait += 15 * time.Second
+	}
+	if err := b.p.CallIntoWithTimeout(ctx, wait, methodAgentRun, payload, &out); err != nil {
+		return agentRunResult{}, err
+	}
+	return agentRunResult{
+		OK: out.OK, Status: out.State, Finish: out.Finish, Text: out.Text, Error: out.Error,
+		MS: out.MS, SessionID: out.SessionID, DialogID: out.DialogID, TurnID: out.TurnID,
+	}, nil
+}
+
 // CompleteTurn 收本轮终态（done / error）。
 func (b *bridgeSessions) CompleteTurn(ctx context.Context, workDir string, ref sessionRef, status, finishReason string) error {
 	var out struct {
@@ -158,10 +203,9 @@ func (b *bridgeSessions) CompleteTurn(ctx context.Context, workDir string, ref s
 
 // ── 执行前 / 执行后 ──────────────────────────────────────────
 
-// beginCronRound 在命令执行前把本轮挂到「该任务的子会话」下（P4 / C11）。
-//
+// beginCronSession 确保「项目根会话 → 任务子会话」存在（P4 / C11），不建轮次。
 // 返回 (ref, detail)：detail 非空 = 归属未完成的原因（并入 RunRecord.Detail，**不阻断执行**）。
-func (r *runner) beginCronRound(ctx context.Context, t Task) (sessionRef, string) {
+func (r *runner) beginCronSession(ctx context.Context, t Task) (sessionRef, string) {
 	if r.sessions == nil {
 		return sessionRef{}, ""
 	}
@@ -187,9 +231,20 @@ func (r *runner) beginCronRound(ctx context.Context, t Task) (sessionRef, string
 	if subDialog != "" {
 		dialogID = subDialog
 	}
-	ref := sessionRef{DialogID: dialogID, SessionID: sub, TurnID: newCronTurnID()}
-	if err := r.sessions.EnsureTurn(ctx, wd, ref); err != nil {
-		return sessionRef{}, "session_bind_failed: " + err.Error()
+	return sessionRef{DialogID: dialogID, SessionID: sub}, ""
+}
+
+// beginCronRound 在命令执行前把本轮挂到「该任务的子会话」下（P4 / C11）。
+//
+// 返回 (ref, detail)：detail 非空 = 归属未完成的原因（并入 RunRecord.Detail，**不阻断执行**）。
+func (r *runner) beginCronRound(ctx context.Context, t Task) (sessionRef, string) {
+	ref, detail := r.beginCronSession(ctx, t)
+	if ref.SessionID == "" {
+		return ref, detail
+	}
+	ref.TurnID = newCronTurnID()
+	if err := r.sessions.EnsureTurn(ctx, strings.TrimSpace(t.CreatedBy.WorkDir), ref); err != nil {
+		return sessionRef{SessionID: ref.SessionID, DialogID: ref.DialogID}, "session_bind_failed: " + err.Error()
 	}
 	return ref, ""
 }

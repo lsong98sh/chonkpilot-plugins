@@ -1,6 +1,7 @@
 package server
 
 import (
+	"errors"
 	"fmt"
 	"io/fs"
 	"os"
@@ -11,6 +12,7 @@ import (
 
 	"github.com/lsong98sh/chonkpilot-util/extx"
 	ignore "github.com/lsong98sh/chonkpilot-util/ignore"
+	bolt "go.etcd.io/bbolt"
 )
 
 var maxFileBytes = 8 << 20 // 8MB
@@ -363,6 +365,9 @@ func (w *Workspace) Reconcile() (changed bool, err error) {
 // EnsureReady 查询前的统一就绪处理：载入索引 + 自愈快检。
 // state 返回 ready/indexing/not_initialized/error。
 // recMu 单飞：同一 workdir 多个并发查询只执行一次差分，其余串行等待后直接复用。
+//
+// 注意：本方法会经 Reconcile 写索引（重建/自愈），**只供写路径/管理工具**使用；
+// 查询类工具请用 EnsureReadyReadOnly。
 func (w *Workspace) EnsureReady() (string, error) {
 	w.recMu.Lock()
 	defer w.recMu.Unlock()
@@ -389,6 +394,60 @@ func (w *Workspace) EnsureReady() (string, error) {
 	return "ready", nil
 }
 
+// LoadIndexReadOnly 只读恢复索引：不删除遗留/损坏文件、不改写 meta（查询工具专用）。
+//
+// 与 LoadIndex 的差异：损坏/旧格式只视为「未初始化」，绝不落盘清理；bolt 写锁超时仍上抛
+// （瞬时错误，供上层有界重试）。
+func (w *Workspace) LoadIndexReadOnly() (bool, error) {
+	w.mu.Lock()
+	loaded := w.ix != nil
+	w.mu.Unlock()
+	if loaded {
+		return true, nil
+	}
+	ix, present, err := w.loadIndexFromDB()
+	if err != nil {
+		if errors.Is(err, bolt.ErrTimeout) {
+			return false, err
+		}
+		if errors.Is(err, bolt.ErrInvalid) || errors.Is(err, errCorruptDB) {
+			return false, nil
+		}
+		return false, err
+	}
+	if !present {
+		return false, nil
+	}
+	w.mu.Lock()
+	w.ix = ix
+	w.mu.Unlock()
+	return true, nil
+}
+
+// EnsureReadyReadOnly 查询专用就绪门：只读载入 + 状态判定，**不做 Reconcile、不写盘**。
+func (w *Workspace) EnsureReadyReadOnly() (string, error) {
+	w.recMu.Lock()
+	defer w.recMu.Unlock()
+	_, err := w.LoadIndexReadOnly()
+	if err != nil {
+		return "error", err
+	}
+	w.mu.Lock()
+	st := w.meta.State
+	hasIx := w.ix != nil
+	w.mu.Unlock()
+	if !hasIx {
+		return "not_initialized", ErrNotInitialized
+	}
+	if st == "error" {
+		return "error", fmt.Errorf("索引出错：%s", w.Meta().Err)
+	}
+	if st == "indexing" {
+		return "indexing", nil
+	}
+	return "ready", nil
+}
+
 // Imports 文件级依赖视图（原始 import 目标，键为绝对路径；fileFilter 为空=全部）。
 func (w *Workspace) Imports(fileFilter string) map[string][]string {
 	w.mu.Lock()
@@ -408,79 +467,173 @@ func (w *Workspace) Imports(fileFilter string) map[string][]string {
 	return rows
 }
 
-// FindCycles 在可解析为仓库内文件的导入边上找环。
+// DependencyGraphPage 文件级依赖的分页视图（键为绝对路径）。
+//
+// fileFilter 为空 = 全部已索引文件；非空时按 workdir 相对路径大小写不敏感全等匹配，
+// 也接受路径段后缀（如 "main.go" 命中 "src/main.go"）。includeEmpty=false 时跳过无 import
+// 的文件。返回 total = 符合条件文件数（未截断），totalEdges = 这些文件的总依赖边数；
+// fileMatched 表示 fileFilter 是否命中任一已索引文件。
+func (w *Workspace) DependencyGraphPage(fileFilter string, limit, offset int, includeEmpty bool) (deps map[string][]string, total, totalEdges int, fileMatched bool) {
+	w.mu.Lock()
+	ix := w.ix
+	w.mu.Unlock()
+	deps = map[string][]string{}
+	if ix == nil {
+		return deps, 0, 0, false
+	}
+	filter := strings.ToLower(strings.TrimSpace(w.norm(fileFilter)))
+	fileMatched = fileFilter == ""
+	var rels []string
+	for p, fi := range ix.Files {
+		if filter != "" {
+			lp := strings.ToLower(p)
+			if lp != filter && !strings.HasSuffix(lp, "/"+filter) {
+				continue
+			}
+			fileMatched = true
+		}
+		if len(fi.Imports) == 0 && !includeEmpty {
+			continue
+		}
+		rels = append(rels, p)
+	}
+	sort.Strings(rels)
+	total = len(rels)
+	for _, p := range rels {
+		totalEdges += len(ix.Files[p].Imports)
+	}
+	if offset >= len(rels) {
+		return deps, total, totalEdges, fileMatched
+	}
+	end := len(rels)
+	if limit > 0 && offset+limit < end {
+		end = offset + limit
+	}
+	for _, p := range rels[offset:end] {
+		deps[w.abs(p)] = append([]string{}, ix.Files[p].Imports...)
+	}
+	return deps, total, totalEdges, fileMatched
+}
+
+// FindCycles 返回全部可解析的简单环（相对路径，按最小节点+邻接顺序枚举，带自环）。
+// 大图下环数可能指数级；对外工具应使用 FindCyclesPage 限制数量。
 func (w *Workspace) FindCycles() [][]string {
+	cycles, _ := w.FindCyclesPage(0, 0, true)
+	return cycles
+}
+
+// FindCyclesPage 确定性枚举简单环并分页。
+//
+//   - 路径为 workdir 相对路径；闭环在末尾重复起点（如 ["a.go","b.go","a.go"]）。
+//   - 每个环只从其字典序最小节点出发枚举（其余节点 >= 起点），避免旋转重复。
+//   - includeSelf=true 时包含文件 import 自己的自环。
+//   - limit<=0 表示不限（仅在内部/测试使用）；否则最多枚举 offset+limit+1 条，
+//     返回 truncated 表示是否还有下一页。
+func (w *Workspace) FindCyclesPage(limit, offset int, includeSelf bool) (cycles [][]string, truncated bool) {
 	w.mu.Lock()
 	ix := w.ix
 	w.mu.Unlock()
 	if ix == nil {
-		return nil
+		return [][]string{}, false
 	}
 	indexed := map[string]bool{}
+	nodes := make([]string, 0, len(ix.Files))
 	for p := range ix.Files {
 		indexed[p] = true
+		nodes = append(nodes, p)
+	}
+	sort.Strings(nodes)
+	order := make(map[string]int, len(nodes))
+	for i, p := range nodes {
+		order[p] = i
 	}
 	adj := map[string][]string{}
-	for p, fi := range ix.Files {
+	for _, p := range nodes {
+		fi := ix.Files[p]
+		seen := map[string]bool{}
 		for _, imp := range fi.Imports {
 			t := resolveImport(fi.Lang, p, imp, w.Dir, indexed)
-			if t != "" && t != p {
-				adj[p] = append(adj[p], t)
+			if t == "" || seen[t] {
+				continue
 			}
-		}
-	}
-	seen := map[string]bool{}
-	var cycles [][]string
-	var stack []string
-	onStack := map[string]bool{}
-	pos := map[string]int{}
-	var dfs func(u string)
-	dfs = func(u string) {
-		if onStack[u] {
-			cyc := append([]string{}, stack[pos[u]:]...)
-			cyc = append(cyc, u)
-			key := cycKey(cyc)
-			if !seen[key] {
-				seen[key] = true
-				cycles = append(cycles, cyc)
+			if t == p && !includeSelf {
+				continue
 			}
-			return
+			seen[t] = true
+			adj[p] = append(adj[p], t)
 		}
-		if seen["v:"+u] {
-			return
-		}
-		seen["v:"+u] = true
-		onStack[u] = true
-		pos[u] = len(stack)
-		stack = append(stack, u)
-		for _, v := range adj[u] {
-			dfs(v)
-		}
-		stack = stack[:len(stack)-1]
-		delete(onStack, u)
+		sort.Strings(adj[p])
 	}
-	for u := range adj {
-		dfs(u)
-	}
-	// 输出绝对路径
-	for i := range cycles {
-		for j := range cycles[i] {
-			cycles[i][j] = w.abs(cycles[i][j])
-		}
-	}
-	return cycles
-}
 
-func cycKey(c []string) string {
-	min := 0
-	for i := 1; i < len(c)-1; i++ {
-		if c[i] < c[min] {
-			min = i
+	capN := 0 // 0 = 不限
+	if limit > 0 {
+		capN = offset + limit + 1 // 多枚举 1 条用于判断 truncated
+	}
+	var out [][]string
+	var path []string
+	inPath := map[string]bool{}
+	stopped := false
+
+	var dfs func(start string, startIdx int, u string)
+	dfs = func(start string, startIdx int, u string) {
+		if stopped {
+			return
+		}
+		for _, v := range adj[u] {
+			if order[v] < startIdx {
+				continue // 每个环只从最小节点出发
+			}
+			if v == start {
+				if len(path) >= 1 {
+					cyc := append(append([]string{}, path...), start)
+					out = append(out, cyc)
+					if capN > 0 && len(out) >= capN {
+						stopped = true
+						return
+					}
+				}
+				continue
+			}
+			if inPath[v] {
+				continue
+			}
+			inPath[v] = true
+			path = append(path, v)
+			dfs(start, startIdx, v)
+			path = path[:len(path)-1]
+			delete(inPath, v)
+			if stopped {
+				return
+			}
 		}
 	}
-	var parts []string
-	for i := 0; i < len(c)-1; i++ {
-		parts = append(parts, c[(min+i)%(len(c)-1)])
+
+	for si, start := range nodes {
+		if stopped {
+			break
+		}
+		inPath[start] = true
+		path = []string{start}
+		dfs(start, si, start)
+		path = path[:0]
+		delete(inPath, start)
 	}
-	return strings.Join(parts, "->")
+
+	if limit > 0 {
+		if len(out) > offset+limit {
+			truncated = true
+			out = out[:offset+limit]
+		}
+		if offset > 0 {
+			if offset >= len(out) {
+				out = [][]string{}
+			} else {
+				out = out[offset:]
+			}
+		}
+	}
+	if out == nil {
+		out = [][]string{}
+	}
+	return out, truncated
 }

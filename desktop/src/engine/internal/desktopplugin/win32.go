@@ -27,6 +27,8 @@ const (
 
 // 窗口位置标志。
 const (
+	swpNoSize     = 0x0001
+	swpNoMove     = 0x0002
 	swpNoZOrder   = 0x0004
 	swpNoActivate = 0x0010
 	swShow        = 5
@@ -62,15 +64,17 @@ func focusWindow(hwnd uintptr) bool {
 	return r != 0
 }
 
-// moveWindow 移动窗口到屏幕坐标。
+// moveWindow 移动窗口到屏幕坐标（只改位置，不改变尺寸）。
 func moveWindow(hwnd uintptr, x, y int32) bool {
-	r, _, _ := procSetWindowPos.Call(hwnd, 0, uintptr(x), uintptr(y), 0, 0, swpNoZOrder|swpNoActivate)
+	r, _, _ := procSetWindowPos.Call(hwnd, 0, uintptr(x), uintptr(y), 0, 0,
+		swpNoZOrder|swpNoActivate|swpNoSize)
 	return r != 0
 }
 
-// resizeWindow 调整窗口尺寸。
+// resizeWindow 调整窗口尺寸（只改尺寸，不移动位置）。
 func resizeWindow(hwnd uintptr, w, h int32) bool {
-	r, _, _ := procSetWindowPos.Call(hwnd, 0, 0, 0, uintptr(w), uintptr(h), swpNoZOrder|swpNoActivate)
+	r, _, _ := procSetWindowPos.Call(hwnd, 0, 0, 0, uintptr(w), uintptr(h),
+		swpNoZOrder|swpNoActivate|swpNoMove)
 	return r != 0
 }
 

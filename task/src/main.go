@@ -1,10 +1,18 @@
-// chonkpilot-task —— 任务系列工具插件（执行 / LLM / 状态 / 终止）。
+// chonkpilot-task —— 任务与会话编排工具插件（执行 / LLM / 状态 / 终止 / 提问 / 续跑 / 子聊天）。
 //
-// 四个工具（工具名保持不变）：
-//   - task_run    执行本机命令 / 脚本（前台、带超时；多 runtime；cwd 缺省取调用上下文的 work_dir）
-//   - task_llm    单次 LLM 调用（宿主 plugin/v1/llm.step，插件拿不到 apiKey）
-//   - task_status 读取任务树 / 任务列表（数据面 task.tree / task.tasks）
-//   - task_stop   终止任务（数据面 task.stop，payload = {task_id,cascade?}）
+// 工具集：
+//   - task_run        执行本机命令 / 脚本（前台、带超时；多 runtime；cwd 缺省取调用上下文的 work_dir）
+//   - task_llm        委派全能力子代理（宿主 plugin/v1/agent.delegate）
+//   - task_status     查询任务结果 / 任务树（宿主 plugin/v1/task.result + 数据面 task.tree/tasks）
+//   - task_stop       终止任务（数据面 task.stop，payload = {task_id,cascade?}）
+//   - ask_user        向用户提问（宿主 plugin/v1/ask.user；非阻塞占位返回）
+//   - next_run        登记下一轮排队输入（宿主 plugin/v1/next.run）
+//   - subchat_open    打开子聊天 / 群聊（宿主 plugin/v1/subchat.open）
+//   - subchat_finish  子 agent 自报完成（宿主 plugin/v1/subchat.finish）
+//
+// 2026-11-08：ask_user / next_run / subchat_open / subchat_finish 由 llm-server 进程内
+// `tools/register` 迁入本插件 —— 宿主只保留能力（turn / ask / inbox / 会话生命周期），
+// 插件做工具适配（schema + 能力调用）。
 //
 // 契约源（2026-10-28 P2-3）：本仓 `task/tools/task/*.tool.md`，经 `//go:embed` 打进插件二进制
 // （**不**放主仓 `capability/`，也不依赖宿主扫描；本插件自己是 MCP server）。
@@ -20,10 +28,12 @@ import (
 	"io/fs"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"runtime"
 	"sort"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/lsong98sh/chonkpilot-plugin-framework/contract"
 	"github.com/lsong98sh/chonkpilot-plugin-framework/sdk"
@@ -133,10 +143,14 @@ func loadContracts() ([]contract.Tool, error) {
 // hot 标记沿用既有 HotTool 注册方式（契约 `hot: true` → p.HotTool）。
 func registerTools(p *pluginsdk.Plugin, t *taskPlugin, tools []contract.Tool) []string {
 	handlers := map[string]pluginsdk.ToolFunc{
-		"task_run":    t.run,
-		"task_llm":    t.llm,
-		"task_status": t.status,
-		"task_stop":   t.stop,
+		"task_run":       t.run,
+		"task_llm":       t.llm,
+		"task_status":    t.status,
+		"task_stop":      t.stop,
+		"ask_user":       t.askUser,
+		"next_run":       t.nextRun,
+		"subchat_open":   t.subchatOpen,
+		"subchat_finish": t.subchatFinish,
 	}
 	seen := make(map[string]bool, len(handlers))
 	for _, tool := range tools {
@@ -145,10 +159,7 @@ func registerTools(p *pluginsdk.Plugin, t *taskPlugin, tools []contract.Tool) []
 			slog.Warn("task: 契约无对应实现，跳过", "tool", tool.Name)
 			continue
 		}
-		p.Tool(tool.Name, tool.Description, tool.Schema, fn)
-		if tool.Hot {
-			p.HotTool(tool.Name)
-		}
+		p.ToolWithMeta(tool.Name, tool.Description, tool.Schema, contract.MetaFor(tool), fn)
 		seen[tool.Name] = true
 	}
 	var missing []string
@@ -173,6 +184,12 @@ func (t *taskPlugin) run(ctx context.Context, args map[string]any, cx pluginsdk.
 	if cwd == "" {
 		cwd = cx.WorkDir
 	}
+	// P0（2026-11-08）：cwd 只作为执行目录，并限制在 work_dir 子树内（越界拒绝）；
+	// 它不再进入沙箱可写白名单（见 sandboxOptions）。
+	cwd, err := resolveCwd(cwd, cx.WorkDir, cx.InstanceID)
+	if err != nil {
+		return nil, err
+	}
 	timeout := cfg.DefaultTimeoutSec
 	if n := toInt(args["timeoutSec"]); n > 0 {
 		timeout = n
@@ -183,9 +200,29 @@ func (t *taskPlugin) run(ctx context.Context, args map[string]any, cx pluginsdk.
 	if timeout > 600 {
 		timeout = 600
 	}
-	maxKB := cfg.MaxOutputKB
-	if maxKB <= 0 {
-		maxKB = 256
+	cfgMaxKB := cfg.MaxOutputKB
+	if cfgMaxKB <= 0 {
+		cfgMaxKB = 256
+	}
+	maxKB := cfgMaxKB
+	// 2026-11-09：调用级输出上限（可选）。参数夹在 [1, 配置上限]：超配置夹到配置值，
+	// 非正数忽略；输出超限时完整 stdout+stderr 落盘到 CaptureDir。
+	if n := toInt(args["maxOutputKB"]); n > 0 {
+		maxKB = n
+		if maxKB > cfgMaxKB {
+			maxKB = cfgMaxKB
+		}
+	}
+	// P0（2026-11-08）：requires 安装到项目内依赖目录（work_dir/.chonkpilot/deps），
+	// 不再以插件进程权限写全局 site-packages / node_modules；缺少 work_dir 时明确报错。
+	requires := stringSlice(args["requires"])
+	depsDir := ""
+	if len(requires) > 0 {
+		var derr error
+		depsDir, derr = depsDirFor(cx.WorkDir)
+		if derr != nil {
+			return nil, derr
+		}
 	}
 
 	res, err := scriptrun.Run(ctx, scriptrun.Options{
@@ -194,20 +231,44 @@ func (t *taskPlugin) run(ctx context.Context, args map[string]any, cx pluginsdk.
 		File:         asString(args["file"]),
 		Cwd:          cwd,
 		InstanceID:   cx.InstanceID,
-		Requires:     stringSlice(args["requires"]),
+		Requires:     requires,
+		DepsDir:      depsDir,
 		Interpreter:  asString(args["interpreter"]),
 		Env:          envMap(args["env"]),
 		Args:         stringSlice(args["args"]),
 		Interpreters: cfg.interpreterMap(),
 		Timeout:      time.Duration(timeout) * time.Second,
 		MaxOutput:    maxKB << 10,
-		// C5（2026-11-03）：进程级写隔离（Low IL + Job），白名单来自 `_meta.chonkpilot.sandbox`。
-		Sandbox: sandboxOptions(cx, cwd),
+		// 2026-11-09：输出超限时完整 stdout+stderr 落盘（不自动删除）。有 work_dir 用项目内
+		// `.chonkpilot/tmp`，否则系统临时目录。
+		CaptureDir: captureDirFor(cx.WorkDir),
+		// C5（2026-11-03）：进程级写隔离（Low IL + Job），白名单只来自 `_meta.chonkpilot.sandbox`。
+		Sandbox: sandboxOptions(cx),
 	})
 	if err != nil {
 		return nil, err
 	}
 	return res, nil
+}
+
+// depsDirFor 返回 requires 的项目内依赖目录：<work_dir>/.chonkpilot/deps。
+// 缺少 work_dir → 明确错误（fail-closed，拒绝安装到全局 site-packages/node_modules）。
+func depsDirFor(workDir string) (string, error) {
+	wd := strings.TrimSpace(workDir)
+	if wd == "" {
+		return "", fmt.Errorf("requires 需要会话工作目录（work_dir）以隔离依赖（拒绝安装到全局 site-packages/node_modules）")
+	}
+	return filepath.Join(wd, ".chonkpilot", "deps"), nil
+}
+
+// captureDirFor 返回 task_run 输出超限时的落盘目录（2026-11-09）：
+// 有 work_dir → `<work_dir>/.chonkpilot/tmp`；否则系统临时目录。
+// 目录仅在输出真的超过阈值时才按需创建（scriptrun 内部 MkdirAll）。
+func captureDirFor(workDir string) string {
+	if wd := strings.TrimSpace(workDir); wd != "" {
+		return filepath.Join(wd, ".chonkpilot", "tmp")
+	}
+	return os.TempDir()
 }
 
 // stringSlice 解析字符串数组参数（容忍 []any / []string；忽略非字符串项与空串）。
@@ -268,7 +329,7 @@ func (t *taskPlugin) llm(ctx context.Context, args map[string]any, cx pluginsdk.
 		"agent":        strings.TrimSpace(asString(args["agent"])),
 		"session_id":   strings.TrimSpace(asString(args["session_id"])),
 		"title":        strings.TrimSpace(asString(args["title"])),
-		"purpose":      cx.Purpose,
+		"display_name": cx.DisplayName,
 	}
 	if n := toInt(args["waitSec"]); n > 0 {
 		in["wait_sec"] = n
@@ -277,10 +338,40 @@ func (t *taskPlugin) llm(ctx context.Context, args map[string]any, cx pluginsdk.
 		in["detach"] = d
 	}
 	var out map[string]any
-	if err := t.p.CallInto(ctx, "plugin/v1/agent.delegate", in, &out); err != nil {
+	// P0（2026-11-08）：delegate 是长等待能力，不能沿用 SDK 缺省 15s 桥超时；按 waitSec
+	// 计算本次调用超时（有上限），否则 >15s 的子代理必然返回 context deadline exceeded。
+	if err := t.p.CallIntoWithTimeout(ctx, delegateTimeout(toInt(args["waitSec"]), args["detach"] == true),
+		"plugin/v1/agent.delegate", in, &out); err != nil {
 		return nil, err
 	}
 	return out, nil
+}
+
+const (
+	// delegateMaxWait 是 task_llm 单次桥调用的上限（与契约 timeout: 600 对齐）。
+	delegateMaxWait = 600 * time.Second
+	// delegateWaitBuffer 是 waitSec 到期与桥超时之间的余量：宿主先返回 running，插件后到点。
+	delegateWaitBuffer = 15 * time.Second
+	// delegateDetachTimeout 是 detach=true 时等待“受理”应答的上限（宿主应立即返回 running）。
+	delegateDetachTimeout = 30 * time.Second
+)
+
+// delegateTimeout 按 waitSec / detach 计算 `plugin/v1/agent.delegate` 的本次桥调用超时：
+//   - detach=true → 30s（只等受理）；
+//   - waitSec>0 → waitSec + 15s 余量，封顶 600s；
+//   - waitSec<=0 → 600s（“等到收尾”的合理有界默认，仍受上限保护）。
+func delegateTimeout(waitSec int, detach bool) time.Duration {
+	if detach {
+		return delegateDetachTimeout
+	}
+	if waitSec <= 0 {
+		return delegateMaxWait
+	}
+	t := time.Duration(waitSec)*time.Second + delegateWaitBuffer
+	if t > delegateMaxWait {
+		return delegateMaxWait
+	}
+	return t
 }
 
 // ── task_status ─────────────────────────
@@ -288,7 +379,7 @@ func (t *taskPlugin) llm(ctx context.Context, args map[string]any, cx pluginsdk.
 // status 查询任务：`task_id` 非空 → 单任务（可等待 / 附已产出）；空 → 会话任务树 + 列表。
 //
 // 与 `tool_result` 同口径（2026-11-04）：终态返回结果；仍在运行 → `state=running` +
-// `output`（已产出的部分输出）；`waitSec` > 0 时先等待至多该秒数。
+// `output`（已产出的部分输出）；`timeout` > 0 时先等待至多该秒数。
 func (t *taskPlugin) status(ctx context.Context, args map[string]any, cx pluginsdk.CallContext) (any, error) {
 	if cx.InstanceID == "" {
 		return nil, fmt.Errorf("缺少会话实例（instance_id）")
@@ -312,21 +403,25 @@ func (t *taskPlugin) status(ctx context.Context, args map[string]any, cx plugins
 	if err != nil {
 		return nil, fmt.Errorf("读取任务列表失败: %w", err)
 	}
+	tree, _, treeTrunc := trimListField(unwrap(treeRaw), "nodes", limit)
+	tasks, totalTasks, tasksTrunc := trimListField(unwrap(tasksRaw), "list", limit)
 	return map[string]any{
-		"ok":    true,
-		"limit": limit,
-		"tree":  unwrap(treeRaw),
-		"tasks": trimTasks(unwrap(tasksRaw), limit),
+		"ok":        true,
+		"limit":     limit,
+		"total":     totalTasks,
+		"truncated": treeTrunc || tasksTrunc,
+		"tree":      tree,
+		"tasks":     tasks,
 	}, nil
 }
 
 // statusOne 查单个任务（任务节点 / gateway 执行 id / 委派子轮次 id 均可）：
-// 宿主 `plugin/v1/task.result` 返回权威状态 + 部分输出；waitSec 内轮询至终态。
+// 宿主 `plugin/v1/task.result` 返回权威状态 + 部分输出；timeout 内轮询至终态。
 func (t *taskPlugin) statusOne(ctx context.Context, args map[string]any, cx pluginsdk.CallContext, id string) (any, error) {
 	if cx.Turn == "" {
 		return nil, fmt.Errorf("缺少会话轮次（turn）：单任务查询必须在会话轮次内调用")
 	}
-	wait := toInt(args["waitSec"])
+	wait := toInt(args["timeout"])
 	var deadline time.Time
 	if wait > 0 {
 		deadline = time.Now().Add(time.Duration(wait) * time.Second)
@@ -358,7 +453,7 @@ func (t *taskPlugin) statusOne(ctx context.Context, args map[string]any, cx plug
 		}
 		if wait <= 0 || time.Now().After(deadline) {
 			return map[string]any{"ok": true, "task_id": id, "state": "running",
-				"message": "任务仍在运行（可加大 waitSec 继续等待）", "output": partial}, nil
+				"message": "任务仍在运行（可加大 timeout 继续等待）", "output": partial}, nil
 		}
 		select {
 		case <-ctx.Done():
@@ -368,13 +463,265 @@ func (t *taskPlugin) statusOne(ctx context.Context, args map[string]any, cx plug
 	}
 }
 
-// trimTasks 截断任务列表到 limit 条（缺省 / 非数组 → 原样返回）。
-func trimTasks(raw any, limit int) any {
-	list, ok := raw.([]any)
-	if !ok || limit <= 0 || len(list) <= limit {
-		return raw
+// trimListField 截断对象形状 `{key:[...]}` 中的数组到 limit 条（P0，2026-11-08）：
+// 任务树实际返回 `{nodes:[...]}`、任务列表返回 `{list:[...]}`，旧实现只认 `[]any` →
+// limit 永不生效。返回 (截断后的对象, 原始条数, 是否截断)；非对象/非数组原样返回。
+func trimListField(raw any, key string, limit int) (any, int, bool) {
+	switch v := raw.(type) {
+	case map[string]any:
+		arr, ok := v[key].([]any)
+		if !ok {
+			return v, 0, false
+		}
+		total := len(arr)
+		truncated := limit > 0 && total > limit
+		if truncated {
+			arr = arr[:limit]
+		}
+		out := make(map[string]any, len(v))
+		for k, val := range v {
+			out[k] = val
+		}
+		out[key] = arr
+		return out, total, truncated
+	case []any:
+		// 容错：仍接受数组形状（旧版/测试）。
+		total := len(v)
+		truncated := limit > 0 && total > limit
+		if truncated {
+			return v[:limit], total, true
+		}
+		return v, total, false
+	default:
+		return raw, 0, false
 	}
-	return list[:limit]
+}
+
+// ── 会话编排工具（2026-11-08 自查户进程内迁入）────────────────────
+//
+// 宿主只保留能力（turn.context / ask 通道 / inbox / 会话生命周期）；本插件做工具适配。
+// 返回体统一是 {text, is_error}（宿主能力直出原结果文本），故用 pluginsdk.Text 原样返回，
+// 不做 JSON 编码（保持契约文本与迁移前逐字一致）。
+
+// capText 是宿主 `plugin/v1/*` 会话编排能力的结果信封。
+type capText struct {
+	Text    string `json:"text"`
+	IsError bool   `json:"is_error"`
+}
+
+// askUser 把提问交回宿主 ask 通道：广播 session-ask → 立即返回占位结果（非阻塞），
+// 用户答复经 ask-user-reply 以同一 turn 续跑。任务节点由 turn 侧建，答复到达才收尾。
+func (t *taskPlugin) askUser(ctx context.Context, args map[string]any, cx pluginsdk.CallContext) (any, error) {
+	if cx.Turn == "" {
+		return nil, fmt.Errorf("缺少会话轮次（turn）：ask_user 必须在会话轮次内调用")
+	}
+	if err := validateAskArgs(args); err != nil {
+		return nil, err
+	}
+	var out capText
+	if err := t.p.CallInto(ctx, "plugin/v1/ask.user", map[string]any{
+		"instance_id":  cx.InstanceID,
+		"turn":         cx.Turn,
+		"tool_call_id": cx.ToolCallID,
+		"args":         args,
+	}, &out); err != nil {
+		return nil, err
+	}
+	if out.IsError {
+		msg := strings.TrimSpace(out.Text)
+		if msg == "" {
+			msg = "ask 能力返回错误"
+		}
+		return nil, fmt.Errorf("%s", msg)
+	}
+	return pluginsdk.Text(out.Text), nil
+}
+
+// ask_user 参数上限（与契约 schema 同步）：Ask 卡片是轻量抉择，不是长文输入框。
+const (
+	askMaxQuestionRunes   = 2000
+	askMaxContextRunes    = 4000
+	askMaxOptions         = 20
+	askMaxOptionTextRunes = 500
+	askMaxRecommended     = 20
+)
+
+// validateAskArgs 在插件边界校验 ask_user 参数（schema 之外的运行时兜底）：
+// question 去空白后非空且不超长；options/recommended 有界且元素形状合法。
+// 失败返回 Go error → MCP isError=true（宿主 turn 侧据此落 failed / 任务节点 error）。
+func validateAskArgs(args map[string]any) error {
+	question := strings.TrimSpace(asString(args["question"]))
+	if question == "" {
+		return fmt.Errorf("question 不能为空")
+	}
+	if utf8.RuneCountInString(question) > askMaxQuestionRunes {
+		return fmt.Errorf("question 过长（最多 %d 字符）", askMaxQuestionRunes)
+	}
+	args["question"] = question // 统一去首尾空白后再下发（展示与历史一致）
+
+	if v, ok := args["context"]; ok && v != nil {
+		ctxText, ok := v.(string)
+		if !ok {
+			return fmt.Errorf("context 必须是字符串")
+		}
+		if utf8.RuneCountInString(ctxText) > askMaxContextRunes {
+			return fmt.Errorf("context 过长（最多 %d 字符）", askMaxContextRunes)
+		}
+	}
+
+	if v, ok := args["options"]; ok && v != nil {
+		options, ok := v.([]any)
+		if !ok {
+			return fmt.Errorf("options 必须是数组")
+		}
+		if len(options) > askMaxOptions {
+			return fmt.Errorf("options 最多 %d 项", askMaxOptions)
+		}
+		for i, item := range options {
+			switch opt := item.(type) {
+			case string:
+				if strings.TrimSpace(opt) == "" {
+					return fmt.Errorf("options[%d] 不能为空字符串", i)
+				}
+				if utf8.RuneCountInString(opt) > askMaxOptionTextRunes {
+					return fmt.Errorf("options[%d] 过长（最多 %d 字符）", i, askMaxOptionTextRunes)
+				}
+			case map[string]any:
+				hasText := false
+				valueText, labelText := "", ""
+				for _, key := range []string{"value", "label"} {
+					raw, exists := opt[key]
+					if !exists || raw == nil {
+						continue
+					}
+					text, ok := raw.(string)
+					if !ok {
+						return fmt.Errorf("options[%d].%s 必须是字符串", i, key)
+					}
+					switch key {
+					case "value":
+						valueText = text
+					case "label":
+						labelText = text
+					}
+					if strings.TrimSpace(text) != "" {
+						hasText = true
+					}
+					if utf8.RuneCountInString(text) > askMaxOptionTextRunes {
+						return fmt.Errorf("options[%d].%s 过长（最多 %d 字符）", i, key, askMaxOptionTextRunes)
+					}
+				}
+				if !hasText {
+					return fmt.Errorf("options[%d] 的 value/label 不能同时为空", i)
+				}
+				// 显式空 value + 非空 label：前端按 value 取值会得到空串 → 归一为 label。
+				if strings.TrimSpace(valueText) == "" && strings.TrimSpace(labelText) != "" {
+					opt["value"] = labelText
+				}
+			default:
+				return fmt.Errorf("options[%d] 必须是字符串或 {value,label} 对象", i)
+			}
+		}
+	}
+
+	if v, ok := args["recommended"]; ok && v != nil {
+		switch rec := v.(type) {
+		case string:
+			if utf8.RuneCountInString(rec) > askMaxOptionTextRunes {
+				return fmt.Errorf("recommended 过长（单个最多 %d 字符）", askMaxOptionTextRunes)
+			}
+		case []any:
+			if len(rec) > askMaxRecommended {
+				return fmt.Errorf("recommended 最多 %d 项", askMaxRecommended)
+			}
+			for i, item := range rec {
+				text, ok := item.(string)
+				if !ok {
+					return fmt.Errorf("recommended[%d] 必须是字符串", i)
+				}
+				if utf8.RuneCountInString(text) > askMaxOptionTextRunes {
+					return fmt.Errorf("recommended[%d] 过长（最多 %d 字符）", i, askMaxOptionTextRunes)
+				}
+			}
+		default:
+			return fmt.Errorf("recommended 必须是字符串或字符串数组")
+		}
+	}
+	return nil
+}
+
+// nextRun 把下一轮提示词登记为排队输入（NEXTRUN-1）；仅主会话可用，由宿主判定。
+func (t *taskPlugin) nextRun(ctx context.Context, args map[string]any, cx pluginsdk.CallContext) (any, error) {
+	if cx.Turn == "" {
+		return nil, fmt.Errorf("缺少会话轮次（turn）：next_run 必须在会话轮次内调用")
+	}
+	var out capText
+	if err := t.p.CallInto(ctx, "plugin/v1/next.run", map[string]any{
+		"instance_id": cx.InstanceID,
+		"turn":        cx.Turn,
+		"args":        args,
+	}, &out); err != nil {
+		return nil, err
+	}
+	// 业务失败（空/超长 prompt、非主会话、数据门面/计数/inbox 失败）→ 工具错误：
+	// worker 落 failed + 任务节点 error；"未启用 / 到限"仍是 isErr=false 的业务文案。
+	if out.IsError {
+		msg := strings.TrimSpace(out.Text)
+		if msg == "" {
+			msg = "next_run 登记失败"
+		}
+		return nil, fmt.Errorf("%s", msg)
+	}
+	return pluginsdk.Text(out.Text), nil
+}
+
+// subchatOpen 建固定参数子聊天 / 群聊；宿主负责会话与首轮落库、开窗事件，插件只转发。
+func (t *taskPlugin) subchatOpen(ctx context.Context, args map[string]any, cx pluginsdk.CallContext) (any, error) {
+	if cx.Turn == "" {
+		return nil, fmt.Errorf("缺少会话轮次（turn）：subchat_open 必须在会话轮次内调用")
+	}
+	var out capText
+	if err := t.p.CallInto(ctx, "plugin/v1/subchat.open", map[string]any{
+		"instance_id":  cx.InstanceID,
+		"turn":         cx.Turn,
+		"display_name": cx.DisplayName,
+		"args":         args,
+	}, &out); err != nil {
+		return nil, err
+	}
+	// 参数 / 建会话 / 建首轮等业务失败 → 工具错误（worker 落 failed + 任务节点 error）。
+	if out.IsError {
+		msg := strings.TrimSpace(out.Text)
+		if msg == "" {
+			msg = "打开子聊天失败"
+		}
+		return nil, fmt.Errorf("%s", msg)
+	}
+	return pluginsdk.Text(out.Text), nil
+}
+
+// subchatFinish 子 agent 自报达成 → 会话 lifecycle=ready（建议态；用户拍板才结束）。
+func (t *taskPlugin) subchatFinish(ctx context.Context, args map[string]any, cx pluginsdk.CallContext) (any, error) {
+	_ = args
+	if cx.Turn == "" {
+		return nil, fmt.Errorf("缺少会话轮次（turn）：subchat_finish 必须在会话轮次内调用")
+	}
+	var out capText
+	if err := t.p.CallInto(ctx, "plugin/v1/subchat.finish", map[string]any{
+		"instance_id": cx.InstanceID,
+		"turn":        cx.Turn,
+	}, &out); err != nil {
+		return nil, err
+	}
+	// 非 sub_chat / 会话不可用 / 置 ready 失败 → 工具错误（worker 落 failed + 任务节点 error）。
+	if out.IsError {
+		msg := strings.TrimSpace(out.Text)
+		if msg == "" {
+			msg = "subchat_finish 失败"
+		}
+		return nil, fmt.Errorf("%s", msg)
+	}
+	return pluginsdk.Text(out.Text), nil
 }
 
 // ── task_stop ─────────────────────────
@@ -387,15 +734,34 @@ func (t *taskPlugin) stop(ctx context.Context, args map[string]any, cx pluginsdk
 	if taskID == "" {
 		return nil, fmt.Errorf("task_id 不能为空")
 	}
-	params := map[string]any{"task_id": taskID}
+	cascade := true // 缺省保持既有“连带子任务”语义；显式 false = 只停目标任务
 	if v, ok := args["cascade"].(bool); ok {
-		params["cascade"] = v
+		cascade = v
 	}
-	raw, err := t.p.DataWrite(ctx, "task", "stop", cx.InstanceID, params)
-	if err != nil {
+	// P0（2026-11-08）：改走 `plugin/v1/task.stop`（带 request_id → 宿主返回 v.Result）。
+	// 旧 data.write 路径要求 `{req_id,ok,result}` 同主题应答，而 task-stop 成功只写 v.Result
+	// → 成功停止被报成 15s/30s 超时。此处成功可在毫秒级拿到 {cancelled, task_id}。
+	var out struct {
+		Cancelled bool   `json:"cancelled"`
+		TaskID    string `json:"task_id"`
+	}
+	if err := t.p.CallIntoWithTimeout(ctx, 30*time.Second, "plugin/v1/task.stop", map[string]any{
+		"request_id":  fmt.Sprintf("task-stop-%d", time.Now().UnixNano()),
+		"instance_id": cx.InstanceID,
+		"task_id":     taskID,
+		"cascade":     cascade,
+	}, &out); err != nil {
 		return nil, fmt.Errorf("终止任务失败: %w", err)
 	}
-	return map[string]any{"ok": true, "result": unwrap(raw)}, nil
+	if !out.Cancelled {
+		return nil, fmt.Errorf("终止任务失败: 任务未被取消（%s）", taskID)
+	}
+	return map[string]any{
+		"ok":        true,
+		"cancelled": true,
+		"task_id":   taskID,
+		"state":     "cancelled",
+	}, nil
 }
 
 func (t *taskPlugin) info(_ context.Context, _ map[string]any) (any, error) {

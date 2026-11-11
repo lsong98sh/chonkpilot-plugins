@@ -10,24 +10,28 @@ package main
 
 import (
 	"errors"
+	"fmt"
 	"log/slog"
 	"path/filepath"
+	"runtime"
 	"strings"
 
 	pluginsdk "github.com/lsong98sh/chonkpilot-plugin-framework/sdk"
+	"github.com/lsong98sh/chonkpilot-util/pathutil"
 	"github.com/lsong98sh/chonkpilot-util/sandbox"
 	"github.com/lsong98sh/chonkpilot-util/scriptrun"
 )
 
 // sandboxOptions 组装 scriptrun 的写隔离参数（Enabled 时 Writable = 已打标的目录）。
-func sandboxOptions(cx pluginsdk.CallContext, cwd string) scriptrun.Sandbox {
+//
+// 2026-11-08（P0）：`cwd` **不再**追加进可写白名单 —— 它只是执行目录，写权限仅来自
+// gateway 下发的 `_meta.chonkpilot.sandbox.writable_dirs`。否则 LLM 传任意绝对目录即可
+// 让沙箱脚本在其内写文件（写隔离绕过）。
+func sandboxOptions(cx pluginsdk.CallContext) scriptrun.Sandbox {
 	if cx.Sandbox == nil || !cx.Sandbox.Enabled {
 		return scriptrun.Sandbox{}
 	}
 	dirs := append([]string{}, cx.Sandbox.WritableDirs...)
-	if strings.TrimSpace(cwd) != "" {
-		dirs = append(dirs, cwd)
-	}
 	writable := make([]string, 0, len(dirs))
 	seen := map[string]bool{}
 	for _, d := range dirs {
@@ -45,6 +49,51 @@ func sandboxOptions(cx pluginsdk.CallContext, cwd string) scriptrun.Sandbox {
 		}
 	}
 	return scriptrun.Sandbox{Enabled: true, Writable: writable}
+}
+
+// resolveCwd 归一 cwd 并限制在会话 work_dir 子树内（越界拒绝）。
+// 返回空串 = 不设置子进程 Dir（沿用插件进程 cwd）。
+//
+// 2026-11-08（P0）：任意绝对 cwd 不再被接受 —— cwd 只作为执行目录，且必须落在
+// `_meta.chonkpilot.work_dir`（或项目工作目录）内；缺少 work_dir 时 fail-closed。
+func resolveCwd(cwd, workDir, instanceID string) (string, error) {
+	cwd = strings.TrimSpace(cwd)
+	if cwd == "" {
+		return "", nil
+	}
+	resolved, msg := pathutil.Resolve(cwd, instanceID)
+	if msg != "" {
+		return "", errors.New("cwd：" + msg)
+	}
+	wd := strings.TrimSpace(workDir)
+	if wd == "" {
+		return "", errors.New("cwd 需要会话工作目录（work_dir）作为边界；缺少 work_dir，拒绝在任意目录执行")
+	}
+	wdResolved, msg := pathutil.Resolve(wd, instanceID)
+	if msg != "" {
+		return "", errors.New("work_dir：" + msg)
+	}
+	if !withinDir(wdResolved, resolved) {
+		return "", fmt.Errorf("cwd 越界：%s 不在会话工作目录 %s 内（只允许 work_dir 子树）", resolved, wdResolved)
+	}
+	return resolved, nil
+}
+
+// withinDir 判定 target 是否在 base 目录内（含相等；Windows 大小写不敏感）。
+func withinDir(base, target string) bool {
+	b := filepath.Clean(base)
+	t := filepath.Clean(target)
+	if runtime.GOOS == "windows" {
+		b, t = strings.ToLower(b), strings.ToLower(t)
+	}
+	if b == t {
+		return true
+	}
+	rel, err := filepath.Rel(b, t)
+	if err != nil || filepath.IsAbs(rel) {
+		return false
+	}
+	return rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
 }
 
 // tagLowIL 给目录打 Low IL 标签（幂等；进程内缓存成功结果）。

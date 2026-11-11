@@ -165,7 +165,17 @@ func StoreDir(dir string) string {
 }
 
 // Open 获取（进程内复用或从盘恢复）指定 workdir 的工作区。
-func Open(dir string) (*Workspace, error) {
+//
+// 写路径（initialize / configure / index_paths）：会确保落盘目录存在。
+func Open(dir string) (*Workspace, error) { return open(dir, true) }
+
+// OpenReadOnly 获取已有工作区，**不创建落盘目录**（查询类工具专用）。
+//
+// 查询路径只读：store 目录不存在时保持不存在，LoadIndex 走只读分支；
+// 索引新鲜度由插件后台（filesys.changed / session-complete）维护。
+func OpenReadOnly(dir string) (*Workspace, error) { return open(dir, false) }
+
+func open(dir string, ensureStore bool) (*Workspace, error) {
 	abs, err := filepath.Abs(dir)
 	if err != nil {
 		return nil, fmt.Errorf("abs %s: %w", dir, err)
@@ -181,11 +191,19 @@ func Open(dir string) (*Workspace, error) {
 	wsMu.Lock()
 	defer wsMu.Unlock()
 	if w, ok := wsReg[wsKey(abs)]; ok {
+		// 缓存命中时写路径仍要补建目录（可能是查询路径先以只读方式登记了该工作区）。
+		if ensureStore {
+			if err := os.MkdirAll(w.Store, 0o755); err != nil {
+				return nil, fmt.Errorf("mkdir store: %w", err)
+			}
+		}
 		return w, nil
 	}
 	w := &Workspace{Dir: abs, Store: StoreDir(abs)}
-	if err := os.MkdirAll(w.Store, 0o755); err != nil {
-		return nil, fmt.Errorf("mkdir store: %w", err)
+	if ensureStore {
+		if err := os.MkdirAll(w.Store, 0o755); err != nil {
+			return nil, fmt.Errorf("mkdir store: %w", err)
+		}
 	}
 	_ = w.loadMeta()
 	wsReg[wsKey(abs)] = w
@@ -361,17 +379,25 @@ func (w *Workspace) absSym(s Symbol) Symbol {
 
 // ---- 查询辅助（对已就绪工作区；输入兼容绝对/相对，输出统一绝对）----
 
-// SearchSymbol 按名字/kind/file 过滤。
+// SearchSymbol 按名字/kind/file 过滤（limit<=0 = 不限；结果按 file/line 排序后截断）。
 func (w *Workspace) SearchSymbol(q, kind, file string, limit int) []Symbol {
+	out, _ := w.SearchSymbolPage(q, kind, file, limit, 0)
+	return out
+}
+
+// SearchSymbolPage 是 SearchSymbol 的分页版本：先收集并排序全部命中，再按 offset/limit 切片，
+// 同时返回**未截断的真实命中总数**（total）。
+func (w *Workspace) SearchSymbolPage(q, kind, file string, limit, offset int) ([]Symbol, int) {
 	ix := w.indexSnapshot()
 	if ix == nil {
-		return nil
+		return []Symbol{}, 0
 	}
-	q = strings.ToLower(q)
+	q = strings.ToLower(strings.TrimSpace(q))
+	kind = strings.TrimSpace(kind)
 	fileRel := w.norm(file)
-	var out []Symbol
+	out := make([]Symbol, 0)
 	for _, s := range ix.AllSymbols() {
-		if kind != "" && s.Kind != kind {
+		if kind != "" && !strings.EqualFold(s.Kind, kind) {
 			continue
 		}
 		if file != "" {
@@ -384,42 +410,93 @@ func (w *Workspace) SearchSymbol(q, kind, file string, limit int) []Symbol {
 			continue
 		}
 		out = append(out, w.absSym(s))
-		if limit > 0 && len(out) >= limit {
-			break
-		}
 	}
 	sort.Slice(out, func(i, j int) bool {
 		if out[i].File != out[j].File {
 			return out[i].File < out[j].File
 		}
-		return out[i].Line < out[j].Line
+		if out[i].Line != out[j].Line {
+			return out[i].Line < out[j].Line
+		}
+		return out[i].Name < out[j].Name
 	})
-	return out
+	total := len(out)
+	if offset > 0 {
+		if offset >= total {
+			return []Symbol{}, total
+		}
+		out = out[offset:]
+	}
+	if limit > 0 && len(out) > limit {
+		out = out[:limit]
+	}
+	return out, total
+}
+
+// HasIndexedFile 判断路径子串是否命中任一已索引文件（用于空结果诊断）。
+func (w *Workspace) HasIndexedFile(file string) bool {
+	ix := w.indexSnapshot()
+	if ix == nil || len(ix.Files) == 0 {
+		return false
+	}
+	file = strings.TrimSpace(file)
+	if file == "" {
+		return true
+	}
+	rel := strings.ToLower(w.norm(file))
+	abs := strings.ToLower(file)
+	for p := range ix.Files {
+		if strings.Contains(strings.ToLower(p), rel) || strings.Contains(strings.ToLower(w.abs(p)), abs) {
+			return true
+		}
+	}
+	return false
+}
+
+// IndexedFileCount 返回当前索引包含的文件数（空结果诊断）。
+func (w *Workspace) IndexedFileCount() int {
+	ix := w.indexSnapshot()
+	if ix == nil {
+		return 0
+	}
+	return len(ix.Files)
 }
 
 // FindSymbol 按 id 或 file+name 定位（首个）。id/file 接受绝对或相对。
+// FindSymbol 按 id 或 file+name 定位。id 非空时**只按 id**匹配（忽略 file/name）；
+// 否则要求 file 精确（大小写不敏感，绝对/相对均可）且 name 大小写不敏感全等。
 func (w *Workspace) FindSymbol(id, file, name string) []Symbol {
 	ix := w.indexSnapshot()
 	if ix == nil {
 		return nil
 	}
 	fileRel := w.norm(file)
+	name = strings.TrimSpace(name)
+	id = strings.TrimSpace(id)
 	var out []Symbol
 	for _, s := range ix.AllSymbols() {
 		if id != "" {
-			m := s.ID == id || s.ID == w.norm(id)
-			if !m {
+			if !strings.EqualFold(s.ID, id) && !strings.EqualFold(s.ID, w.norm(id)) {
 				continue
 			}
-		}
-		if file != "" && name != "" {
-			if s.File != fileRel || !strings.EqualFold(s.Name, name) {
+		} else if file != "" && name != "" {
+			if !strings.EqualFold(s.File, fileRel) || !strings.EqualFold(s.Name, name) {
 				continue
 			}
+		} else {
+			continue
 		}
 		out = append(out, w.absSym(s))
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].Line < out[j].Line })
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].File != out[j].File {
+			return out[i].File < out[j].File
+		}
+		if out[i].Line != out[j].Line {
+			return out[i].Line < out[j].Line
+		}
+		return out[i].Name < out[j].Name
+	})
 	return out
 }
 
@@ -427,20 +504,27 @@ func (w *Workspace) FindSymbol(id, file, name string) []Symbol {
 type CalleeRef struct {
 	Name     string `json:"name"`
 	Resolved bool   `json:"resolved"` // 是否在索引内唯一命中符号
-	Kind     string `json:"kind,omitempty"`
-	File     string `json:"file,omitempty"`
-	Line     int    `json:"line,omitempty"`
-	ID       string `json:"id,omitempty"`
+	// Candidates = 索引内同名定义数：0 = 未索引/外部符号；1 = resolved；>1 = 同名多处无法解析。
+	Candidates int    `json:"candidates"`
+	Kind       string `json:"kind,omitempty"`
+	File       string `json:"file,omitempty"`
+	Line       int    `json:"line,omitempty"`
+	ID         string `json:"id,omitempty"`
 }
 
-// Callers 返回调用了 target 的符号（按名字匹配：忽略大小写的全等 或 后缀 `.name`，
-// 故 `pkg.Foo` 与 `Foo` 视为同一目标）。file 非空时只保留该文件内的调用方；limit>0 截断。
-// 语义为调用点文本的名字级启发式（无类型/重载解析）。
+// Callers 返回调用了 target 的符号（limit<=0 = 不限；结果按 file/line/name 排序后截断）。
 func (w *Workspace) Callers(target, file string, limit int) []Symbol {
+	out, _ := w.CallersPage(target, file, limit, 0)
+	return out
+}
+
+// CallersPage 是 Callers 的分页版本：先收集并排序全部调用方，再按 offset/limit 切片，
+// 同时返回**未截断的真实调用方总数**（total）。
+func (w *Workspace) CallersPage(target, file string, limit, offset int) ([]Symbol, int) {
 	ix := w.indexSnapshot()
 	target = strings.TrimSpace(target)
 	if ix == nil || target == "" {
-		return nil
+		return []Symbol{}, 0
 	}
 	idxSet := map[int]bool{}
 	for _, k := range callLookupKeys(target) {
@@ -456,7 +540,7 @@ func (w *Workspace) Callers(target, file string, limit int) []Symbol {
 
 	syms := ix.AllSymbols()
 	fileRel := w.norm(file)
-	var out []Symbol
+	out := make([]Symbol, 0)
 	for _, i := range idx {
 		if i < 0 || i >= len(syms) {
 			continue
@@ -469,29 +553,90 @@ func (w *Workspace) Callers(target, file string, limit int) []Symbol {
 			continue
 		}
 		out = append(out, w.absSym(s))
-		if limit > 0 && len(out) >= limit {
-			break
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].File != out[j].File {
+			return out[i].File < out[j].File
+		}
+		if out[i].Line != out[j].Line {
+			return out[i].Line < out[j].Line
+		}
+		return out[i].Name < out[j].Name
+	})
+	total := len(out)
+	if offset > 0 {
+		if offset >= total {
+			return []Symbol{}, total
+		}
+		out = out[offset:]
+	}
+	if limit > 0 && len(out) > limit {
+		out = out[:limit]
+	}
+	return out, total
+}
+
+// FindByName 返回名字与 target 匹配的已索引定义（全名或最后一段，大小写不敏感）。
+// 用于 callers 回填“目标符号是谁”；找不到定义不代表没有调用方（可能是外部/动态符号）。
+func (w *Workspace) FindByName(target string) []Symbol {
+	ix := w.indexSnapshot()
+	target = strings.TrimSpace(target)
+	if ix == nil || target == "" {
+		return []Symbol{}
+	}
+	seen := map[int]bool{}
+	out := make([]Symbol, 0)
+	for _, k := range callLookupKeys(target) {
+		for _, i := range ix.byName[k] {
+			if i < 0 || i >= len(ix.syms) || seen[i] {
+				continue
+			}
+			seen[i] = true
+			out = append(out, w.absSym(ix.syms[i]))
 		}
 	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].File != out[j].File {
+			return out[i].File < out[j].File
+		}
+		if out[i].Line != out[j].Line {
+			return out[i].Line < out[j].Line
+		}
+		return out[i].Name < out[j].Name
+	})
 	return out
 }
 
 // Callees 返回某符号（按 id 或 file+name 定位，取首个）直接调用的目标；
 // 能唯一解析到已索引符号时回填其 file/line/kind/id（resolved=true，否则 resolved=false）。
+// Callees 返回某符号直接调用的目标（limit<=0 = 不限）。
 func (w *Workspace) Callees(id, file, name string, limit int) []CalleeRef {
-	ix := w.indexSnapshot()
-	if ix == nil {
-		return nil
-	}
+	out, _ := w.CalleesPage(id, file, name, limit, 0)
+	return out
+}
+
+// CalleesPage 是 Callees 的分页版本：返回当前页与**未截断的调用总数**。
+func (w *Workspace) CalleesPage(id, file, name string, limit, offset int) ([]CalleeRef, int) {
 	hits := w.FindSymbol(id, file, name)
 	if len(hits) == 0 {
-		return nil
+		return []CalleeRef{}, 0
+	}
+	return w.CalleesOf(hits[0], limit, offset)
+}
+
+// CalleesOf 基于已定位的目标符号生成调用目标列表；candidates 给出来源同名定义数
+// （0 = 外部/未索引，1 = 唯一解析，>1 = 同名多处）。
+func (w *Workspace) CalleesOf(target Symbol, limit, offset int) ([]CalleeRef, int) {
+	ix := w.indexSnapshot()
+	if ix == nil {
+		return []CalleeRef{}, 0
 	}
 	syms := ix.AllSymbols()
-	var out []CalleeRef
-	for _, c := range hits[0].Calls {
-		ref := CalleeRef{Name: c}
-		if ids := ix.byName[strings.ToLower(c)]; len(ids) == 1 && ids[0] < len(syms) {
+	all := make([]CalleeRef, 0, len(target.Calls))
+	for _, c := range target.Calls {
+		ids := ix.byName[strings.ToLower(c)]
+		ref := CalleeRef{Name: c, Candidates: len(ids)}
+		if len(ids) == 1 && ids[0] < len(syms) {
 			s := w.absSym(syms[ids[0]])
 			ref.Resolved = true
 			ref.Kind = s.Kind
@@ -499,12 +644,19 @@ func (w *Workspace) Callees(id, file, name string, limit int) []CalleeRef {
 			ref.Line = s.Line
 			ref.ID = s.ID
 		}
-		out = append(out, ref)
-		if limit > 0 && len(out) >= limit {
-			break
-		}
+		all = append(all, ref)
 	}
-	return out
+	total := len(all)
+	if offset > 0 {
+		if offset >= total {
+			return []CalleeRef{}, total
+		}
+		all = all[offset:]
+	}
+	if limit > 0 && len(all) > limit {
+		all = all[:limit]
+	}
+	return all, total
 }
 
 // fileHit 文件过滤：相对路径子串或绝对路径子串命中（与 SearchSymbol 同口径）。
@@ -557,19 +709,50 @@ func anyCallMatches(calls []string, target string) bool {
 }
 
 // TopComplexity 最高复杂度前 topN（>=minCc）。
-func (w *Workspace) TopComplexity(file string, topN, minCc int) []Symbol {
+// IndexCoverage 返回当前索引的文件数与其中解析报错（HasErr）的文件数。
+func (w *Workspace) IndexCoverage() (indexed, parseErrors int) {
 	ix := w.indexSnapshot()
 	if ix == nil {
-		return nil
+		return 0, 0
 	}
-	fileRel := w.norm(file)
+	for _, fi := range ix.Files {
+		indexed++
+		if fi.HasErr {
+			parseErrors++
+		}
+	}
+	return indexed, parseErrors
+}
+
+// TopComplexity 兼容旧接口：不过滤 kind，返回前 topN 条（minCc 为下限）。
+func (w *Workspace) TopComplexity(file string, topN, minCc int) []Symbol {
+	out, _ := w.TopComplexityPage(file, "all", topN, minCc)
+	return out
+}
+
+// TopComplexityPage 返回复杂度排名（真实匹配总数一并返回）。
+//
+// kind 取值："" / "all" = 全部符号；"function" = func/method/constructor；
+// 其余按符号 kind 精确匹配（大小写不敏感）。file 为大小写不敏感的子串匹配。
+// 排序确定：复杂度降序 → 文件 → 行号 → 名称 → kind；topN<=0 表示不限。
+func (w *Workspace) TopComplexityPage(file, kind string, topN, minCc int) ([]Symbol, int) {
+	ix := w.indexSnapshot()
+	if ix == nil {
+		return []Symbol{}, 0
+	}
+	fileRel := strings.ToLower(w.norm(file))
+	fileAbs := strings.ToLower(file)
+	kind = strings.ToLower(strings.TrimSpace(kind))
 	var out []Symbol
 	for _, s := range ix.AllSymbols() {
 		if file != "" {
 			sl := strings.ToLower(s.File)
-			if !strings.Contains(sl, strings.ToLower(fileRel)) && !strings.Contains(strings.ToLower(w.abs(s.File)), strings.ToLower(file)) {
+			if !strings.Contains(sl, fileRel) && !strings.Contains(strings.ToLower(w.abs(s.File)), fileAbs) {
 				continue
 			}
+		}
+		if !complexityKindMatch(kind, s.Kind) {
+			continue
 		}
 		if s.Complexity >= minCc {
 			out = append(out, w.absSym(s))
@@ -579,30 +762,65 @@ func (w *Workspace) TopComplexity(file string, topN, minCc int) []Symbol {
 		if out[i].Complexity != out[j].Complexity {
 			return out[i].Complexity > out[j].Complexity
 		}
-		return out[i].File < out[j].File
+		if out[i].File != out[j].File {
+			return out[i].File < out[j].File
+		}
+		if out[i].Line != out[j].Line {
+			return out[i].Line < out[j].Line
+		}
+		if out[i].Name != out[j].Name {
+			return out[i].Name < out[j].Name
+		}
+		return out[i].Kind < out[j].Kind
 	})
-	if len(out) > topN {
+	total := len(out)
+	if topN > 0 && len(out) > topN {
 		out = out[:topN]
 	}
-	return out
+	if out == nil {
+		out = []Symbol{}
+	}
+	return out, total
+}
+
+// complexityKindMatch kind 过滤：function 覆盖函数类；all/空 不过滤；其余精确匹配。
+func complexityKindMatch(kind, symKind string) bool {
+	switch kind {
+	case "", "all":
+		return true
+	case "function":
+		return symKind == "func" || symKind == "method" || symKind == "constructor"
+	default:
+		return strings.EqualFold(kind, symKind)
+	}
 }
 
 // ModuleSummary 目录摘要。
+//
+// path 为 workdir 相对/绝对目录前缀，按**路径段边界**且大小写不敏感匹配
+// （src 命中 src/a.go，不命中 srcfoo/a.go）；空 path = 全项目。
+// files/symbols 只统计已索引文件（≤8MB、受 exts/skip/gitignore 限制）；
+// topComplexity5 只含 func/method/constructor，按复杂度→文件→行→名称稳定排序。
 func (w *Workspace) ModuleSummary(prefix string) map[string]any {
 	ix := w.indexSnapshot()
 	lc := map[string]int{}
 	ns := 0
+	parseErrs := 0
 	var rels []string
 	if ix != nil {
+		pr := strings.ToLower(strings.TrimSpace(w.norm(prefix)))
 		for p, fi := range ix.Files {
-			if prefix != "" {
-				pr := w.norm(prefix)
-				if !strings.HasPrefix(p, pr) && !strings.HasPrefix(w.abs(p), prefix) {
+			if pr != "" {
+				lp := strings.ToLower(p)
+				if lp != pr && !strings.HasPrefix(lp, pr+"/") {
 					continue
 				}
 			}
 			lc[fi.Lang]++
 			ns += len(fi.Symbols)
+			if fi.HasErr {
+				parseErrs++
+			}
 			rels = append(rels, p)
 		}
 	}
@@ -611,15 +829,39 @@ func (w *Workspace) ModuleSummary(prefix string) map[string]any {
 	for _, p := range rels {
 		if fi, ok := ix.Files[p]; ok {
 			for _, s := range fi.Symbols {
-				comps = append(comps, w.absSym(s))
+				if complexityKindMatch("function", s.Kind) {
+					comps = append(comps, w.absSym(s))
+				}
 			}
 		}
 	}
-	sort.Slice(comps, func(i, j int) bool { return comps[i].Complexity > comps[j].Complexity })
+	sort.Slice(comps, func(i, j int) bool {
+		if comps[i].Complexity != comps[j].Complexity {
+			return comps[i].Complexity > comps[j].Complexity
+		}
+		if comps[i].File != comps[j].File {
+			return comps[i].File < comps[j].File
+		}
+		if comps[i].Line != comps[j].Line {
+			return comps[i].Line < comps[j].Line
+		}
+		if comps[i].Name != comps[j].Name {
+			return comps[i].Name < comps[j].Name
+		}
+		return comps[i].Kind < comps[j].Kind
+	})
 	if len(comps) > 5 {
 		comps = comps[:5]
 	}
-	return map[string]any{"scope": w.abs(prefix), "files": len(rels), "symbols": ns, "langCounts": lc, "topComplexity5": comps}
+	scope := w.Dir
+	if prefix != "" {
+		scope = w.abs(w.norm(prefix))
+	}
+	return map[string]any{
+		"scope": scope, "files": len(rels), "symbols": ns,
+		"langCounts": lc, "topComplexity5": comps,
+		"parseErrorFiles": parseErrs, "lastIndexedAt": w.Meta().LastIndexedAt,
+	}
 }
 
 func itoa(v int) string {

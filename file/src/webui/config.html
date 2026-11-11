@@ -96,6 +96,17 @@
           t.className = 'hint';
           t.textContent = '启用';
           line.appendChild(input); line.appendChild(t); wrap.appendChild(line);
+        } else if (f.type === 'select') {
+          input = document.createElement('select');
+          input.style.cssText = 'width:100%;box-sizing:border-box;padding:7px 9px;border:1px solid var(--ck-border);border-radius:6px;font:inherit;background:transparent;color:inherit;';
+          for (const opt of (f.options || [''])) {
+            const o = document.createElement('option');
+            o.value = opt;
+            o.textContent = opt === '' ? '自动识别' : opt;
+            input.appendChild(o);
+          }
+          input.value = values[f.key] == null ? '' : String(values[f.key]);
+          wrap.appendChild(input);
         } else {
           input = document.createElement('input');
           input.type = f.type === 'integer' ? 'number' : 'text';

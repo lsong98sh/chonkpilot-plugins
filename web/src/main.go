@@ -12,23 +12,54 @@ package main
 
 import (
 	"context"
+	"embed"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log/slog"
 	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/lsong98sh/chonkpilot-plugin-framework/contract"
 	pluginsdk "github.com/lsong98sh/chonkpilot-plugin-framework/sdk"
 )
 
 const pluginVersion = "2.0.0"
+
+// apiResponseMaxBytes 是 web_search / web_fetch 上游响应的读取上限（8 MiB）。
+// 超限不再静默截断：直接返回明确错误（截断会让 JSON 解析必然失败）。
+const apiResponseMaxBytes = 8 << 20
+
+// contentHardMaxBytes 是 web_fetch / web_download 单次返回内容的硬上限（8 MiB）。
+// 参数 maxBytes 超过该值直接报错：内容模式最终会进 LLM 上下文（二进制再 base64 放大 4/3），
+// 更大文件应走 web_download 落盘模式（maxMB/流式写盘）。
+const contentHardMaxBytes = 8 << 20
+
+// web_search 正文预算：need_content=true 时按总字节预算截断各条 content。
+const (
+	searchContentBudgetDefault = 256 << 10 // 256 KiB
+	searchContentBudgetMax     = 8 << 20   // 8 MiB
+)
+
+// apiAttemptTimeoutMax 单次上游尝试的超时上限：3 次尝试 + 1s/2s 退避 <= 168s，
+// 保证在 manifest 的 180s 网关超时内完成，避免必然转后台。
+const apiAttemptTimeoutMax = 55 * time.Second
+
+// toolsFS 是工具契约（`*.tool.md`）的 embed 源：插件自持，产物不带契约目录。
+//
+//go:embed all:tools
+var toolsFS embed.FS
+
+// toolsRoot 是 embed 内契约目录名（`tools/web/`）。
+const toolsRoot = "tools/web"
 
 type searcher struct {
 	p   *pluginsdk.Plugin
@@ -57,49 +88,18 @@ func main() {
 	defer p.Close()
 
 	s := &searcher{p: p, cfg: newConfigManager(p)}
-	p.Tool("web_search", "联网搜索（DeepSeek Search）。返回标题/链接/摘要/正文片段。", map[string]any{
-		"type": "object",
-		"properties": map[string]any{
-			"query":        map[string]any{"type": "string", "description": "检索词（1-128 字符）"},
-			"count":        map[string]any{"type": "integer", "description": "返回条数（1-50）"},
-			"need_content": map[string]any{"type": "boolean", "description": "是否返回正文"},
-			"ori_question": map[string]any{"type": "string", "description": "原始问题（供检索改写参考）"},
-			"localization": map[string]any{"type": "string", "description": "本地化检索 IP 地址（可选；缺省空串）"},
-		},
-		"required": []string{"query"},
-	}, s.search)
 
-	p.Tool("web_fetch", "用 DeepSeek 网页抓取服务抓取单个 URL，返回页面标题与 Markdown 正文（需配置 DeepSeek API Key）。"+
-		"需要原始内容（HTML/二进制）或下载文件请用 web_download。",
-		map[string]any{
-			"type": "object",
-			"properties": map[string]any{
-				"url": map[string]any{"type": "string", "description": "http/https 绝对地址（<=8192 字符，不得携带账号密码）"},
-			},
-			"required": []string{"url"},
-		}, s.fetch)
-
-	p.Tool("web_download", "本地直连抓取 URL：返回**原始内容**（文本原样返回；二进制返回 base64），"+
-		"或按 saveAs/dir/filename 落盘下载。重定向默认跟随 max-redirects 次（插件配置，可被参数覆盖）。"+
-		"落盘路径须在项目「可写目录」白名单内（沙箱开启时；递归，越界明确失败）。",
-		map[string]any{
-			"type": "object",
-			"properties": map[string]any{
-				"url":          map[string]any{"type": "string", "description": "http/https 绝对地址"},
-				"method":       map[string]any{"type": "string", "description": "GET（默认）/POST/PUT/DELETE/HEAD"},
-				"headers":      map[string]any{"type": "object", "description": "附加请求头"},
-				"body":         map[string]any{"type": "string", "description": "请求体（POST/PUT）"},
-				"saveAs":       map[string]any{"type": "string", "description": "落盘路径（绝对或 ~/ 开头；目录则按 URL 文件名）"},
-				"dir":          map[string]any{"type": "string", "description": "下载目录（绝对或 ~/ 开头；缺省用配置）"},
-				"filename":     map[string]any{"type": "string", "description": "下载文件名（缺省取 Content-Disposition / URL 文件名）"},
-				"maxBytes":     map[string]any{"type": "integer", "description": "本次读取上限（字节；返回内容时缺省用配置）"},
-				"maxMB":        map[string]any{"type": "integer", "description": "本次单文件上限（MB，下载模式）"},
-				"overwrite":    map[string]any{"type": "boolean", "description": "同名是否覆盖（缺省用配置；否则自动加 -1）"},
-				"timeoutSec":   map[string]any{"type": "integer", "description": "本次超时（5-3600 秒）"},
-				"maxRedirects": map[string]any{"type": "integer", "description": "最大重定向次数（0-20；0 = 不跟随；缺省用配置）"},
-			},
-			"required": []string{"url"},
-		}, s.download)
+	// 契约 → 工具注册：schema / description / 策略（async/timeout/on_timeout/hot）均取自 md，
+	// `_meta.source="md"` 由 contract.MetaFor 写入。
+	contracts, err := loadContracts()
+	if err != nil {
+		slog.Error("web: 加载工具契约失败", "err", err)
+		os.Exit(1)
+	}
+	if missing := registerTools(p, s, contracts); len(missing) > 0 {
+		slog.Error("web: 契约缺少实现", "tools", strings.Join(missing, ","))
+		os.Exit(1)
+	}
 
 	p.OnRequest("test", s.test)
 	p.OnRequest("status", s.status)
@@ -107,9 +107,6 @@ func main() {
 	// 宿主资源通道（PLUGIN-UI-1）：插件自持 webui（embed），宿主经 UDS 逐文件拉取
 	// （GET /plugins/web/<path> → plugin/v1/ui.asset.get）。
 	p.OnRequest("plugin/v1/ui.asset.get", uiAssetGet)
-	p.HotTool("web_search")
-	p.HotTool("web_fetch")
-	p.HotTool("web_download")
 
 	// 配置面（PLUGIN-UI-1 第三段）：`load` / `save` / `reset` 动作 + 一次性键迁移。
 	// 配置写入口**只有**动作面（页面不再直调 config.set / 宿主方法）。
@@ -125,21 +122,78 @@ func main() {
 	}
 }
 
+// loadContracts 读取 embed 内的契约（`tools/web/*.tool.md`，按名称排序）。
+func loadContracts() ([]contract.Tool, error) {
+	entries, err := fs.ReadDir(toolsFS, toolsRoot)
+	if err != nil {
+		return nil, fmt.Errorf("读取契约目录 %s: %w", toolsRoot, err)
+	}
+	out := make([]contract.Tool, 0, len(entries))
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".tool.md") {
+			continue
+		}
+		raw, err := fs.ReadFile(toolsFS, toolsRoot+"/"+e.Name())
+		if err != nil {
+			return nil, err
+		}
+		tool, err := contract.Parse(string(raw))
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", e.Name(), err)
+		}
+		if tool.Name == "" {
+			continue
+		}
+		out = append(out, tool)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out, nil
+}
+
+// registerTools 按契约注册工具（handler 表按工具名分派），返回缺少实现的工具名。
+// hot 由契约 `hot: true` 经 `_meta` 传给 SDK（SDK 读取 meta.hot），无需再调用 HotTool。
+func registerTools(p *pluginsdk.Plugin, s *searcher, tools []contract.Tool) []string {
+	handlers := map[string]pluginsdk.ToolFunc{
+		"web_search":   s.search,
+		"web_fetch":    s.fetch,
+		"web_download": s.download,
+	}
+	seen := make(map[string]bool, len(handlers))
+	for _, tool := range tools {
+		fn, ok := handlers[tool.Name]
+		if !ok {
+			slog.Warn("web: 契约无对应实现，跳过", "tool", tool.Name)
+			continue
+		}
+		p.ToolWithMeta(tool.Name, tool.Description, tool.Schema, contract.MetaFor(tool), fn)
+		seen[tool.Name] = true
+	}
+	var missing []string
+	for name := range handlers {
+		if !seen[name] {
+			missing = append(missing, name)
+		}
+	}
+	sort.Strings(missing)
+	return missing
+}
+
 // ── web_search ─────────────────────────
 
 type result struct {
-	Title       string  `json:"title"`
-	URL         string  `json:"url"`
-	Snippet     string  `json:"snippet,omitempty"`
-	Summary     string  `json:"summary,omitempty"`
-	Content     string  `json:"content,omitempty"`
-	SiteName    string  `json:"site_name,omitempty"`
-	SiteIcon    string  `json:"site_icon,omitempty"`
-	Date        string  `json:"date,omitempty"`
-	Author      string  `json:"author,omitempty"`
-	Authority   float64 `json:"authority,omitempty"`
-	Score       float64 `json:"score,omitempty"`
-	RerankScore float64 `json:"rerank_score,omitempty"`
+	Title            string  `json:"title"`
+	URL              string  `json:"url"`
+	Snippet          string  `json:"snippet,omitempty"`
+	Summary          string  `json:"summary,omitempty"`
+	Content          string  `json:"content,omitempty"`
+	ContentTruncated bool    `json:"content_truncated,omitempty"`
+	SiteName         string  `json:"site_name,omitempty"`
+	SiteIcon         string  `json:"site_icon,omitempty"`
+	Date             string  `json:"date,omitempty"`
+	Author           string  `json:"author,omitempty"`
+	Authority        float64 `json:"authority,omitempty"`
+	Score            float64 `json:"score,omitempty"`
+	RerankScore      float64 `json:"rerank_score,omitempty"`
 }
 
 type searchResponse struct {
@@ -162,14 +216,23 @@ func (s *searcher) search(ctx context.Context, args map[string]any, _ pluginsdk.
 		return nil, errors.New("web 未配置 DeepSeek API Key：请在 插件 → 联网能力 中填写")
 	}
 	count := cfg.Count
+	requestedCount := count
 	if n := toInt(args["count"]); n > 0 {
 		count = n
+		requestedCount = n
 	}
 	if count < 1 {
 		count = 1
 	}
 	if count > 50 {
 		count = 50
+	}
+	budget := searchContentBudgetDefault
+	if n := toInt(args["max_content_bytes"]); n > 0 {
+		budget = n
+	}
+	if budget > searchContentBudgetMax {
+		budget = searchContentBudgetMax
 	}
 	needContent := cfg.NeedContent
 	if v, ok := args["need_content"].(bool); ok {
@@ -189,6 +252,7 @@ func (s *searcher) search(ctx context.Context, args map[string]any, _ pluginsdk.
 	}
 	var resp searchResponse
 	if err := json.Unmarshal(raw, &resp); err != nil {
+		s.record(0, err)
 		return nil, fmt.Errorf("搜索响应解析失败: %w", err)
 	}
 	items := resp.Results
@@ -201,8 +265,57 @@ func (s *searcher) search(ctx context.Context, args map[string]any, _ pluginsdk.
 	if items == nil {
 		items = []result{}
 	}
+	contentBytes, contentTruncated := applySearchContentBudget(items, budget)
 	s.record(len(items), nil)
-	return map[string]any{"provider": "deepseek", "results": items, "count": len(items)}, nil
+	out := map[string]any{
+		"provider": "deepseek", "results": items,
+		"count": len(items), "count_requested": requestedCount,
+		"content_bytes": contentBytes, "content_truncated": contentTruncated,
+	}
+	if len(items) == 0 {
+		out["note"] = "no_results"
+		out["hint"] = "未检索到结果，可放宽或改写 query，或降低 count 后重试。"
+	}
+	return out, nil
+}
+
+// applySearchContentBudget 按总字节预算截断各条 content（仅 need_content=true 时有内容），
+// 返回实际保留的正文总字节数与是否有条目被截断。snippet/summary 不受影响。
+func applySearchContentBudget(items []result, budget int) (int, bool) {
+	if budget <= 0 {
+		for i := range items {
+			if items[i].Content != "" {
+				items[i].Content = ""
+				items[i].ContentTruncated = true
+			}
+		}
+		return 0, len(items) > 0
+	}
+	remaining := budget
+	used := 0
+	truncated := false
+	for i := range items {
+		c := items[i].Content
+		if c == "" {
+			continue
+		}
+		if len(c) <= remaining {
+			used += len(c)
+			remaining -= len(c)
+			continue
+		}
+		truncated = true
+		if remaining <= 0 {
+			items[i].Content = ""
+			items[i].ContentTruncated = true
+			continue
+		}
+		items[i].Content = truncateUTF8(c, remaining)
+		items[i].ContentTruncated = true
+		used += len(items[i].Content)
+		remaining = 0
+	}
+	return used, truncated
 }
 
 // doAPI 调用 DeepSeek 工具 API（搜索 / 抓取共用）：Bearer 鉴权 + 可重试错误重试 3 次。
@@ -216,6 +329,9 @@ func (s *searcher) doAPI(ctx context.Context, cfg settings, path string, body ma
 	timeout := time.Duration(cfg.TimeoutSec) * time.Second
 	if timeout <= 0 {
 		timeout = 30 * time.Second
+	}
+	if timeout > apiAttemptTimeoutMax {
+		timeout = apiAttemptTimeoutMax
 	}
 	client := &http.Client{Timeout: timeout}
 	var lastErr error
@@ -238,8 +354,17 @@ func (s *searcher) doAPI(ctx context.Context, cfg settings, path string, body ma
 			lastErr = doErr
 			continue
 		}
-		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
+		raw, readErr := io.ReadAll(io.LimitReader(resp.Body, apiResponseMaxBytes+1))
 		_ = resp.Body.Close()
+		if readErr != nil {
+			return nil, fmt.Errorf("读取联网响应失败: %w", readErr)
+		}
+		if len(raw) > apiResponseMaxBytes {
+			if path == cfg.FetchPath {
+				return nil, fmt.Errorf("响应超过上限 %dMiB：该页面过大，请改用 web_download 下载后本地读取", apiResponseMaxBytes>>20)
+			}
+			return nil, fmt.Errorf("响应超过上限 %dMiB：请降低 count 或关闭 need_content，大文件请改用 web_download", apiResponseMaxBytes>>20)
+		}
 		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 			return raw, nil
 		}
@@ -253,7 +378,7 @@ func (s *searcher) doAPI(ctx context.Context, cfg settings, path string, body ma
 	if lastErr == nil {
 		lastErr = errors.New("联网服务不可用")
 	}
-	return nil, lastErr
+	return nil, fmt.Errorf("%w（可稍后重试；页面较大或需要原始内容请改用 web_download）", lastErr)
 }
 
 func friendlyError(code int, raw []byte) string {
@@ -354,6 +479,7 @@ func (s *searcher) downloadDir(_ context.Context, _ map[string]any) (any, error)
 		"overwrite":    cfg.DownloadOverwrite,
 		"fetchMaxMB":   cfg.FetchMaxMB,
 		"maxRedirects": cfg.MaxRedirects,
+		"allowPrivate": cfg.AllowPrivate,
 	}, nil
 }
 

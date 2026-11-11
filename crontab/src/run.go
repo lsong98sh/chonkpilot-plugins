@@ -16,7 +16,40 @@ const outputTailMax = 4 << 10
 // notifierBodyMax 是系统通知正文上限（rune）。
 const notifierBodyMax = 200
 
-// runner 执行一次任务的 action（run / notify）。
+// agentRunReq 是「以完整智能体执行 prompt」的宿主能力入参（plugin/v1/agent.run）。
+type agentRunReq struct {
+	WorkDir     string
+	InstanceID  string
+	SessionID   string
+	DialogID    string
+	SessionKind string
+	Prompt      string
+	AgentName   string
+	Title       string
+	DisplayName string
+	TimeoutSec  int
+}
+
+// agentRunResult 是宿主智能体执行结果。
+type agentRunResult struct {
+	OK        bool
+	Status    string // complete / incomplete / error / interrupted / cancelled
+	Finish    string
+	Text      string
+	Error     string
+	MS        int64
+	SessionID string
+	DialogID  string
+	TurnID    string
+}
+
+// agentHost 是宿主「无父轮次启动完整智能体」的能力面。nil = 宿主未提供（旧宿主 / 单测）
+// → agent 动作记为失败（不静默降级为无工具 LLM）。
+type agentHost interface {
+	RunAgent(ctx context.Context, req agentRunReq) (agentRunResult, error)
+}
+
+// runner 执行一次任务的 action（run / notify / agent）。
 type runner struct {
 	cfg      *configManager
 	notifier Notifier
@@ -29,6 +62,8 @@ type runner struct {
 	resolveSandbox func(ctx context.Context, workDir string) ([]string, error)
 	// sessions 是会话归属能力面（P4 / C11）。nil = 宿主未提供 / 单测 → 跳过归属（不阻断执行）。
 	sessions sessionHost
+	// agents 是宿主智能体执行能力面（action.type=agent）。nil = 宿主未提供 → 该动作失败并留痕。
+	agents agentHost
 }
 
 // execute 执行任务动作并返回运行记录（不落盘；调用方负责写 store / runs.jsonl）。
@@ -39,6 +74,8 @@ func (r *runner) execute(ctx context.Context, t Task, spec *ActionSpec) RunRecor
 		return r.runCommand(ctx, t, spec, now)
 	case ActionNotify:
 		return r.notify(t, spec, now)
+	case ActionAgent:
+		return r.runAgent(ctx, t, spec, now)
 	}
 	return RunRecord{TaskID: t.ID, At: now, Kind: spec.Type, OK: false, Error: "未知动作类型: " + spec.Type}
 }
@@ -91,6 +128,87 @@ func (r *runner) runCommand(ctx context.Context, t Task, spec *ActionSpec, now i
 	return rec
 }
 
+// runAgent 执行 agent 动作：经宿主 `plugin/v1/agent.run` 启动一个**无父轮次**的完整智能体轮次
+// （全工具面，可读项目文件 → 支持「定时代码审查」这类任务），等待收尾并记录结果。
+//
+// 会话归属：先确保「项目根会话 → 任务子会话」存在，再让宿主在该任务子会话里建轮次；
+// 结果正文写入 RunRecord.OutputTail（供任务详情 / 通知查看）。
+func (r *runner) runAgent(ctx context.Context, t Task, spec *ActionSpec, now int64) RunRecord {
+	rec := RunRecord{TaskID: t.ID, At: now, Kind: ActionAgent}
+	if spec == nil || spec.Agent == nil {
+		rec.Error = "agent 动作参数缺失"
+		return rec
+	}
+	if skip, ok := r.ensureProjectOpen(ctx, t, now); !ok {
+		return skip
+	}
+	ref, detail := r.beginCronSession(ctx, t)
+	rec.Detail = appendDetail(rec.Detail, detail)
+	rec.SessionID, rec.DialogID = ref.SessionID, ref.DialogID
+
+	if r.agents == nil {
+		rec.Error = "宿主未提供 plugin/v1/agent.run（无法执行智能体动作）"
+		return rec
+	}
+	timeoutSec := spec.Agent.TimeoutSec
+	if timeoutSec <= 0 {
+		timeoutSec = r.cfg.Settings().DefaultTimeoutSec
+	}
+	start := time.Now()
+	title := spec.Agent.Title
+	if title == "" {
+		title = t.Description
+	}
+	displayName := spec.Agent.DisplayName
+	if displayName == "" {
+		displayName = "定时任务"
+	}
+	res, err := r.agents.RunAgent(ctx, agentRunReq{
+		WorkDir:     strings.TrimSpace(t.CreatedBy.WorkDir),
+		InstanceID:  t.CreatedBy.InstanceID,
+		SessionID:   ref.SessionID,
+		DialogID:    ref.DialogID,
+		SessionKind: sessionKindCrontabTask,
+		Prompt:      spec.Agent.Prompt,
+		AgentName:   spec.Agent.Agent,
+		Title:       title,
+		DisplayName: displayName,
+		TimeoutSec:  timeoutSec,
+	})
+	rec.MS = time.Since(start).Milliseconds()
+	if err != nil {
+		rec.OK = false
+		rec.Error = err.Error()
+	} else {
+		rec.OK = res.OK
+		rec.OutputTail = strx.TruncBytes(strings.TrimSpace(res.Text), outputTailMax)
+		if res.Status != "" && !res.OK {
+			rec.Error = "智能体未完成（" + res.Status + "）"
+			if strings.TrimSpace(res.Error) != "" {
+				rec.Error += "：" + strings.TrimSpace(res.Error)
+			}
+		}
+		if res.SessionID != "" {
+			rec.SessionID = res.SessionID
+		}
+		if res.DialogID != "" {
+			rec.DialogID = res.DialogID
+		}
+		rec.TurnID = res.TurnID
+	}
+
+	if enabled, text := spec.AgentNotifySetting(); enabled {
+		body := buildAgentBody(t.Description, text, rec, res.Text)
+		if nerr := r.notifier.Notify("ChonkPilot 定时任务", body, ""); nerr != nil {
+			rec.Detail = appendDetail(rec.Detail, "notify_error: "+nerr.Error())
+			if r.logf != nil {
+				r.logf("crontab: 完成通知失败（task=%s）: %v", t.ID, nerr)
+			}
+		}
+	}
+	return rec
+}
+
 // notify 执行 notify 动作（系统通知）。
 func (r *runner) notify(t Task, spec *ActionSpec, now int64) RunRecord {
 	rec := RunRecord{TaskID: t.ID, At: now, Kind: ActionNotify, OK: true}
@@ -123,6 +241,26 @@ func (r *runner) ensureProjectOpen(ctx context.Context, t Task, now int64) (RunR
 		}, false
 	}
 	return RunRecord{}, true
+}
+
+// buildAgentBody 构造「智能体执行结束」的通知正文（附结果摘要，详情见任务子会话）。
+func buildAgentBody(desc, custom string, rec RunRecord, text string) string {
+	status := "执行成功"
+	if !rec.OK {
+		status = "执行失败"
+	}
+	prefix := "「" + desc + "」"
+	if strings.TrimSpace(custom) != "" {
+		prefix = strings.TrimSpace(custom)
+	}
+	body := fmt.Sprintf("%s %s（耗时 %dms）", prefix, status, rec.MS)
+	if snippet := strings.TrimSpace(text); snippet != "" {
+		body += "\n" + strx.TruncRunes(snippet, 120)
+	}
+	if rec.Error != "" {
+		body += "\n" + rec.Error
+	}
+	return strx.TruncRunes(body, notifierBodyMax)
 }
 
 // buildCompletionBody 构造「命令执行结束」的通知正文。

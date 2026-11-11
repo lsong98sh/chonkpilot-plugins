@@ -41,7 +41,9 @@ timeout: 600
     },
     "waitSec": {
       "type": "integer",
-      "description": "最多等待秒数；0/缺省 = 等到收尾"
+      "minimum": 0,
+      "maximum": 600,
+      "description": "最多等待秒数；0/缺省 = 等到收尾（受 600s 上限保护，超长任务请用 detach）。到期返回 state=running"
     },
     "detach": {
       "type": "boolean",
@@ -64,6 +66,9 @@ timeout: 600
 ```
 
 `state=running`（detach / 等待超时）**不返回正文**：用 `task_status(task_id=…)` 取终态结果。
+
+等待上限：`waitSec` 到期即返回 `state=running`；`waitSec=0/缺省` 最多等到 600s。需要更长任务时用
+`detach=true` 立即拿 `task_id`，再用 `task_status` 轮询，不要在单次调用里长时间阻塞。
 
 `state=error` 且 `code=LLM_INCOMPLETE` 表示子代理输出不完整（截断）；`partial` 仅为已产出的
 非终态内容，**不得当作最终回复**。子代理被取消时为 `state=cancelled`。只有 `state=done`

@@ -5,9 +5,12 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
+
+	"github.com/lsong98sh/chonkpilot-plugins/file/lib/filetool"
 )
 
 // ─── 测试桩：配置存储 ────────────────────────────────────────────
@@ -119,7 +122,7 @@ func TestHandleLoadDefaults(t *testing.T) {
 		t.Fatalf("handleLoad: %v", err)
 	}
 	values := res.(map[string]any)["values"].(map[string]string)
-	if values[KeyDefaultPurpose] != "文件操作" || values[KeyMaxTargets] != "200" {
+	if values[KeyMaxBytes] != "1048576" || values[KeyMaxTargets] != strconv.Itoa(filetool.TargetsHardLimit) {
 		t.Errorf("默认值错误：%v", values)
 	}
 	if values[KeyDefaultEncoding] != "" {
@@ -132,17 +135,17 @@ func TestHandleSaveWritesNamespaceAndReadsBack(t *testing.T) {
 	m := newTestManager(t, store, nil)
 	if _, err := m.handleSave(context.Background(), map[string]any{
 		"entries": map[string]any{
-			KeyDefaultPurpose:  "审查",
 			KeyDefaultEncoding: "UTF-8",
 			KeyMaxTargets:      "50",
+			KeyMaxBytes:        "2097152",
 		},
 	}); err != nil {
 		t.Fatalf("handleSave: %v", err)
 	}
 	want := map[string]string{
-		KeyDefaultPurpose:  "审查",
 		KeyDefaultEncoding: "utf-8",
 		KeyMaxTargets:      "50",
+		KeyMaxBytes:        "2097152",
 	}
 	for k, v := range want {
 		if got, ok := store.get(k); !ok || got != v {
@@ -150,7 +153,7 @@ func TestHandleSaveWritesNamespaceAndReadsBack(t *testing.T) {
 		}
 	}
 	cfg := m.Settings()
-	if cfg.DefaultPurpose != "审查" || cfg.DefaultEncoding != "utf-8" || cfg.MaxTargets != 50 {
+	if cfg.DefaultEncoding != "utf-8" || cfg.MaxTargets != 50 || cfg.MaxBytes != 2097152 {
 		t.Errorf("Settings = %+v", cfg)
 	}
 	res, err := m.handleLoad(context.Background(), nil)
@@ -170,12 +173,12 @@ func TestHandleSaveMergesPartial(t *testing.T) {
 		t.Fatalf("save #1: %v", err)
 	}
 	if _, err := m.handleSave(context.Background(), map[string]any{
-		"entries": map[string]any{KeyDefaultPurpose: "粘贴"},
+		"entries": map[string]any{KeyMaxBytes: "2097152"},
 	}); err != nil {
 		t.Fatalf("save #2: %v", err)
 	}
 	cfg := m.Settings()
-	if cfg.MaxTargets != 30 || cfg.DefaultPurpose != "粘贴" {
+	if cfg.MaxTargets != 30 || cfg.MaxBytes != 2097152 {
 		t.Errorf("部分保存丢失既有键：%+v", cfg)
 	}
 }
@@ -189,12 +192,13 @@ func TestHandleSaveValidationRejects(t *testing.T) {
 		value any
 		want  string
 	}{
-		{"purpose 为空", KeyDefaultPurpose, "  ", "不能为空"},
-		{"purpose 过长", KeyDefaultPurpose, strings.Repeat("字", 65), "过长"},
 		{"encoding 非法字符", KeyDefaultEncoding, "utf 8", "非法字符"},
 		{"maxTargets 下界", KeyMaxTargets, "0", "1–2000"},
 		{"maxTargets 上界", KeyMaxTargets, "2001", "1–2000"},
 		{"maxTargets 非数字", KeyMaxTargets, "abc", "1–2000"},
+		{"maxBytes 下界", KeyMaxBytes, "0", "1–33554432"},
+		{"maxBytes 上界", KeyMaxBytes, "33554433", "1–33554432"},
+		{"maxBytes 非数字", KeyMaxBytes, "abc", "1–33554432"},
 		{"未知键（旧键名）", "maxTargets", "50", "未知配置键"},
 		{"未知键（别家命名空间）", "plugins.mcp.default-limit", "10", "未知配置键"},
 	}
@@ -237,8 +241,11 @@ func TestHandleReset(t *testing.T) {
 	if store.len() != 0 || store.deletes != 1 {
 		t.Errorf("reset 应删存储：len=%d deletes=%d", store.len(), store.deletes)
 	}
-	if res.(map[string]any)["values"].(map[string]string)[KeyMaxTargets] != "200" {
+	if res.(map[string]any)["values"].(map[string]string)[KeyMaxTargets] != strconv.Itoa(filetool.TargetsHardLimit) {
 		t.Errorf("reset 后应回显默认：%v", res)
+	}
+	if res.(map[string]any)["values"].(map[string]string)[KeyMaxBytes] != "1048576" {
+		t.Errorf("reset 后 maxBytes 默认值错误：%v", res)
 	}
 }
 
@@ -253,7 +260,6 @@ func TestMigrateLegacyOnce(t *testing.T) {
 	}
 	_ = newTestManager(t, store, legacy)
 	want := map[string]string{
-		KeyDefaultPurpose:  "改写",
 		KeyDefaultEncoding: "gbk",
 		KeyMaxTargets:      "500",
 	}
@@ -284,38 +290,56 @@ func TestMigrateSkipsDefaults(t *testing.T) {
 
 func TestApplyDefaultsUsesSettings(t *testing.T) {
 	m := newTestManager(t, newMemStore(map[string]string{
-		KeyDefaultPurpose:  "审查",
 		KeyDefaultEncoding: "utf-8",
 		KeyMaxTargets:      "2",
+		KeyMaxBytes:        "2097152",
 	}), nil)
 	f := &filePlugin{cfg: m}
 
+	// 超出配置上限 → 参数错误，且不静默截断 targets。
 	args := map[string]any{"targets": []any{
 		map[string]any{"path": "a"},
 		map[string]any{"path": "b", "encoding": "gbk"},
 		map[string]any{"path": "c"},
 	}}
-	f.applyDefaults(args)
-	if args["purpose"] != "审查" {
-		t.Errorf("默认 purpose 未生效：%v", args)
+	err := f.applyDefaults(args)
+	if err == nil || !strings.Contains(err.Error(), "exceeds plugins.file.max-targets 2") {
+		t.Fatalf("超限应参数错误，err=%v", err)
+	}
+	if got := len(args["targets"].([]any)); got != 3 {
+		t.Fatalf("超限不应截断 targets，got %d", got)
+	}
+
+	// 未超限：注入默认 encoding（显式项不覆盖）与 maxBytes。
+	args = map[string]any{"targets": []any{
+		map[string]any{"path": "a"},
+		map[string]any{"path": "b", "encoding": "gbk"},
+	}}
+	if err := f.applyDefaults(args); err != nil {
+		t.Fatalf("未超限不应报错: %v", err)
+	}
+	if args["maxBytes"] != 2097152 {
+		t.Errorf("默认 maxBytes 未生效：%v", args)
 	}
 	targets := args["targets"].([]any)
-	if len(targets) != 2 {
-		t.Fatalf("targets 截断 = %d，期望 2", len(targets))
-	}
 	t0 := targets[0].(map[string]any)
 	t1 := targets[1].(map[string]any)
-	if t0["encoding"] != "utf-8" {
-		t.Errorf("默认 encoding 应注入缺省 target：%v", t0)
+	if args["defaultEncoding"] != "utf-8" {
+		t.Errorf("默认字符集应注入顶层 defaultEncoding：%v", args)
+	}
+	if _, has := t0["encoding"]; has {
+		t.Errorf("默认字符集不应改写 target encoding：%v", t0)
 	}
 	if t1["encoding"] != "gbk" {
 		t.Errorf("显式 target encoding 不应被覆盖：%v", t1)
 	}
 
 	// 显式入参优先（LLM 可逐次覆盖）。
-	args = map[string]any{"purpose": "自定", "targets": []any{map[string]any{"path": "a"}}}
-	f.applyDefaults(args)
-	if args["purpose"] != "自定" {
+	args = map[string]any{"maxBytes": 4096, "targets": []any{map[string]any{"path": "a"}}}
+	if err := f.applyDefaults(args); err != nil {
+		t.Fatal(err)
+	}
+	if args["maxBytes"] != 4096 {
 		t.Errorf("显式入参应优先：%v", args)
 	}
 }

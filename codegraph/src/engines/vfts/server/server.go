@@ -146,9 +146,9 @@ var toolSpecs = []toolSpec{
 	{
 		Name: "vfts_query",
 		Description: "在 vfts 全文索引中检索：match 为自然语言匹配串，query 为布尔/高级表达式" +
-			"（二者至少给其一，query 不支持字段前缀）。scope=file（默认）检索文件：返回命中文件 + 片段/行号" +
-			"（topK，按相关度）；scope=session 检索**会话正文索引**：按 ts 升序返回命中消息" +
-			"（session_id/dialog_id/turn_id/message_id/role/ts/snippet/score），snippet 为命中词前后约 240 字符正文。",
+			"（二者互斥，至少给其一；query 不支持字段前缀）。scope=file（默认）检索文件：返回命中文件 + 片段/行号" +
+			"（topK<=100，按相关度）；scope=session 检索**会话正文索引**：按相关度取 topK 后按 ts 升序展示" +
+			"（session_id/dialog_id/turn_id/message_id/role/ts/snippet/score），snippet 约 240 字符。返回 total/returned/truncated。",
 		Props: map[string]any{
 			"workdir":    map[string]any{"type": "string", "description": "项目根目录"},
 			"scope":      map[string]any{"type": "string", "enum": []string{"file", "session"}, "description": "检索范围（默认 file；session = 会话正文索引）"},
@@ -156,7 +156,7 @@ var toolSpecs = []toolSpec{
 			"role":       map[string]any{"type": "string", "enum": []string{"user", "assistant"}, "description": "scope=session 时按角色过滤（缺省 = 两者）"},
 			"match":      map[string]any{"type": "string", "description": "自然语言匹配串（如：全文索引）"},
 			"query":      map[string]any{"type": "string", "description": "布尔/高级表达式（如：fox AND brown；不支持 content: 字段前缀）"},
-			"topK":       map[string]any{"type": "integer", "description": "返回命中数上限（默认 20）"},
+			"topK":       map[string]any{"type": "integer", "minimum": 1, "maximum": 100, "description": "返回上限（默认 20，上限 100）"},
 			"path":       map[string]any{"type": "string", "description": "文件路径子串过滤（可选，scope=file）"},
 		},
 		Required: []string{"workdir"},
@@ -348,13 +348,22 @@ func getIncrementalRemoves(args map[string]any, k string) []IncrementalRemove {
 	return out
 }
 
-// needWS 从 args 取 workdir 并打开工作区。
+// needWS 从 args 取 workdir 并打开工作区（写路径：确保落盘目录存在）。
 func needWS(args map[string]any) (*Workspace, error) {
 	wd := getString(args, "workdir")
 	if wd == "" {
 		return nil, fmt.Errorf("缺少 workdir（项目根目录绝对路径）")
 	}
 	return Open(wd)
+}
+
+// needWSReadOnly 查询路径：只复用/载入已有工作区，不创建落盘目录。
+func needWSReadOnly(args map[string]any) (*Workspace, error) {
+	wd := getString(args, "workdir")
+	if wd == "" {
+		return nil, fmt.Errorf("缺少 workdir（项目根目录绝对路径）")
+	}
+	return OpenReadOnly(wd)
 }
 
 // 查询门在「有待索引项」时的有界等待参数（包级变量便于测试覆写）。
@@ -411,11 +420,13 @@ func gateIndexStatus(workDir string) (any, bool) {
 
 // readyGate 查询类统一门：返回 (应答, workspace, 是否就绪)。
 // 未就绪时返回结构化应答，不视为协议错误。
+//
+// 查询路径只读：OpenReadOnly 不建落盘目录（EnsureReady 仅载入已有集合，不重建索引）。
 func readyGate(args map[string]any) (any, *Workspace, bool) {
 	if resp, blocked := gateIndexStatus(getString(args, "workdir")); blocked {
 		return resp, nil, false
 	}
-	w, err := needWS(args)
+	w, err := needWSReadOnly(args)
 	if err != nil {
 		return map[string]any{"status": "error", "message": err.Error()}, nil, false
 	}
@@ -429,7 +440,7 @@ func readyGate(args map[string]any) (any, *Workspace, bool) {
 		return map[string]any{
 			"status": "pending", "state": "indexing",
 			"done": s.ProgressDone, "total": s.ProgressTotal,
-			"message": "vfts 全文索引仍在构建中，请稍后重试或先 vfts_index",
+			"message": "vfts 全文索引仍在构建中，请稍后重试（或在『代码知识库』设置页查看进度）",
 		}, w, false
 	case "error":
 		msg := s.Err
@@ -442,7 +453,7 @@ func readyGate(args map[string]any) (any, *Workspace, bool) {
 	default:
 		return map[string]any{
 			"status": "not_initialized", "state": st,
-			"message": "该项目尚未初始化 vfts 全文索引，请先 vfts_index {workdir}",
+			"message": "该项目尚未初始化 vfts 全文索引，请稍后重试（或在『代码知识库』设置页开启全文索引）",
 		}, w, false
 	}
 }
@@ -519,7 +530,7 @@ func toolIndex(_ context.Context, args map[string]any) (any, error) {
 }
 
 func toolStatus(_ context.Context, args map[string]any) (any, error) {
-	w, err := needWS(args)
+	w, err := needWSReadOnly(args)
 	if err != nil {
 		return nil, err
 	}
@@ -529,54 +540,117 @@ func toolStatus(_ context.Context, args map[string]any) (any, error) {
 
 // ---- 查询工具实现 ----
 
+// vftsMaxTopK 单次查询返回上限（file=文件数，session=消息条数）。
+const vftsMaxTopK = 100
+
 func toolQuery(_ context.Context, args map[string]any) (any, error) {
-	if getString(args, "scope") == "session" {
+	scope := strings.ToLower(strings.TrimSpace(getString(args, "scope")))
+	switch scope {
+	case "":
+		scope = "file"
+	case "session":
 		return toolSessionQuery(args)
+	case "file":
+	default:
+		return nil, fmt.Errorf("scope 只允许 file / session（收到 %q）", scope)
 	}
 	resp, w, ok := readyGate(args)
 	if !ok {
 		return resp, nil
 	}
-	match := getString(args, "match")
-	expr := getString(args, "query")
+	match := strings.TrimSpace(getString(args, "match"))
+	expr := strings.TrimSpace(getString(args, "query"))
 	if match == "" && expr == "" {
 		return nil, fmt.Errorf("需要 match 或 query 至少其一")
 	}
+	if match != "" && expr != "" {
+		return nil, fmt.Errorf("match 与 query 互斥（只给其一）")
+	}
 	topK := getInt(args, "topK", 20)
-	hits, err := w.Query(match, expr, topK, getString(args, "path"))
+	if topK <= 0 {
+		topK = 20
+	}
+	if topK > vftsMaxTopK {
+		topK = vftsMaxTopK
+	}
+	hits, matched, truncated, err := w.QueryPage(match, expr, topK, getString(args, "path"))
 	if err != nil {
 		return nil, err
 	}
-	return map[string]any{"workdir": w.Dir, "total": len(hits), "hits": hits}, nil
+	out := map[string]any{
+		"workdir": w.Dir, "scope": "file", "topK": topK,
+		"returned": len(hits), "total": matched, "truncated": truncated,
+		"score_kind": "zvec_fts_raw", "line_kind": "chunk_start_plus_offset",
+		"hits": hits,
+	}
+	if len(hits) == 0 {
+		out["note"] = "no_hits"
+	}
+	return out, nil
 }
 
 // toolSessionQuery 会话正文检索（scope=session）：未初始化走结构化应答（不算协议错误）。
 func toolSessionQuery(args map[string]any) (any, error) {
-	w, err := needWS(args)
+	w, err := needWSReadOnly(args)
 	if err != nil {
 		return nil, err
 	}
-	match := getString(args, "match")
-	expr := getString(args, "query")
+	match := strings.TrimSpace(getString(args, "match"))
+	expr := strings.TrimSpace(getString(args, "query"))
 	if match == "" && expr == "" {
 		return nil, fmt.Errorf("需要 match 或 query 至少其一")
+	}
+	if match != "" && expr != "" {
+		return nil, fmt.Errorf("match 与 query 互斥（只给其一）")
 	}
 	role := strings.ToLower(strings.TrimSpace(getString(args, "role")))
 	if role != "" && role != "user" && role != "assistant" {
 		return nil, fmt.Errorf("role 只允许 user / assistant（收到 %q）", role)
 	}
-	hits, err := w.QuerySessions(match, expr, getInt(args, "topK", 20), getString(args, "session_id"), role)
+	topK := getInt(args, "topK", 20)
+	if topK <= 0 {
+		topK = 20
+	}
+	if topK > vftsMaxTopK {
+		topK = vftsMaxTopK
+	}
+	sessionID := strings.TrimSpace(getString(args, "session_id"))
+	hits, matched, truncated, filterApplied, err := w.QuerySessionsPage(match, expr, topK, sessionID, role)
 	if err != nil {
 		if errors.Is(err, ErrSessionNotInitialized) {
 			return map[string]any{
 				"status": "not_initialized", "state": "not_initialized",
 				"message": "该项目尚未建立会话内容索引（请先在 vfts 配置页开启「会话内容检索」或重建会话索引）",
-				"workdir": w.Dir, "total": 0, "hits": []SessionHit{},
+				"workdir": w.Dir, "scope": "session", "topK": topK,
+				"returned": 0, "total": 0, "truncated": false, "hits": []SessionHit{},
 			}, nil
 		}
 		return nil, err
 	}
-	return map[string]any{"workdir": w.Dir, "total": len(hits), "hits": hits}, nil
+	out := map[string]any{
+		"workdir": w.Dir, "scope": "session", "topK": topK,
+		"returned": len(hits), "total": matched, "truncated": truncated,
+		"score_kind": "zvec_fts_raw",
+		"hits":       hits,
+	}
+	var hints []string
+	if sessionID != "" {
+		out["session_filter_applied"] = filterApplied
+		if !filterApplied {
+			hints = append(hints, "服务端 session_id 过滤不可用，已回退为全量候选内本地过滤；目标会话可能少召回。")
+		}
+	}
+	if p := strings.TrimSpace(getString(args, "path")); p != "" {
+		out["path_ignored"] = true
+	}
+	if len(hits) == 0 {
+		out["note"] = "no_hits"
+		hints = append(hints, "无命中：可换关键词/缩小范围；子会话消息可能未建立会话索引。")
+	}
+	if len(hints) > 0 {
+		out["hint"] = strings.Join(hints, " ")
+	}
+	return out, nil
 }
 
 // ---- 会话索引管理工具实现 ----

@@ -54,9 +54,9 @@ func parseEnvelope(t *testing.T, out string) execEnvelope {
 	return env
 }
 
-// fileArgs 构造 file 域工具入参 {purpose, targets:[target]}。
+// fileArgs 构造 file 域工具入参 {targets:[target]}。
 func fileArgs(target map[string]any) map[string]any {
-	return map[string]any{"purpose": "路径约束测试", "targets": []any{target}}
+	return map[string]any{"targets": []any{target}}
 }
 
 func writeTmp(t *testing.T, name, content string) string {
@@ -90,14 +90,21 @@ func TestRejectRelativePaths(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			isErr, out := runFile(t, tc.tool, tc.args)
-			if !isErr {
-				t.Fatalf("相对路径应失败，got out=%q", out)
+			if isErr {
+				t.Fatalf("单目标失败不应整体 isError，out=%q", out)
 			}
-			if !strings.Contains(out, tc.want) {
-				t.Fatalf("错误消息应含原值 %q，got out=%q", tc.want, out)
+			env := parseEnvelope(t, out)
+			if len(env.Results) != 1 || env.Results[0].Status != "failed" {
+				t.Fatalf("相对路径应记该项 failed，got=%+v out=%q", env.Results, out)
 			}
-			if !strings.Contains(out, "绝对路径") {
-				t.Fatalf("错误消息应含路径约束说明，got out=%q", out)
+			if !strings.Contains(env.Results[0].Error, tc.want) {
+				t.Fatalf("错误消息应含原值 %q，got=%q", tc.want, env.Results[0].Error)
+			}
+			if !strings.Contains(env.Results[0].Error, "绝对路径") {
+				t.Fatalf("错误消息应含路径约束说明，got=%q", env.Results[0].Error)
+			}
+			if env.Summary.Failed != 1 {
+				t.Fatalf("summary 应记 failed=1，got=%+v", env.Summary)
 			}
 		})
 	}
