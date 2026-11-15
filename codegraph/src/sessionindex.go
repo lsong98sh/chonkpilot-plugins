@@ -1,11 +1,12 @@
 // sessionindex.go —— 会话内容全文索引（SESSION-FTS，2B-vfts §3.5）的插件侧编排。
 //
 // 职责（引擎只做存取，编排全在插件）：
-//   - 增量：订阅既有 `session-complete`（零新增字段）→ 只处理**主会话**（parents 为空，
-//     且必要时 data-session-get 校验 parent_id 为空）→ 按会话去抖 → 按轮拉该轮消息正文
-//     → 转 doc 调引擎 `vfts_session_index`（按 message_id 先删后插，幂等）。
-//   - 全量：`vfts.session.reindex` → 后台扫当前项目全部主会话（data-session-list）→ 逐会话
-//     `data-session-history` 分页（before_turn_id）→ 写会话集合；`state.json` 记每会话
+//   - 增量：订阅既有 `session-complete` → 处理**所有会话**（主会话 + 子会话 / 委派轮次）
+//     → 按会话去抖 → 按轮拉该轮消息正文 → 转 doc 调引擎 `vfts_session_index`
+//     （按 message_id 先删后插，幂等）；工具结果（role=tool / tool_pair）也入索引。
+//   - 全量：`vfts.session.reindex` → 后台经 `plugin/v1/session.browse(include_sub=true)`
+//     扫当前项目全部会话 → 逐会话 `data-session-history` 分页（before_turn_id）→ 写会话集合；
+//     `state.json` 记每会话
 //     `indexed_until_turn`（游标由引擎写入）→ 中断后再次重建可断点续建。
 //   - 查询：`vfts.session.query`（UI 会话内查找）→ 直调引擎 `vfts_query{scope:session}`。
 //   - 收口：配置键 `plugins.codegraph.vfts.sessions` 关闭 → 清空该 workdir 的会话集合。
@@ -30,8 +31,8 @@ import (
 // 消息面（61-消息一览）：会话索引相关。
 const (
 	subjectSessionHistory = "plugin/v1/session.history" // → data-session-history
-	subjectSessionList    = "plugin/v1/session.list"    // → data-session-list
-	subjectSessionGet     = "plugin/v1/session.get"     // → data-session-get（校验 parent_id）
+	subjectSessionList    = "plugin/v1/session.list"    // → data-session-list（旧宿主回落；仅主会话）
+	subjectSessionBrowse  = "plugin/v1/session.browse"  // → 全部会话（含子会话；SESSION-QUERY-1）
 	subjectToolNotify     = "plugin/v1/tool.notify"     // → tool-notify（既有通知面）
 
 	noticeSessionIndexDone   = "session-index-done"
@@ -129,7 +130,7 @@ func (m *configManager) sessionsEnabled(ctx context.Context, instanceID string) 
 // 增量：session-complete
 // ---------------------------------------------------------------------------
 
-// onSessionComplete 处理轮末事件：只处理主会话（parents 为空），按会话去抖后增量写会话索引。
+// onSessionComplete 处理轮末事件：主会话与子会话（委派 / session_create）都索引。
 func (x *sessionIndexer) onSessionComplete(payload []byte) {
 	var ev sessionCompleteEvent
 	if json.Unmarshal(payload, &ev) != nil {
@@ -137,9 +138,6 @@ func (x *sessionIndexer) onSessionComplete(payload []byte) {
 	}
 	if ev.InstanceID == "" || ev.Session == "" || ev.Turn == "" || ev.WorkDir == "" {
 		return
-	}
-	if len(ev.Parents) > 0 {
-		return // 子轮次（父链非空）不入会话正文索引
 	}
 	key := normalizeWorkdir(ev.WorkDir) + "|" + ev.Session
 	x.mu.Lock()
@@ -188,10 +186,6 @@ func (x *sessionIndexer) indexTurns(task sessionTurnTask) {
 	if wd := x.m.workdirOf(task.InstanceID); wd != "" && !samePath(wd, task.WorkDir) {
 		return
 	}
-	// 兜底校验：会话行 parent_id 非空 = 子会话 → 不入会话正文索引（主会话才索引）。
-	if parent, err := x.sessionParent(ctx, task.InstanceID, task.SessionID, task.DialogID); err == nil && parent != "" {
-		return
-	}
 	docs := make([]vfts.SessionDoc, 0, 8)
 	for _, turn := range task.Turns {
 		msgs, err := x.fetchTurnMessages(ctx, task.InstanceID, task.SessionID, task.DialogID, turn)
@@ -224,25 +218,6 @@ func (x *sessionIndexer) call(ctx context.Context, method string, payload map[st
 		return nil, fmt.Errorf("插件通道未装配")
 	}
 	return x.m.p.Call(ctx, method, payload)
-}
-
-// sessionParent 经 `plugin/v1/session.get` 读会话父 id（空 = 主会话；读失败 → error）。
-func (x *sessionIndexer) sessionParent(ctx context.Context, instanceID, sessionID, dialogID string) (string, error) {
-	payload := map[string]any{"instance_id": instanceID, "session_id": sessionID}
-	if dialogID != "" {
-		payload["dialog_id"] = dialogID
-	}
-	raw, err := x.call(ctx, subjectSessionGet, payload)
-	if err != nil {
-		return "", err
-	}
-	var root struct {
-		Data map[string]any `json:"data"`
-	}
-	if err := json.Unmarshal(raw, &root); err != nil {
-		return "", err
-	}
-	return pluginsdk.Str(root.Data["parent_id"]), nil
 }
 
 // fetchTurnMessages 读某轮的消息视图行（含 message_id / created_at / type / content）。
@@ -282,7 +257,7 @@ func (x *sessionIndexer) fetchTurnMessages(ctx context.Context, instanceID, sess
 // 全量重建
 // ---------------------------------------------------------------------------
 
-// fullRebuild 后台重建某 workdir 的全部主会话索引（可被新的重建覆盖/取消）。
+// fullRebuild 后台重建某 workdir 的全部会话索引（含子会话；可被新的重建覆盖/取消）。
 func (x *sessionIndexer) fullRebuild(workdir, instanceID string) {
 	wd := normalizeWorkdir(workdir)
 	if wd == "" {
@@ -326,9 +301,9 @@ func (x *sessionIndexer) fullRebuild(workdir, instanceID string) {
 	x.notify(instanceID, wd, noticeSessionIndexDone, "会话内容索引已重建完成")
 }
 
-// runFullRebuild 逐会话（data-session-list → data-session-history 分页）重建。
+// runFullRebuild 逐会话（session.browse → session.history 分页）重建（含子会话）。
 func (x *sessionIndexer) runFullRebuild(ctx context.Context, workdir, instanceID string) error {
-	sessions, err := x.mainSessions(ctx, instanceID)
+	sessions, err := x.allSessions(ctx, workdir, instanceID)
 	if err != nil {
 		return err
 	}
@@ -355,13 +330,55 @@ func (x *sessionIndexer) runFullRebuild(ctx context.Context, workdir, instanceID
 	return nil
 }
 
-// sessionRef 会话行（主会话）的最小字段。
+// sessionRef 会话行的最小字段。
 type sessionRef struct {
 	SessionID string
 	DialogID  string
 }
 
-// mainSessions 取当前项目全部**主会话**（parent_id 为空）。
+// allSessions 取当前项目全部会话（主会话 + 子会话）。
+//
+// 首选宿主 `plugin/v1/session.browse(include_sub=true)`（SESSION-QUERY-1，含对话库 id）；
+// 旧宿主无该方法 → 回落 `data-session-list`（仅主会话，至少不中断索引）。
+func (x *sessionIndexer) allSessions(ctx context.Context, workdir, instanceID string) ([]sessionRef, error) {
+	out := make([]sessionRef, 0, 32)
+	seen := map[string]bool{}
+	offset := 0
+	for {
+		res, err := x.call(ctx, subjectSessionBrowse, map[string]any{
+			"instance_id": instanceID,
+			"work_dir":    workdir,
+			"include_sub": true,
+			"limit":       200,
+			"offset":      offset,
+		})
+		if err != nil {
+			return x.mainSessions(ctx, instanceID)
+		}
+		var root struct {
+			Sessions []map[string]any `json:"sessions"`
+			Total    int              `json:"total"`
+		}
+		if err := json.Unmarshal(res, &root); err != nil {
+			return nil, fmt.Errorf("session.browse 应答解析失败: %w", err)
+		}
+		for _, row := range root.Sessions {
+			sid := pluginsdk.Str(row["session_id"])
+			if sid == "" || seen[sid] {
+				continue
+			}
+			seen[sid] = true
+			out = append(out, sessionRef{SessionID: sid, DialogID: pluginsdk.Str(row["dialog_id"])})
+		}
+		offset += len(root.Sessions)
+		if len(root.Sessions) == 0 || offset >= root.Total {
+			break
+		}
+	}
+	return out, nil
+}
+
+// mainSessions 取当前项目全部**主会话**（旧宿主回落；parent_id 为空）。
 func (x *sessionIndexer) mainSessions(ctx context.Context, instanceID string) ([]sessionRef, error) {
 	res, err := x.call(ctx, subjectSessionList, map[string]any{"instance_id": instanceID})
 	if err != nil {
@@ -518,19 +535,27 @@ func sessionDocsOf(sessionID, dialogID string, msgs []map[string]any) []vfts.Ses
 
 // sessionDocOf 单条消息视图行 → doc；不入索引 → (zero,false)。
 //
-// 过滤：role ∈ {user, assistant} 且 type=text（工具卡片 type=tool_pair、思维链 type=reasoning、
-// system 全部排除）；正文为空 → 不入索引。
+// 过滤：
+//   - 普通消息：role ∈ {user, assistant} 且 type=text（缺省）；思维链 type=reasoning / system 排除；
+//   - 工具结果：role=tool（历史视图 type=tool_pair）→ 索引 `tool + arguments + result`
+//     （result 优先，缺失用 result_simplified），让"工具跑出过什么"可被检索；
+//   - 正文为空 → 不入索引。
 func sessionDocOf(sessionID, dialogID string, m map[string]any) (vfts.SessionDoc, bool) {
 	role := strings.ToLower(pluginsdk.Str(m["role"]))
-	if role != "user" && role != "assistant" {
-		return vfts.SessionDoc{}, false
-	}
-	switch typ := pluginsdk.Str(m["type"]); typ {
-	case "", "text":
+	typ := strings.ToLower(pluginsdk.Str(m["type"]))
+	var text string
+	switch {
+	case role == "tool" || typ == "tool_pair":
+		role = "tool"
+		text = toolPairDocText(m)
+	case role == "user" || role == "assistant":
+		if typ != "" && typ != "text" {
+			return vfts.SessionDoc{}, false
+		}
+		text = strings.TrimSpace(pluginsdk.Str(m["content"]))
 	default:
 		return vfts.SessionDoc{}, false
 	}
-	text := strings.TrimSpace(pluginsdk.Str(m["content"]))
 	messageID := pluginsdk.Str(m["message_id"])
 	if text == "" || messageID == "" {
 		return vfts.SessionDoc{}, false
@@ -546,6 +571,42 @@ func sessionDocOf(sessionID, dialogID string, m map[string]any) (vfts.SessionDoc
 		TS:        parseCreatedAt(pluginsdk.Str(m["created_at"])),
 		Text:      text,
 	}, true
+}
+
+// toolPairDocText 拼工具卡片可检索文本：工具名 + 参数 + 结果。
+//
+// 结果可能很大（stdout / 文件内容），截断到 16k 字符；参数截断到 2k。结果缺失时回落到
+// `result_simplified` / `brief`，保证至少能按工具名与摘要命中。
+func toolPairDocText(m map[string]any) string {
+	tool := strings.TrimSpace(pluginsdk.Str(m["tool"]))
+	args := truncateRunes(strings.TrimSpace(pluginsdk.Str(m["arguments"])), 2048)
+	result := strings.TrimSpace(pluginsdk.Str(m["result"]))
+	if result == "" {
+		result = strings.TrimSpace(pluginsdk.Str(m["result_simplified"]))
+	}
+	if result == "" {
+		result = strings.TrimSpace(pluginsdk.Str(m["brief"]))
+	}
+	result = truncateRunes(result, 16384)
+	parts := make([]string, 0, 3)
+	for _, part := range []string{tool, args, result} {
+		if part != "" {
+			parts = append(parts, part)
+		}
+	}
+	return strings.Join(parts, "\n")
+}
+
+// truncateRunes 按 rune 截断（不切断多字节字符）。
+func truncateRunes(s string, max int) string {
+	if max <= 0 {
+		return s
+	}
+	r := []rune(s)
+	if len(r) <= max {
+		return s
+	}
+	return string(r[:max]) + "…"
 }
 
 // parseCreatedAt RFC3339Nano → UnixMilli（解析失败 → 0）。

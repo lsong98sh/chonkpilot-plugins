@@ -30,6 +30,10 @@ func (f *fakeSessionPlane) call(_ context.Context, method string, payload map[st
 	switch method {
 	case subjectSessionList:
 		return json.Marshal(map[string]any{"list": f.sessions})
+	case subjectSessionBrowse:
+		return json.Marshal(map[string]any{
+			"sessions": f.sessions, "total": len(f.sessions), "scanned_users": 1, "truncated": false,
+		})
 	case subjectSessionHistory:
 		sid, _ := payload["session_id"].(string)
 		msgs := f.history[sid]
@@ -46,8 +50,6 @@ func (f *fakeSessionPlane) call(_ context.Context, method string, payload map[st
 		return json.Marshal(map[string]any{"messages": map[string]any{
 			"turns": turns, "messages": msgs, "has_more": false,
 		}})
-	case subjectSessionGet:
-		return json.Marshal(map[string]any{"data": map[string]any{"parent_id": ""}})
 	}
 	return nil, fmt.Errorf("未预期的能力调用 %s", method)
 }
@@ -282,14 +284,19 @@ func TestReconcileSkipsWhenEngineNotReady(t *testing.T) {
 	}
 }
 
-// TestReconcileIgnoresSubSessions：子会话（parent_id 非空）不参与对账。
-func TestReconcileIgnoresSubSessions(t *testing.T) {
+// TestReconcileIncludesSubSessions：子会话（parent_id 非空）同样参与对账与索引。
+func TestReconcileIncludesSubSessions(t *testing.T) {
 	idx, plane, eng, _ := newReconcileHarness(t, map[string]vfts.SessionCursor{})
 	plane.sessions = []map[string]any{{"session_id": "sub", "dialog_id": "d1", "parent_id": "s1"}}
+	plane.history["sub"] = []map[string]any{sessionMsg("m1", "t1", "assistant", "子会话结论")}
 
 	st := idx.reconcileWorkdir(context.Background(), `E:\proj`, "inst-1")
-	if st.Sessions != 0 || eng.count("vfts_session_index") != 0 {
-		t.Fatalf("子会话不应进索引：%+v calls=%v", st, eng.names)
+	if st.Sessions != 1 || eng.count("vfts_session_index") != 1 {
+		t.Fatalf("子会话应进索引：%+v calls=%v", st, eng.names)
+	}
+	docs, _ := eng.arg("vfts_session_index", 0)["docs"].([]vfts.SessionDoc)
+	if len(docs) != 1 || docs[0].SessionID != "sub" {
+		t.Fatalf("子会话 doc 不符：%+v", docs)
 	}
 }
 

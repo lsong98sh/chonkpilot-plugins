@@ -2,10 +2,11 @@ package main
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 )
 
-// TestSessionDocOfFilters：只索引 role ∈ {user,assistant} 且 type=text（缺省）的非空正文。
+// TestSessionDocOfFilters：普通消息 role ∈ {user,assistant} 且 type=text；工具结果也入索引。
 func TestSessionDocOfFilters(t *testing.T) {
 	base := map[string]any{
 		"role": "user", "type": "text", "message_id": "m1", "turn_id": "t1",
@@ -22,9 +23,24 @@ func TestSessionDocOfFilters(t *testing.T) {
 		t.Fatalf("created_at 应解析为 UnixMilli：%d", d.TS)
 	}
 
+	// 工具结果：role=tool（历史视图 type=tool_pair）→ 工具名 + 参数 + 结果可检索。
+	toolDoc := map[string]any{
+		"role": "tool", "type": "tool_pair", "message_id": "m3", "turn_id": "t1",
+		"created_at": "2026-11-01T10:00:00.000000001Z",
+		"tool":       "task_run",
+		"arguments":  `{"command":"go test ./..."}`,
+		"result":     "ok  github.com/x/y  1.2s",
+	}
+	td, ok := sessionDocOf("s1", "d1", toolDoc)
+	if !ok {
+		t.Fatal("工具结果应入索引")
+	}
+	if td.Role != "tool" || !strings.Contains(td.Text, "go test") || !strings.Contains(td.Text, "ok  github") {
+		t.Fatalf("工具 doc 文本不符：%+v", td)
+	}
+
 	cases := []map[string]any{
-		{"role": "tool", "message_id": "m2", "content": "x"},                           // 工具结果
-		{"role": "assistant", "type": "tool_pair", "message_id": "m3", "content": "x"}, // 工具卡片
+		{"role": "tool", "message_id": "m2", "content": "x"},                           // 工具行但无 tool/result
 		{"role": "assistant", "type": "reasoning", "message_id": "m4", "content": "x"}, // 思维链
 		{"role": "user", "type": "text", "message_id": "m5", "content": "   "},         // 空正文
 		{"role": "user", "type": "text", "content": "无 id"},                            // 缺 message_id
@@ -98,8 +114,8 @@ func TestSessionsConfigKey(t *testing.T) {
 	}
 }
 
-// TestOnSessionCompleteIgnoresSubSession：子轮次（parents 非空）不进入待索引队列。
-func TestOnSessionCompleteIgnoresSubSession(t *testing.T) {
+// TestOnSessionCompleteAcceptsSubSession：子轮次（parents 非空）同样进入待索引队列。
+func TestOnSessionCompleteAcceptsSubSession(t *testing.T) {
 	store := newFakeStore(map[string]string{})
 	mgr := newTestManager(store, map[string]string{"inst-1": `E:\proj`}, nil, nil, t)
 	mgr.sessions = newSessionIndexer(mgr)
@@ -111,9 +127,14 @@ func TestOnSessionCompleteIgnoresSubSession(t *testing.T) {
 	})
 	idx.onSessionComplete(payload)
 	idx.mu.Lock()
-	defer idx.mu.Unlock()
-	if len(idx.pending) != 0 {
-		t.Fatalf("子轮次不应入队：%+v", idx.pending)
+	n := len(idx.pending)
+	for k, tm := range idx.timers {
+		tm.Stop()
+		delete(idx.timers, k)
+	}
+	idx.mu.Unlock()
+	if n != 1 {
+		t.Fatalf("子轮次应入队：%+v", idx.pending)
 	}
 }
 

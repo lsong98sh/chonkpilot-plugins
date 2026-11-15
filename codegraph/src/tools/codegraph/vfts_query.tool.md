@@ -15,9 +15,9 @@ hot: true
 在 vfts 全文索引中检索：`match` 为自然语言匹配串，`query` 为布尔/高级表达式（**二者互斥，至少给其一**；query 不支持字段前缀）。
 
 - `scope=file`（默认）检索文件：返回命中文件 + 片段/行号，按相关度；`path` 为大小写不敏感的子串过滤。
-- `scope=session` 检索**会话正文索引**：按相关度取 `topK` 条，再按 `ts` 升序展示（便于会话内上下文）；`role` 可过滤 user/assistant。
+- `scope=session` 检索**会话正文索引**：按相关度取 `topK` 条，再按 `ts` 升序展示（便于会话内上下文）；`role` 可过滤 user/assistant/tool（索引含工具结果消息）。
 - `topK` 缺省 20、硬上限 100（file=文件数，session=消息条数）；`total` 是截断前的匹配数（file 为候选块内唯一文件数，候选块硬上限 500；session 为本地过滤后条数），`truncated=true` 表示还有更多（候选达到上限时也可能为 true，属保守值）。
-- `scope=session` 时 `session_id` 缺省：args → 上下文 `session` → `top_session`；都为空则查全部会话。子会话消息可能未建立会话索引，空结果会带提示。`session_filter_applied=false` 表示服务端 session_id 过滤不可用、已回退为全量候选内本地过滤（可能少召回）。
+- `scope=session` 时 `session_id` 缺省：args → 上下文 `session` → `top_session`；都为空则查全部会话。**主会话与子会话都建立索引**（含工具结果；思维链 / system 不入），空结果会带提示。`session_filter_applied=false` 表示服务端 session_id 过滤不可用、已回退为全量候选内本地过滤（可能少召回）。
 - `scope=session` 时 `path` 被忽略，并返回 `path_ignored:true`。
 - 空结果 `note:"no_hits"`；file 无命中不额外解释，session 附 `hint`（换关键词/缩小范围/子会话可能未索引）。
 - `score_kind:"zvec_fts_raw"` 表示分数为 zvec 原始相似度（未归一化）；file 的 `line_kind:"chunk_start_plus_offset"` 表示行号是块起始行加命中偏移，可能不是精确行。

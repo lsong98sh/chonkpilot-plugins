@@ -229,7 +229,7 @@ func main() {
 	})
 	p.Subscribe("session-complete", func(_ context.Context, _ string, payload []byte) {
 		onWorkdirPayload(payload)
-		// 会话内容索引（SESSION-FTS）：轮末增量写该轮消息（主会话才处理；去抖合并）。
+		// 会话内容索引（SESSION-FTS）：轮末增量写该轮消息（主会话与子会话都处理；去抖合并）。
 		cfg.sessions.onSessionComplete(payload)
 	})
 	// `vfts.session.query` / `vfts.session.reindex`（2B §3.5 / 61 §4.3 点分直通）：

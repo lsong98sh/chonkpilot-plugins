@@ -1,0 +1,168 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>会话工具设置</title>
+  <link rel="stylesheet" href="/shared/ck-theme.css" />
+  <link rel="stylesheet" href="/themes.css" />
+  <script src="/shared/ck-theme.js"></script>
+  <style>
+    body { margin: 0; padding: 16px 18px; font: 13px/1.5 var(--ck-font-sans); color: var(--ck-text); background: var(--ck-bg); }
+    h1 { font-size: 16px; margin: 0 0 4px; } h2 { font-size: 13px; margin: 0 0 10px; }
+    p.sub { margin: 0 0 16px; color: var(--ck-text-muted); font-size: 12px; }
+    .card { border: 1px solid var(--ck-border); border-radius: 8px; padding: 14px; margin-bottom: 14px; }
+    .row { display: flex; flex-direction: column; gap: 6px; margin-bottom: 14px; }
+    label { font-weight: 600; font-size: 12px; }
+    select, input[type=number], input[type=text], input[type=password] { width: 100%; box-sizing: border-box; padding: 7px 9px; border: 1px solid var(--ck-border); border-radius: 6px; font: inherit; background: transparent; color: inherit; }
+    input[type=checkbox] { width: 16px; height: 16px; margin: 2px 0; accent-color: var(--ck-accent); }
+    .hint { color: var(--ck-text-muted); font-size: 11px; overflow-wrap: anywhere; }
+    .actions { display: flex; gap: 8px; flex-wrap: wrap; }
+    button { padding: 6px 12px; border-radius: 6px; border: 1px solid var(--ck-border); background: var(--ck-surface); color: inherit; font: inherit; cursor: pointer; }
+    button.primary { background: var(--ck-accent); border-color: var(--ck-accent); color: var(--ck-accent-fg); }
+    .msg { font-size: 12px; white-space: pre-wrap; overflow-wrap: anywhere; margin-top: 8px; }
+    .msg.err { color: var(--ck-danger); } .msg.ok { color: var(--ck-success); }
+  </style>
+</head>
+<body>
+  <h1>会话工具设置</h1>
+  <p class="sub">
+    五个读工具（<b>session_search / list / get / history / status</b>）与四个写工具
+    （<b>session_create / send / rename / open</b>）。此处是<b>个人（usr）设置</b>；项目默认由
+    项目配置的 <code>plugins.session.*</code> 提供。语义检索需配置任意 OpenAI 兼容
+    <code>/embeddings</code> 服务（缺省关闭）；后台全量索引与 HNSW 默认开启。
+  </p>
+
+  <div class="card">
+    <h2>个人设置</h2>
+    <div id="form"></div>
+    <div class="actions">
+      <button class="primary" id="save">保存</button>
+      <button id="reset">恢复默认</button>
+    </div>
+    <div class="msg" id="msg"></div>
+  </div>
+
+  <script src="/plugin-ui/_sdk/plugin.js"></script>
+  <script>
+    const form = document.getElementById('form');
+    const msg = document.getElementById('msg');
+    let fields = [];
+    let values = {};
+
+    function show(t, err) {
+      msg.textContent = t || '';
+      msg.className = 'msg ' + (t ? (err ? 'err' : 'ok') : '');
+    }
+
+    async function api(action, payload) {
+      const res = await fetch('/plugins/session/api/' + encodeURIComponent(action), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-CK-Plugin-Id': 'session' },
+        body: JSON.stringify(payload || {}),
+      });
+      let body = null;
+      try { body = await res.json(); } catch (_) { /* 非 JSON：按状态码报错 */ }
+      if (!res.ok) {
+        const errors = (body && Array.isArray(body.errors) && body.errors) || ['HTTP ' + res.status];
+        throw new Error(errors.join('; '));
+      }
+      return body;
+    }
+
+    function render() {
+      form.innerHTML = '';
+      for (const f of fields) {
+        const wrap = document.createElement('div');
+        wrap.className = 'row';
+        const lab = document.createElement('label');
+        lab.textContent = f.label || f.key;
+        wrap.appendChild(lab);
+
+        let input;
+        if (f.type === 'boolean') {
+          input = document.createElement('input');
+          input.type = 'checkbox';
+          input.checked = String(values[f.key]) === 'true';
+        } else if (f.type === 'select' && Array.isArray(f.options)) {
+          input = document.createElement('select');
+          for (const opt of f.options) {
+            const o = document.createElement('option');
+            o.value = opt.value;
+            o.textContent = opt.label || opt.value;
+            input.appendChild(o);
+          }
+          input.value = values[f.key] == null ? '' : String(values[f.key]);
+        } else {
+          input = document.createElement('input');
+          input.type = f.type === 'integer' ? 'number' : (f.type === 'secret' ? 'password' : 'text');
+          input.value = values[f.key] == null ? '' : String(values[f.key]);
+          if (f.min != null) input.min = f.min;
+          if (f.max != null) input.max = f.max;
+          input.autocomplete = 'off';
+        }
+        input.dataset.key = f.key;
+        wrap.appendChild(input);
+
+        if (f.hint) {
+          const hint = document.createElement('div');
+          hint.className = 'hint';
+          hint.textContent = f.hint;
+          wrap.appendChild(hint);
+        }
+        form.appendChild(wrap);
+      }
+    }
+
+    function collect() {
+      const out = {};
+      for (const el of form.querySelectorAll('[data-key]')) {
+        if (el.type === 'checkbox') {
+          out[el.dataset.key] = el.checked ? 'true' : 'false';
+        } else if (el.type === 'number') {
+          out[el.dataset.key] = Number(el.value);
+        } else {
+          out[el.dataset.key] = el.value;
+        }
+      }
+      return out;
+    }
+
+    async function load() {
+      try {
+        const body = await api('load');
+        fields = (body && body.fields) || [];
+        values = (body && body.values) || {};
+        render();
+        show('');
+      } catch (e) {
+        show(String(e.message || e), true);
+      }
+    }
+
+    document.getElementById('save').addEventListener('click', async () => {
+      try {
+        const body = await api('save', { values: collect() });
+        values = (body && body.values) || values;
+        render();
+        show('已保存');
+      } catch (e) {
+        show(String(e.message || e), true);
+      }
+    });
+
+    document.getElementById('reset').addEventListener('click', async () => {
+      try {
+        const body = await api('reset');
+        values = (body && body.values) || {};
+        render();
+        show('已恢复默认（删除个人设置，回落项目默认）');
+      } catch (e) {
+        show(String(e.message || e), true);
+      }
+    });
+
+    load();
+  </script>
+</body>
+</html>

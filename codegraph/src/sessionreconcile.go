@@ -41,7 +41,7 @@ const (
 
 // sessionReconcileStats 一轮对账的计数（只用于日志 / 通知，不落盘）。
 type sessionReconcileStats struct {
-	Sessions  int // 数据面主会话数
+	Sessions  int // 数据面会话数（含子会话）
 	Missing   int // 漏索引（引擎无游标 / 无指纹）→ 补索引
 	Rebuilt   int // 指纹不一致 → 重建
 	Removed   int // 已删除会话 → 清理
@@ -180,9 +180,9 @@ func (x *sessionIndexer) reconcileRound(ctx context.Context, wd, instanceID stri
 	if err != nil {
 		return fmt.Errorf("读取已索引会话游标失败：%w", err)
 	}
-	sessions, err := x.mainSessions(ctx, instanceID)
+	sessions, err := x.allSessions(ctx, wd, instanceID)
 	if err != nil {
-		return fmt.Errorf("读取项目主会话失败：%w", err)
+		return fmt.Errorf("读取项目会话失败：%w", err)
 	}
 	st.Sessions = len(sessions)
 
