@@ -74,6 +74,62 @@ func TestAddNotifyWithoutWorkDirSucceeds(t *testing.T) {
 	}
 }
 
+// TestAddSessionModeAndTopSession：session_mode=own 持久化；tool 调用上下文里的 top_session
+// 写入 CreatedBy（完成后通知固定回主会话），省略 mode 默认 main。
+func TestAddSessionModeAndTopSession(t *testing.T) {
+	p, store := addTestPlugin(t, false)
+	dir := t.TempDir()
+	res, err := p.add(context.Background(), map[string]any{
+		"delay":        "1h",
+		"session_mode": "own",
+		"action":       map[string]any{"type": "run", "param": map[string]any{"command": "echo hi"}},
+	}, pluginsdk.CallContext{WorkDir: dir, Session: "s-child", TopSession: "s-main"})
+	if err != nil {
+		t.Fatalf("add own: %v", err)
+	}
+	ownID := ((res.(map[string]any)["task"]).(map[string]any)["id"]).(string)
+	task := store.List()[0]
+	for _, x := range store.List() {
+		if x.ID == ownID {
+			task = x
+			break
+		}
+	}
+	if sessionModeOf(task) != SessionModeOwn {
+		t.Fatalf("session_mode=%q", task.SessionMode)
+	}
+	if task.CreatedBy.TopSession != "s-main" || task.CreatedBy.SessionID != "s-child" {
+		t.Fatalf("CreatedBy=%+v", task.CreatedBy)
+	}
+	view := res.(map[string]any)["task"].(map[string]any)
+	if view["session_mode"] != SessionModeOwn {
+		t.Fatalf("taskView session_mode=%v", view["session_mode"])
+	}
+
+	if _, err := p.add(context.Background(), map[string]any{
+		"delay":  "1h",
+		"action": map[string]any{"type": "run", "param": map[string]any{"command": "echo hi"}},
+	}, pluginsdk.CallContext{WorkDir: dir}); err != nil {
+		t.Fatalf("add default: %v", err)
+	}
+	for _, x := range store.List() {
+		if x.ID == ownID {
+			continue
+		}
+		if got := sessionModeOf(x); got != SessionModeMain {
+			t.Fatalf("省略 session_mode 应为 main，得到 %q", got)
+		}
+	}
+
+	if _, err := p.add(context.Background(), map[string]any{
+		"delay":        "1h",
+		"session_mode": "bogus",
+		"action":       map[string]any{"type": "notify", "param": "<b>x</b>"},
+	}, pluginsdk.CallContext{}); err == nil || !strings.Contains(err.Error(), "session_mode") {
+		t.Fatalf("非法 session_mode 应拒绝: %v", err)
+	}
+}
+
 func TestAddRunWithExistingWorkDirSucceeds(t *testing.T) {
 	p, _ := addTestPlugin(t, false)
 	dir := t.TempDir()

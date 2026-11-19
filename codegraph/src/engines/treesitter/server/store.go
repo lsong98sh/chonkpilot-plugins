@@ -174,11 +174,19 @@ func (w *Workspace) loadIndexFromDB() (ix *Index, present bool, err error) {
 	return out, true, nil
 }
 
-// saveIndexFull 全量落盘（单事务，原子）：重建三个 bucket 后写入全部文件条目。
-// 仅 Initialize（全量重建）路径使用；Reconcile 走 saveIndexDelta（只写变更部分）。
+// saveIndexFull 取当前内存索引快照后全量落盘（单事务，原子）。
+// 仅 Initialize（全量重建）/ IndexPaths 路径使用；Reconcile 走 saveIndexDelta（只写变更部分）。
 func (w *Workspace) saveIndexFull() error {
 	w.mu.Lock()
 	ix := w.ix
+	w.mu.Unlock()
+	return w.saveIndexSnapshot(ix)
+}
+
+// saveIndexSnapshot 按**传入快照**全量落盘（单事务，原子）：重建三个 bucket 后写入全部文件条目。
+// ix 为 nil 也安全（只写 schema 的空索引）。本函数不读 w.ix、不持 w.mu，允许调用方在
+// 「先落盘、后换内存」的顺序下安全使用（保存失败时内存索引不受影响）。
+func (w *Workspace) saveIndexSnapshot(ix *Index) error {
 	var paths []string
 	if ix != nil {
 		paths = make([]string, 0, len(ix.Files))
@@ -187,7 +195,6 @@ func (w *Workspace) saveIndexFull() error {
 		}
 		sort.Strings(paths)
 	}
-	w.mu.Unlock()
 
 	db, err := w.openDBForWrite()
 	if err != nil {

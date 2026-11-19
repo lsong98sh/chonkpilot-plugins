@@ -19,8 +19,6 @@ import (
 )
 
 const (
-	pluginID        = "remote"
-	pluginVersion   = "1.0.0"
 	protocolVersion = "remote/1"
 	uiAssetRoot     = "webui"
 )
@@ -28,11 +26,14 @@ const (
 //go:embed all:webui
 var webuiFS embed.FS
 
+// embeddedManifest 是插件 manifest（构建期嵌入 exe，随 `plugin.hello` 上报；宿主不再读盘）。
+//
+//go:embed manifest.json
+var embeddedManifest []byte
+
 func main() {
 	p, err := pluginsdk.New(pluginsdk.Options{
-		ID:       pluginID,
-		Name:     "远程接入",
-		Version:  pluginVersion,
+			Manifest: embeddedManifest,
 		Features: map[string]any{"ui": true},
 	})
 	if err != nil {
@@ -46,7 +47,7 @@ func main() {
 	if err := cfg.Init(context.Background()); err != nil {
 		log.Warn("remote: 读取配置失败（按未配置启动）", "err", err)
 	}
-	dev := newDeviceStore(pluginsdk.DefaultDataDir(), pluginVersion, log)
+	dev := newDeviceStore(pluginsdk.DefaultDataDir(), p.Version(), log)
 	ws := newWorkspaceStore()
 	run := newRunningSet()
 	asks := newAskCache()
@@ -72,7 +73,7 @@ func main() {
 	p.OnRequest("test", c.handleTest)
 	p.OnRequest("status", c.handleStatus)
 	p.OnRequest("badge", c.handleBadge)
-	p.OnRequest("ping", pluginsdk.PingHandler(pluginVersion))
+	p.OnRequest("ping", pluginsdk.PingHandler(p.Version()))
 	p.OnRequest("plugin/v1/ui.asset.get", uiAssetGet)
 
 	ctx, cancel := context.WithCancel(context.Background())

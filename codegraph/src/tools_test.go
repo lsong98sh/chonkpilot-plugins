@@ -7,14 +7,14 @@ import (
 	"github.com/lsong98sh/chonkpilot-plugin-framework/contract"
 )
 
-// TestEmbeddedToolContracts：9 个 hot 工具的 md 必须齐全，且解析出策略面（source=md）。
+// TestEmbeddedToolContracts：10 个 hot 工具的 md 必须齐全，且解析出策略面（source=md）。
 func TestEmbeddedToolContracts(t *testing.T) {
 	all, err := loadToolContracts()
 	if err != nil {
 		t.Fatalf("loadToolContracts: %v", err)
 	}
-	if len(all) != 9 {
-		t.Fatalf("契约数量 = %d，want 9", len(all))
+	if len(all) != 10 {
+		t.Fatalf("契约数量 = %d，want 10", len(all))
 	}
 	for _, name := range hotTools {
 		name := name
@@ -29,9 +29,8 @@ func TestEmbeddedToolContracts(t *testing.T) {
 			if !ct.Hot {
 				t.Errorf("hot 应为 true")
 			}
-			if ct.Async != "auto" || ct.Timeout != 30 || ct.OnTimeout != "background" {
-				t.Errorf("策略 = async:%s timeout:%d on_timeout:%s，want auto/30/background",
-					ct.Async, ct.Timeout, ct.OnTimeout)
+			if ct.Async != "auto" || ct.Timeout != 30 {
+				t.Errorf("策略 = async:%s timeout:%d，want auto/30", ct.Async, ct.Timeout)
 			}
 			if ct.Category != "codegraph" {
 				t.Errorf("category = %q，want codegraph", ct.Category)
@@ -46,8 +45,12 @@ func TestEmbeddedToolContracts(t *testing.T) {
 			if meta["hot"] != true {
 				t.Errorf("_meta.hot = %v，want true", meta["hot"])
 			}
-			if meta["async"] != "auto" || meta["timeout"] != 30 || meta["on_timeout"] != "background" {
+			if meta["async"] != "auto" || meta["timeout"] != 30 {
 				t.Errorf("_meta 策略不完整: %v", meta)
+			}
+			// 打点声明：codegraph 全部只读分析 → touch_files: false（显式声明）。
+			if v, ok := meta["touch_files"].(bool); !ok || v {
+				t.Errorf("_meta.touch_files = %v（存在=%v），want false", meta["touch_files"], ok)
 			}
 			props, _ := ct.Schema["properties"].(map[string]any)
 			if _, ok := props["workdir"]; !ok {
@@ -64,15 +67,15 @@ func TestEmbeddedToolContracts(t *testing.T) {
 	}
 }
 
-// TestCodegraphContracts：8 个 codegraph_* 查询契约转引擎注册面（vfts_query 单独注册）。
+// TestCodegraphContracts：9 个 codegraph_* 查询契约转引擎注册面（vfts_query 单独注册）。
 func TestCodegraphContracts(t *testing.T) {
 	all, err := loadToolContracts()
 	if err != nil {
 		t.Fatalf("loadToolContracts: %v", err)
 	}
 	got := codegraphContracts(all)
-	if len(got) != 8 {
-		t.Fatalf("codegraphContracts 数量 = %d，want 8", len(got))
+	if len(got) != 9 {
+		t.Fatalf("codegraphContracts 数量 = %d，want 9", len(got))
 	}
 	for _, c := range got {
 		if !strings.HasPrefix(c.Name, "codegraph_") {

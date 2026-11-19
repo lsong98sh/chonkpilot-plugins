@@ -338,9 +338,15 @@ func TestFileToolsInstanceRoot(t *testing.T) {
 	}
 }
 
-// TestFileToolsContractMeta：`.tool.md` 的行为字段（async/timeout/on_timeout）经 SDK
-// 写入 tools/list 的 `_meta`，且 source=md；gateway 据此裁决同步/超时动作。
+// TestFileToolsContractMeta：`.tool.md` 的行为字段（async/timeout/touch_files）经 SDK
+// 写入 tools/list 的 `_meta`，且 source=md；gateway 据此裁决同步/异步与前置打点。
 func TestFileToolsContractMeta(t *testing.T) {
+	// 打点口径：写盘类 true；只读类 false。
+	wantTouch := map[string]bool{
+		"file_copy": true, "file_delete": true, "file_iconv": true, "file_move": true,
+		"file_patch": true, "file_replace": true, "file_write": true,
+		"file_detect": false, "file_diff": false, "file_find": false, "file_read": false,
+	}
 	tools := loadTools(t)
 	for _, tool := range tools {
 		m := contract.MetaFor(tool)
@@ -348,13 +354,18 @@ func TestFileToolsContractMeta(t *testing.T) {
 			t.Errorf("%s: source=%v，期望 md", tool.Name, m["source"])
 		}
 		if m["async"] != "sync" {
-			t.Errorf("%s: async=%v，期望 sync（md async: never）", tool.Name, m["async"])
-		}
-		if m["on_timeout"] != "background" {
-			t.Errorf("%s: on_timeout=%v，期望 background", tool.Name, m["on_timeout"])
+			t.Errorf("%s: async=%v，期望 sync", tool.Name, m["async"])
 		}
 		if tool.Timeout <= 0 {
 			t.Errorf("%s: timeout=%d，同步工具不应为 0/负数", tool.Name, tool.Timeout)
+		}
+		want, declared := wantTouch[tool.Name]
+		if !declared {
+			t.Errorf("%s: 未声明打点口径", tool.Name)
+			continue
+		}
+		if v, ok := m["touch_files"].(bool); !ok || v != want {
+			t.Errorf("%s: touch_files=%v（存在=%v），期望 %v", tool.Name, m["touch_files"], ok, want)
 		}
 	}
 
@@ -371,7 +382,7 @@ func TestFileToolsContractMeta(t *testing.T) {
 	if write == nil {
 		t.Fatal("tools/list 缺 file_write")
 	}
-	if write["source"] != "md" || write["async"] != "sync" || write["on_timeout"] != "background" {
+	if write["source"] != "md" || write["async"] != "sync" || write["touch_files"] != true {
 		t.Fatalf("file_write _meta 不符: %v", write)
 	}
 	if n, _ := write["timeout"].(float64); int(n) != 120 {

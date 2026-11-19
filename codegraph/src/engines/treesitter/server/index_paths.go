@@ -97,6 +97,12 @@ func (w *Workspace) IndexPaths(files, removes []string) (indexed, removed, skipp
 
 	ix := rebuildIndex(next.Files)
 	total := len(ix.Files)
+	// 先落盘新快照；保存失败**不换**内存索引（磁盘仍是旧快照，内存也保持旧快照）。
+	// saveIndexSnapshot 不读 w.ix、不持 w.mu，因此这里持 recMu 时做 IO 是安全的。
+	if err := w.saveIndexSnapshot(ix); err != nil {
+		w.markError(fmt.Sprintf("save index: %v", err))
+		return indexed, removed, skipped, err
+	}
 	w.mu.Lock()
 	w.ix = ix
 	w.meta.State = "ready"
@@ -105,10 +111,6 @@ func (w *Workspace) IndexPaths(files, removes []string) (indexed, removed, skipp
 	w.meta.ProgressTotal = total
 	w.meta.LastIndexedAt = time.Now().UnixNano()
 	w.mu.Unlock()
-	if err := w.SaveIndex(); err != nil {
-		w.markError(fmt.Sprintf("save index: %v", err))
-		return indexed, removed, skipped, err
-	}
 	return indexed, removed, skipped, w.saveMeta()
 }
 

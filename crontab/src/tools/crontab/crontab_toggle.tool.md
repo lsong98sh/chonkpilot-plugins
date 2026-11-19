@@ -3,14 +3,14 @@
 name: crontab_toggle
 title: 启用/停用定时任务
 args: crontab_toggle --input={RAW-INPUT-FILE}
-async: never
+async: sync
 category: crontab
 hot: true
 runtime: plugin
 idempotent: true
 output: json
 timeout: 30
-on_timeout: background
+touch_files: false
 ```
 
 # 摘要

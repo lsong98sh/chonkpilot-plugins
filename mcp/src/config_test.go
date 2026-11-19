@@ -8,6 +8,8 @@ import (
 	"strings"
 	"sync"
 	"testing"
+
+	pluginsdk "github.com/lsong98sh/chonkpilot-plugin-framework/sdk"
 )
 
 // ─── 测试桩：配置存储 ────────────────────────────────────────────
@@ -119,8 +121,11 @@ func TestHandleLoadDefaults(t *testing.T) {
 		t.Fatalf("handleLoad: %v", err)
 	}
 	values := res.(map[string]any)["values"].(map[string]string)
-	if values[KeyDefaultLimit] != "20" || values[KeyIncludeNonHot] != "true" || values[KeyInvokeTimeoutSec] != "120" {
+	if values[KeyDefaultLimit] != "20" || values[KeyIncludeNonHot] != "true" {
 		t.Errorf("默认值错误：%v", values)
+	}
+	if _, ok := values["plugins.mcp.invoke-timeout-sec"]; ok {
+		t.Errorf("invoke-timeout-sec 已下线，不应回显：%v", values)
 	}
 }
 
@@ -129,17 +134,15 @@ func TestHandleSaveWritesNamespaceAndReadsBack(t *testing.T) {
 	m := newTestManager(t, store, nil)
 	if _, err := m.handleSave(context.Background(), map[string]any{
 		"entries": map[string]any{
-			KeyDefaultLimit:     "5",
-			KeyIncludeNonHot:    false,
-			KeyInvokeTimeoutSec: "60",
+			KeyDefaultLimit:  "5",
+			KeyIncludeNonHot: false,
 		},
 	}); err != nil {
 		t.Fatalf("handleSave: %v", err)
 	}
 	want := map[string]string{
-		KeyDefaultLimit:     "5",
-		KeyIncludeNonHot:    "false",
-		KeyInvokeTimeoutSec: "60",
+		KeyDefaultLimit:  "5",
+		KeyIncludeNonHot: "false",
 	}
 	for k, v := range want {
 		if got, ok := store.get(k); !ok || got != v {
@@ -147,7 +150,7 @@ func TestHandleSaveWritesNamespaceAndReadsBack(t *testing.T) {
 		}
 	}
 	cfg := m.Settings()
-	if cfg.DefaultLimit != 5 || cfg.IncludeNonHot || cfg.InvokeTimeoutSec != 60 {
+	if cfg.DefaultLimit != 5 || cfg.IncludeNonHot {
 		t.Errorf("Settings = %+v", cfg)
 	}
 	res, err := m.handleLoad(context.Background(), nil)
@@ -189,8 +192,6 @@ func TestHandleSaveValidationRejects(t *testing.T) {
 		{"布尔非法", KeyIncludeNonHot, "yes", `必须是 "true"/"false"`},
 		{"条数下界", KeyDefaultLimit, "0", "1–200"},
 		{"条数上界", KeyDefaultLimit, "201", "1–200"},
-		{"超时下界", KeyInvokeTimeoutSec, "4", "5–1800"},
-		{"超时上界", KeyInvokeTimeoutSec, "1801", "5–1800"},
 		{"未知键（旧键名）", "defaultLimit", "10", "未知配置键"},
 	}
 	for _, tc := range cases {
@@ -248,9 +249,8 @@ func TestMigrateLegacyOnce(t *testing.T) {
 	}
 	_ = newTestManager(t, store, legacy)
 	want := map[string]string{
-		KeyDefaultLimit:     "15",
-		KeyIncludeNonHot:    "false",
-		KeyInvokeTimeoutSec: "90",
+		KeyDefaultLimit:  "15",
+		KeyIncludeNonHot: "false",
 	}
 	for k, v := range want {
 		if got, ok := store.get(k); !ok || got != v {
@@ -267,9 +267,8 @@ func TestMigrateLegacyOnce(t *testing.T) {
 func TestMigrateSkipsDefaults(t *testing.T) {
 	store := newMemStore(nil)
 	_ = newTestManager(t, store, map[string]any{
-		"defaultLimit":     20,
-		"includeNonHot":    true,
-		"invokeTimeoutSec": 120,
+		"defaultLimit":  20,
+		"includeNonHot": true,
 	})
 	if store.len() != 0 {
 		t.Errorf("默认旧值不应迁移落键：%v", store.data)
@@ -280,17 +279,16 @@ func TestMigrateSkipsDefaults(t *testing.T) {
 
 func TestInfoUsesSettings(t *testing.T) {
 	m := newTestManager(t, newMemStore(map[string]string{
-		KeyDefaultLimit:     "3",
-		KeyIncludeNonHot:    "false",
-		KeyInvokeTimeoutSec: "30",
+		KeyDefaultLimit:  "3",
+		KeyIncludeNonHot: "false",
 	}), nil)
-	p := &mcpPlugin{cfg: m}
+	p := &mcpPlugin{cfg: m, p: &pluginsdk.Plugin{}}
 	res, err := p.info(context.Background(), nil)
 	if err != nil {
 		t.Fatalf("info: %v", err)
 	}
 	out := res.(map[string]any)
-	if out["defaultLimit"] != 3 || out["includeNonHot"] != false || out["invokeTimeoutSec"] != 30 {
+	if out["defaultLimit"] != 3 || out["includeNonHot"] != false {
 		t.Errorf("info = %v", out)
 	}
 }

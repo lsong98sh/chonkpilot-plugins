@@ -131,3 +131,206 @@ func TestOpenCaseInsensitiveReuse(t *testing.T) {
 		t.Fatalf("同一 workdir 不同大小写应复用同一 Workspace（%p ≠ %p）", w2, w1)
 	}
 }
+
+// Initialize 的落盘顺序 = 先写新快照、成功后才换内存。保存失败（此处用另一 bbolt 句柄
+// 独占锁住 index.db → 写库超时）时必须：
+//   - 返回错误、状态回 error；
+//   - **不换**内存索引（新增文件只出现在 next、不进入 w.ix）；
+//   - 磁盘旧索引保持原样（未被清空/重写），重开仍是旧快照。
+func TestInitializeSaveFailureKeepsMemoryAndDisk(t *testing.T) {
+	dir := t.TempDir()
+	writeTestProject(t, dir)
+	w, err := Open(dir)
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+	defer dropWorkspace(w.Dir)
+
+	if err := w.Initialize(nil, nil, nil); err != nil {
+		t.Fatalf("首次 Initialize failed: %v", err)
+	}
+	before := w.Status()
+	if before.IndexedFiles == 0 {
+		t.Fatalf("前置：首次索引应有文件，status=%+v", before)
+	}
+	if got := countDBFiles(t, w); got != before.IndexedFiles {
+		t.Fatalf("前置：落盘 files=%d ≠ status=%d", got, before.IndexedFiles)
+	}
+
+	// 新增可索引文件：若保存失败后仍替换内存索引，status.indexedFiles 会变成 before+1。
+	if err := os.WriteFile(filepath.Join(dir, "extra.go"),
+		[]byte("package extra\n\nfunc Extra() {}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// 独占锁住索引库（第二个写者 open 会等待 dbOpenTimeout 后返回 ErrTimeout）。
+	held, err := bolt.Open(w.dbPath(), 0o644, &bolt.Options{})
+	if err != nil {
+		t.Fatalf("hold index.db: %v", err)
+	}
+
+	err = w.Initialize(nil, nil, nil)
+	closeErr := held.Close()
+	if err == nil {
+		t.Fatal("index.db 被独占时 Initialize 应保存失败并返回错误")
+	}
+	if closeErr != nil {
+		t.Fatalf("release index.db: %v", closeErr)
+	}
+
+	if st := w.State(); st != "error" {
+		t.Fatalf("保存失败后 state 应为 error：got=%q", st)
+	}
+	if got := w.Status().IndexedFiles; got != before.IndexedFiles {
+		t.Fatalf("保存失败后内存索引被替换：indexedFiles=%d，期望保持 %d（extra.go 不得进入内存）",
+			got, before.IndexedFiles)
+	}
+	if got := countDBFiles(t, w); got != before.IndexedFiles {
+		t.Fatalf("保存失败后磁盘索引被改写：files=%d，期望保持 %d", got, before.IndexedFiles)
+	}
+}
+
+// saveIndexSnapshot(nil) 必须安全：写入仅含 schema 的空索引（0 文件），可被 LoadIndex 识别。
+func TestSaveIndexSnapshotNilSafe(t *testing.T) {
+	dir := t.TempDir()
+	w, err := Open(dir)
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+	defer dropWorkspace(w.Dir)
+
+	if err := w.saveIndexSnapshot(nil); err != nil {
+		t.Fatalf("saveIndexSnapshot(nil): %v", err)
+	}
+	if got := countDBFiles(t, w); got != 0 {
+		t.Fatalf("空快照落盘 files=%d，期望 0", got)
+	}
+	ok, err := w.LoadIndex()
+	if err != nil || !ok {
+		t.Fatalf("空快照应可识别为已初始化空索引：LoadIndex=(%v,%v)", ok, err)
+	}
+	if got := w.Status().IndexedFiles; got != 0 {
+		t.Fatalf("空快照载入后 indexedFiles=%d，期望 0", got)
+	}
+}
+
+// IndexPaths 的落盘顺序同样是「先写新快照、成功后才换内存」。用独占 bbolt 句柄模拟保存失败：
+// 返回错误、状态 error、内存/磁盘均为旧快照（新增符号不得进入内存，磁盘条数不变）。
+func TestIndexPathsSaveFailureKeepsMemoryAndDisk(t *testing.T) {
+	w := newIndexedWorkspace(t)
+	before := w.Status()
+	if before.IndexedFiles == 0 {
+		t.Fatalf("前置：应有索引文件，status=%+v", before)
+	}
+	if got := countDBFiles(t, w); got != before.IndexedFiles {
+		t.Fatalf("前置：落盘 files=%d ≠ status=%d", got, before.IndexedFiles)
+	}
+
+	p := writeSrc(t, w.Dir, "pkg/new.go", "package pkg\n\nfunc NewlyAdded() {}\n")
+
+	held, err := bolt.Open(w.dbPath(), 0o644, &bolt.Options{})
+	if err != nil {
+		t.Fatalf("hold index.db: %v", err)
+	}
+	_, _, _, err = w.IndexPaths([]string{p}, nil)
+	closeErr := held.Close()
+	if err == nil {
+		t.Fatal("index.db 被独占时 IndexPaths 应保存失败并返回错误")
+	}
+	if closeErr != nil {
+		t.Fatalf("release index.db: %v", closeErr)
+	}
+
+	if st := w.State(); st != "error" {
+		t.Fatalf("保存失败后 state 应为 error：got=%q", st)
+	}
+	if got := w.Status().IndexedFiles; got != before.IndexedFiles {
+		t.Fatalf("保存失败后内存索引被替换：indexedFiles=%d，期望保持 %d", got, before.IndexedFiles)
+	}
+	if got := len(w.SearchSymbol("NewlyAdded", "", "", 0)); got != 0 {
+		t.Fatalf("保存失败后新符号进入了内存索引：命中 %d 次", got)
+	}
+	if got := countDBFiles(t, w); got != before.IndexedFiles {
+		t.Fatalf("保存失败后磁盘索引被改写：files=%d，期望保持 %d", got, before.IndexedFiles)
+	}
+}
+
+// Reconcile 的落盘顺序：先 saveIndexDelta（只依赖 upserts/removed），成功后才换内存。
+// 独占 bbolt 句柄模拟保存失败：内存/磁盘均为旧快照，新符号不进入内存。
+func TestReconcileSaveFailureKeepsMemoryAndDisk(t *testing.T) {
+	w := newIndexedWorkspace(t)
+	before := w.Status()
+	if before.IndexedFiles == 0 {
+		t.Fatalf("前置：应有索引文件，status=%+v", before)
+	}
+	if got := countDBFiles(t, w); got != before.IndexedFiles {
+		t.Fatalf("前置：落盘 files=%d ≠ status=%d", got, before.IndexedFiles)
+	}
+
+	// 新增文件（mtime/size 与旧条目不同 → reconcile 会产生 upsert）。
+	writeSrc(t, w.Dir, "pkg/reconciled.go", "package pkg\n\nfunc ReconcileOnly() {}\n")
+
+	held, err := bolt.Open(w.dbPath(), 0o644, &bolt.Options{})
+	if err != nil {
+		t.Fatalf("hold index.db: %v", err)
+	}
+	changed, err := w.Reconcile()
+	closeErr := held.Close()
+	if err == nil {
+		t.Fatal("index.db 被独占时 Reconcile 应保存失败并返回错误")
+	}
+	if closeErr != nil {
+		t.Fatalf("release index.db: %v", closeErr)
+	}
+	if !changed {
+		t.Fatal("发生过新增时 changed 应为 true")
+	}
+
+	if st := w.State(); st != "error" {
+		t.Fatalf("保存失败后 state 应为 error：got=%q", st)
+	}
+	if got := w.Status().IndexedFiles; got != before.IndexedFiles {
+		t.Fatalf("保存失败后内存索引被替换：indexedFiles=%d，期望保持 %d", got, before.IndexedFiles)
+	}
+	if got := len(w.SearchSymbol("ReconcileOnly", "", "", 0)); got != 0 {
+		t.Fatalf("保存失败后新符号进入了内存索引：命中 %d 次", got)
+	}
+	if got := countDBFiles(t, w); got != before.IndexedFiles {
+		t.Fatalf("保存失败后磁盘索引被改写：files=%d，期望保持 %d（旧快照）", got, before.IndexedFiles)
+	}
+}
+
+// 正常路径：Initialize → IndexPaths → Reconcile 之后，内存 status 与落盘 files bucket 始终一致。
+func TestDiskMemoryConsistentAcrossUpdatePaths(t *testing.T) {
+	w := newIndexedWorkspace(t)
+	check := func(stage string) {
+		t.Helper()
+		st := w.Status()
+		if got := countDBFiles(t, w); got != st.IndexedFiles {
+			t.Fatalf("%s：落盘 files=%d ≠ status.indexedFiles=%d", stage, got, st.IndexedFiles)
+		}
+	}
+	check("Initialize")
+
+	p := writeSrc(t, w.Dir, "pkg/added.go", "package pkg\n\nfunc AddedOne() {}\n")
+	if _, _, _, err := w.IndexPaths([]string{p}, nil); err != nil {
+		t.Fatalf("IndexPaths: %v", err)
+	}
+	check("IndexPaths")
+	if got := len(w.SearchSymbol("AddedOne", "", "", 0)); got != 1 {
+		t.Fatalf("IndexPaths 后 AddedOne 命中 %d 次，期望 1", got)
+	}
+
+	// 改内容（长度不同确保 mtime/size 快检命中差异）→ Reconcile 走 delta。
+	writeSrc(t, w.Dir, "a.go", "package a\n\nfunc RebuiltGamma() {}\n")
+	if changed, err := w.Reconcile(); err != nil || !changed {
+		t.Fatalf("Reconcile = (%v, %v)，期望 (true, nil)", changed, err)
+	}
+	check("Reconcile")
+	if got := len(w.SearchSymbol("RebuiltGamma", "", "", 0)); got != 1 {
+		t.Fatalf("Reconcile 后 RebuiltGamma 命中 %d 次，期望 1", got)
+	}
+	if got := len(w.SearchSymbol("Alpha", "", "", 0)); got != 0 {
+		t.Fatalf("Reconcile 后旧符号 Alpha 仍命中 %d 次，期望 0", got)
+	}
+}

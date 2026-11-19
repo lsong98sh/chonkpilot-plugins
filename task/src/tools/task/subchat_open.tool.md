@@ -3,12 +3,13 @@
 name: subchat_open
 title: subchat_open
 args: subchat_open --input={RAW-INPUT-FILE}
-async: never
+async: sync
 category: task
 hot: true
 output: stdout
 runtime: plugin
 timeout: 0
+touch_files: false
 ```
 
 # 摘要

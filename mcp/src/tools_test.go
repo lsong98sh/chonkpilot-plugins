@@ -34,11 +34,20 @@ func TestContractsCoverAllTools(t *testing.T) {
 		if tool.Async != "sync" || !tool.AsyncSet {
 			t.Errorf("%s async = %q（set=%v），want sync", name, tool.Async, tool.AsyncSet)
 		}
-		if tool.Timeout <= 0 || !tool.TimeoutSet {
-			t.Errorf("%s timeout = %d（set=%v），want >0", name, tool.Timeout, tool.TimeoutSet)
+		if name == "mcp_invoke" {
+			// mcp_invoke 不设自身超时（0 = 无上限）：等待/超时由目标工具的契约决定。
+			if tool.Timeout != 0 || !tool.TimeoutSet {
+				t.Errorf("%s timeout = %d（set=%v），want 0（无自身超时）", name, tool.Timeout, tool.TimeoutSet)
+			}
+		} else {
+			if tool.Timeout <= 0 || !tool.TimeoutSet {
+				t.Errorf("%s timeout = %d（set=%v），want >0", name, tool.Timeout, tool.TimeoutSet)
+			}
 		}
-		if tool.OnTimeout != "fail" || !tool.OnTimeoutSet {
-			t.Errorf("%s on_timeout = %q（set=%v），want fail", name, tool.OnTimeout, tool.OnTimeoutSet)
+		// 打点声明：mcp_find 只读 → false；mcp_load/mcp_invoke 可加载/调用任意外部工具 → true（保守）。
+		wantTouch := name != "mcp_find"
+		if !tool.TouchFilesSet || tool.TouchFiles != wantTouch {
+			t.Errorf("%s touch_files = %v（set=%v），want %v", name, tool.TouchFiles, tool.TouchFilesSet, wantTouch)
 		}
 		if tool.Description == "" || tool.Description == tool.Title {
 			t.Errorf("%s 摘要为空或回退为 title: %q", name, tool.Description)
@@ -52,6 +61,12 @@ func TestContractsCoverAllTools(t *testing.T) {
 		}
 		if meta["hot"] != true {
 			t.Errorf("%s _meta.hot = %v，want true", name, meta["hot"])
+		}
+		if name == "mcp_invoke" && meta["policy_lock"] != true {
+			t.Errorf("%s 应 policy_lock=true（不允许界面/CLI/调用级覆盖超时）", name)
+		}
+		if v, ok := meta["touch_files"].(bool); !ok || v != (name != "mcp_find") {
+			t.Errorf("%s _meta.touch_files = %v（存在=%v）", name, meta["touch_files"], ok)
 		}
 	}
 
@@ -76,6 +91,9 @@ func TestContractsCoverAllTools(t *testing.T) {
 	}
 	if props := schemaProps(t, byName["mcp_invoke"]); props["arguments"] == nil {
 		t.Error("mcp_invoke schema 缺少 arguments 参数")
+	}
+	if props := schemaProps(t, byName["mcp_invoke"]); props["timeoutSec"] != nil {
+		t.Error("mcp_invoke 不应再有 timeoutSec（超时由目标工具契约决定）")
 	}
 }
 

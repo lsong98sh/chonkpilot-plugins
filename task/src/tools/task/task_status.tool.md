@@ -10,7 +10,7 @@ runtime: plugin
 idempotent: true
 output: stdout
 timeout: 0
-on_timeout: fail
+touch_files: false
 policy_lock: true
 ```
 
@@ -32,11 +32,16 @@ policy_lock: true
     },
     "timeout": {
       "type": "integer",
-      "description": "可选：等待秒数（仅单任务查询；0/缺省 = 立即返回当前状态）"
+      "minimum": 0,
+      "maximum": 600,
+      "default": 0,
+      "description": "可选：等待秒数（仅单任务查询；0/缺省 = 立即返回当前状态；上限 600，超出报参数错误）"
     },
     "limit": {
       "type": "integer",
-      "description": "可选：任务树模式截断条数（同时作用于 tree.nodes 与 tasks.list；缺省用配置）"
+      "minimum": 1,
+      "maximum": 500,
+      "description": "可选：任务树模式截断条数（同时作用于 tree.nodes 与 tasks.list；1..500，缺省用配置）"
     }
   }
 }
@@ -66,6 +71,9 @@ policy_lock: true
 }
 ```
 
-`limit` 同时作用于 `tree.nodes` 与 `tasks.list`：两者各自最多返回 `min(limit, 总数)` 条；
+未找到：`{ "ok": false, "task_id": "…", "state": "not_found", "message": "未找到任务 …" }`。
+运行中：`{ "ok": true, "task_id": "…", "state": "running", "message": "任务仍在运行（可加大 timeout 继续等待）", "output": "…" }`。
+`ok` 只表示“查询本身成功”（未找到为 false）；任务自身成败看 `state`。`result` 与 `output`
+终态/运行中分别给出（运行中也可能为空）。`limit` 同时作用于 `tree.nodes` 与 `tasks.list`：两者各自最多返回 `min(limit, 总数)` 条；
 `total` = 任务列表原始条数，`truncated` = 任一集合被截断。节点行含
 `task_id/title/state/tool_call_id/created_at/…`，不含结果正文；要详情请按 `task_id` 单查。

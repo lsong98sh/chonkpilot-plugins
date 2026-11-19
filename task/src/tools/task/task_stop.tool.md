@@ -3,13 +3,14 @@
 name: task_stop
 title: 终止任务
 args: task_stop --input={RAW-INPUT-FILE}
-async: never
+async: sync
 category: task
 hot: true
 runtime: plugin
 idempotent: false
 output: stdout
 timeout: 120
+touch_files: false
 ```
 
 # 摘要

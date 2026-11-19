@@ -115,3 +115,11 @@ K. 传输层级失败（provider 断开/transport error）：`任务结束(error
 
 - **基线 6 不成立**：`async: never`/`timeout: 120` 未下发 gateway；实际 `always` 且无超时点，故本工具不存在 `mcp-tools-timeout` 裁决面。
 - **基线 8 的文件域 `{results[],summary}` 约定不适用**：本工具返回 `{ok,limit,tree,tasks}`；且 `ok` 不表示全部成功（`not_found` 时 `ok:false` 仍属正常业务结果）。
+## 10. 修复记录（2026-11-12）
+
+- **P1 limit 无效（2026-11-08 已修）**：`trimListField` 支持 `{nodes:[...]}` / `{list:[...]}` 对象形状，`limit` 真正截断并返回 `total`/`truncated`。
+- **P1 返回形状与契约一致（2026-11-08 已修）**：`tree={nodes}`、`tasks={list}`，与契约示例一致。
+- **P1 waitSec 无上限**：`timeout` 严格校验 0..600（整数），越界/非整数报参数错误；不再出现“误填大值长期挂起”。
+- **P2 参数范围**：`limit` 严格 1..500；缺省仍取配置 `plugins.task.status-limit`。
+- **P2 未文档化形状**：契约补 `state=not_found`、`message`、运行中 `output`、`ok` 只表示“查询成功”（任务成败看 `state`）。
+- 仍为基线：单任务等待仍用 500ms 轮询（未改宿主 `plugin/v1/task.wait` 事件驱动），等待期间每秒 2 次桥调用；任务树按 `session_id` 过滤（子代理看到的是自己的树，契约已注明）。

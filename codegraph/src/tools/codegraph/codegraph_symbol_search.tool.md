@@ -5,7 +5,7 @@ name: codegraph_symbol_search
 title: 符号搜索
 async: auto
 timeout: 30
-on_timeout: background
+touch_files: false
 category: codegraph
 hot: true
 ```

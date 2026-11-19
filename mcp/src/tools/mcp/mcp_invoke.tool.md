@@ -8,8 +8,9 @@ hot: true
 runtime: plugin
 idempotent: false
 output: stdout
-timeout: 1860
-on_timeout: fail
+timeout: 0
+touch_files: true
+policy_lock: true
 ```
 
 # 摘要
@@ -17,7 +18,7 @@ on_timeout: fail
 
 - `name` 必须是宿主暴露的工具名，且必须属于当前 `work_dir` 已打开实例的已装配工具面；`work_dir` 取自本次调用上下文，无需传入。
 - `arguments` 必须是 JSON 对象（缺省 = `{}`；字符串/数组/null 会返回参数错误，**不会**静默清空后执行）。
-- `timeoutSec`：本次同步等待上限（秒，5–1800，缺省 120）；目标工具自己的超时策略仍由宿主按其契约裁决。本工具契约 `timeout: 1860`，保证 1800 秒的等待能被外层容纳。
+- **本工具不设自身超时**（契约 `timeout: 0` + `policy_lock`）：界面/CLI/调用级的超时覆盖也不作用于本工具；等待与超时行为完全由**目标工具**的契约决定——`sync` 到执行硬上限报错；`async` 立即转后台并返回 `pending`；`auto` 到转异步阈值转后台并返回 `pending`；`manual` 到转异步阈值返回 `awaiting`（可选 detach/cancel）。
 - 调用上下文会透传 `instance_id/session/turn/tool_call_id/display_name`，内层任务可正确归属与展示。
 - **目标失败即失败**：目标返回 `isError` / 超时 / 取消时，本工具也返回错误，不会把 `{accepted:true}` 之类的受理回执当成结果。
 - 目标若为异步工具（契约 `async`），返回 `status=pending|awaiting` 与 `task_id`；继续跟踪请用 `task_status`。
@@ -37,13 +38,6 @@ on_timeout: fail
     "arguments": {
       "type": "object",
       "description": "目标工具的参数对象（缺省 {}；必须是 JSON 对象）"
-    },
-    "timeoutSec": {
-      "type": "integer",
-      "minimum": 5,
-      "maximum": 1800,
-      "default": 120,
-      "description": "同步等待上限（秒）；缺省 120，超出范围按 5/1800 收敛"
     }
   }
 }

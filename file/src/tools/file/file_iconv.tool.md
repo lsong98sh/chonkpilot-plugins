@@ -3,14 +3,14 @@
 name: file_iconv
 title: 转换文件编码
 args: file_iconv --input={RAW-INPUT-FILE}
-async: never
+async: sync
 category: file
 hot: true
 runtime: builtin
 idempotent: true
 output: stdout
 timeout: 300
-on_timeout: background
+touch_files: true
 ```
 
 # 摘要

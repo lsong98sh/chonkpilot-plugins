@@ -11,6 +11,7 @@ package main
 
 import (
 	"context"
+	_ "embed"
 	"fmt"
 	"log/slog"
 	"os"
@@ -25,8 +26,6 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
-const pluginVersion = "1.0.0"
-
 type filePlugin struct {
 	p     *pluginsdk.Plugin
 	cfg   *configManager
@@ -34,9 +33,14 @@ type filePlugin struct {
 	tools []contract.Tool
 }
 
+// embeddedManifest 是插件 manifest（构建期嵌入 exe，随 `plugin.hello` 上报；宿主不再读盘）。
+//
+//go:embed manifest.json
+var embeddedManifest []byte
+
 func main() {
 	p, err := pluginsdk.New(pluginsdk.Options{
-		ID: "file", Name: "文件工具", Version: pluginVersion,
+		Manifest: embeddedManifest,
 		Features: map[string]any{"mcp": "http", "ui": true},
 	})
 	if err != nil {
@@ -64,9 +68,9 @@ func main() {
 		p.MCPHot(name)
 	}
 
-	p.OnRequest("status", pluginsdk.StatusHandler(pluginVersion, f.status))
+	p.OnRequest("status", pluginsdk.StatusHandler(p.Version(), f.status))
 	p.OnRequest("tools", f.toolNames)
-	p.OnRequest("ping", pluginsdk.PingHandler(pluginVersion))
+	p.OnRequest("ping", pluginsdk.PingHandler(p.Version()))
 	// 宿主资源通道（PLUGIN-UI-1）：插件自持 webui（embed），宿主经 UDS 逐文件拉取
 	// （GET /plugins/file/<path> → plugin/v1/ui.asset.get）。
 	p.OnRequest("plugin/v1/ui.asset.get", uiAssetGet)

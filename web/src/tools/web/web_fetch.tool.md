@@ -4,7 +4,7 @@ name: web_fetch
 title: 网页抓取
 async: auto
 timeout: 180
-on_timeout: background
+touch_files: false
 category: web
 hot: true
 ```

@@ -3,14 +3,14 @@
 name: crontab_list
 title: 列出定时任务
 args: crontab_list --input={RAW-INPUT-FILE}
-async: never
+async: sync
 category: crontab
 hot: true
 runtime: plugin
 idempotent: true
 output: json
 timeout: 30
-on_timeout: background
+touch_files: false
 ```
 
 # 摘要

@@ -2,16 +2,18 @@
 
 | 工具 | 结论 | P0 | P1 | P2 | 文档 |
 |---|---|---|---|---|---|
-| task_run | 有风险（沙箱两处绕过、提权误判、契约声称的 exe 用法失败） | 2 | 3 | 7 | [task_run.md](task_run.md) |
-| task_llm | 不建议当前形态（默认等待被 SDK 15s 截断，子任务失控） | 1 | 2 | 5 | [task_llm.md](task_llm.md) |
-| task_status | 有风险（`limit` 失效、树形状与契约不符） | 0 | 3 | 6 | [task_status.md](task_status.md) |
-| task_stop | 不建议当前形态（成功停止被报为失败，取消仍生效） | 1 | 1 | 4 | [task_stop.md](task_stop.md) |
-| ask_user | 可用但有风险（question 不校验、能力错误留 running、描述只有首段） | 0 | 3 | 5 | [ask_user.md](ask_user.md) |
-| next_run | 可用但有风险（恢复轮恒报未启用；潜在幂等键丢 prompt） | 0 | 1 | 6 | [next_run.md](next_run.md) |
-| subchat_open | 有风险（participants 静默丢弃并降级为单聊、参数不校验、首轮失败不回流） | 0 | 3 | 6 | [subchat_open.md](subchat_open.md) |
-| subchat_finish | 有风险（无会话类型守卫，主会话也会被置 ready） | 0 | 1 | 5 | [subchat_finish.md](subchat_finish.md) |
-| **合计** | — | **4** | **17** | **44** | — |
+| task_run | 可用（2026-11-08/09 修两处 P0 与 P1；P2 剩 args 语义/全局上限） | 0 | 0 | 2 | [task_run.md](task_run.md) |
+| task_llm | 可用（2026-11-08 修 SDK 15s；2026-11-12 修 agent 校验/传输 partial/session busy/waitSec/标题） | 0 | 0 | 1 | [task_llm.md](task_llm.md) |
+| task_status | 可用（2026-11-08 修 limit/树形状；2026-11-12 修 timeout/limit 范围与文档） | 0 | 0 | 1 | [task_status.md](task_status.md) |
+| task_stop | 可用（2026-11-10 修 P0/P1：走 plugin/v1/task.stop、cascade 生效、撤销 ask 提问） | 0 | 0 | 4 | [task_stop.md](task_stop.md) |
+| ask_user | 可用（2026-11-10 修 P1：sync 契约/校验/返回值/worker isError） | 0 | 0 | 5 | [ask_user.md](ask_user.md) |
+| next_run | 可用（2026-11-10 修 P1：恢复轮/白名单/幂等覆盖） | 0 | 0 | 6 | [next_run.md](next_run.md) |
+| subchat_open | 可用（2026-11-10 修 P1：参数校验/mode/is_error/上限） | 0 | 0 | 6 | [subchat_open.md](subchat_open.md) |
+| subchat_finish | 可用（2026-11-10 修 P1：仅 sub_chat 工具面、is_error/返回值） | 0 | 0 | 5 | [subchat_finish.md](subchat_finish.md) |
+| **合计** | — | **0** | **0** | **30** | — |
 
+> 计数口径（2026-11-12）：A 组 4 个工具（task_run/task_llm/task_status/task_stop）按当前状态更新，P0/P1 已清零、P2=8；B 组 4 个工具（ask_user/next_run/subchat_open/subchat_finish）的 P2 仍沿用审查基线（22，修复仅覆盖 P0/P1 与部分行为，未随修复回改）。合计 P0=0/P1=0/P2=30。
+>
 > 本索引覆盖 task 插件全部 8 个工具。`task_run`/`task_llm`/`task_status`/`task_stop` 由本次审查批次 A 产出；`ask_user`/`next_run`/`subchat_open`/`subchat_finish` 由并行批次 B 产出，本索引中的结论与本计数直接取自各自文档（未二次复核其证据）。
 
 > **2026-11-10 修复说明（next_run / subchat_open / subchat_finish / ask_user / task_stop）**：`next_run` 恢复轮补齐 `nextRunMax` / agent 白名单 / deny 集 / 已登记 inbox 项回查，append 幂等命中后强制覆盖 content，成功文案含次数/上限，插件透传 `is_error`。`subchat_open` 补齐固定参数存在性校验（注册表/llms 可用时）、`mode` 返回、`is_error` 透传、prompt 上限与 schema/返回值。`subchat_finish` 非 `sub_chat` 工具面全部排除，插件透传 `is_error`，成功返回 session_id/lifecycle，契约补返回值。`ask_user` 的 P1 已修（契约 `async: async`→`sync`、摘要首段改非阻塞、补返回值/schema 上限/运行时校验、worker 识别 `isError`）；`task_stop` 的 P0/P1 已修（改走 `plugin/v1/task.stop`、`cascade` 生效），并补齐**命中 ask 任务节点时撤销提问**。同日按用户要求再修 `ask_user`：历史答案双份（tool 行只写标记）、投递失败答复落库、同会话答复逐条立即投递（不再等待全部作答）、选项空 value 归一/空对象拒绝（自由文本问答保留）。各文 §6/§7 已按现状更新；上表计数仍为审查时基线，未随修复回改。

@@ -3,14 +3,14 @@
 name: file_diff
 title: 比较文件
 args: file_diff --input={RAW-INPUT-FILE}
-async: never
+async: sync
 category: file
 hot: true
 runtime: builtin
 idempotent: true
 output: stdout
 timeout: 120
-on_timeout: background
+touch_files: false
 ```
 
 # 摘要

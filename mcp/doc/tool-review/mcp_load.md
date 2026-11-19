@@ -119,4 +119,5 @@ LLM tool_call
 
 - **2026-11-08（链路打通 + 契约化）**：契约迁移到 `src/tools/mcp/mcp_load.tool.md`；`skill/prompt` 走 `plugin/v1/prompts.get`、`resource` 走 `plugin/v1/resources.read`，均携带调用上下文的 `instance_id`（修复项目/用户级资产恒 not found）；`tool` 分支返回 `input_schema`；同名条目 tool 优先；详情读取失败明确报错。
 - **2026-11-11（全量与错误区分）**：按名称查工具改为**全量**（`listTools(true)`），不再受 `plugins.mcp.include-non-hot` 检索过滤影响；列表读取失败与“未找到”区分——未命中且存在列表错误时返回“读取条目列表失败: …”，不再误报“未找到条目”。
-- 仍为基线（未改）：`content` + `text` 双份返回、`prompts.get` 只取首条 message、名称大小写敏感无近似建议（契约已写明精确匹配）。
+- **2026-11-11（返回精简）**：skill/prompt/resource 只返回 `content`，删除重复的 `text` 兼容字段（token 减半）。
+- 仍为基线（未改）：`prompts.get` 只取首条 message、名称大小写敏感无近似建议（契约已写明精确匹配）。

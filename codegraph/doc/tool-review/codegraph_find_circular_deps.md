@@ -76,3 +76,10 @@ status: verified
 - `TestToolCircularDepsSelfAndNoCycles`：默认包含自环、`include_self=false` 返回空 `[]` + `no_cycles`。
 - 既有 `TestFindCycles`（无环/无索引）回归。
 - 回归：`go test -count=1 ./server/...` 通过。
+## 8. P2 修复（2026-11-11）
+
+- **巨环体积**：新增 `max_cycle_length`（0=不限）。>0 时 DFS 在路径节点数达到上限即剪枝，只枚举 ≤ 该长度的环；更长环不枚举、不计数（契约已写明）。默认行为不变。
+- **子图范围**：新增 `path`（workdir 相对路径前缀，目录或文件）。只在前缀内建边与枚举，返回回声 `path`；`path` 未命中已索引文件时 `note:"path_not_indexed"`。
+- **取消**：`toolCircularDeps` 改为透传 `ctx`；`FindCyclesPageFiltered` 在 DFS/起点循环检查取消，取消返回错误且不返回部分结果。旧 `FindCyclesPage` 保留为不限/全图的兼容包装。
+- 测试：`TestCircularDepsMaxLengthAndPath`（2 环 vs 3 环、`path=x` 子图、不存在 path、已取消 ctx）。
+- 仍为基线：解析仍是启发式（别名/包重命名/TS path alias/外部模块不参与，0 环不能证明无循环）。

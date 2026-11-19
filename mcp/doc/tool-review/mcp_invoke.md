@@ -144,5 +144,6 @@ LLM tool_call（外层，llm-server 已做白名单判定，`llm-server/turn.go:
 ## 10. 修复记录（2026-11-08 / 2026-11-11）
 
 - **2026-11-08（同步化 + 上下文）**：契约迁移到 `src/tools/mcp/mcp_invoke.tool.md`；载荷新增 `request_id`，桥从 fire-and-forget 改走 `Emit().Wait()`，目标结果/错误/超时/取消真实返回；`name/arguments` 之外透传 `instance_id/session/turn/tool_call_id/display_name/top_session/parent/data_dir`（内层任务可归属、展示名不丢、instance-scoped 工具可解析）；**禁止 `mcp_invoke` 自调用**；`arguments` 非 object（含 null）报参数错误；目标 `isError` → 外层错误；`{accepted:true}` 受理回执 → 明确错误；异步目标的 `structuredContent`（`status=pending|awaiting`、`task_id`）原样透出；SDK 宿主调用上限从 15s 放宽（`invokeTimeoutMax+60`），避免同步等待被提前截断。
-- **2026-11-11（体积与超时口径）**：返回结果加 **1MiB 上限**——文本按 UTF-8 边界截断、结构化结果按 JSON 文本截断，返回 `truncated:true` 与 `total_bytes` 并附恢复提示（`TestInvokeOutcomeTruncation`）；契约 `timeout` 从 600 提到 1860，与 `timeoutSec` 的 5–1800 区间对齐（原先 >600 的等待必然先被外层转 awaiting）。
+- **2026-11-11（体积与超时口径）**：返回结果加 **1MiB 上限**——文本按 UTF-8 边界截断、结构化结果按 JSON 文本截断，返回 `truncated:true` 与 `total_bytes` 并附恢复提示（`TestInvokeOutcomeTruncation`）。
+- **2026-11-11（超时改为目标工具主导）**：删除 `timeoutSec` 参数与配置键 `plugins.mcp.invoke-timeout-sec`；契约 `timeout: 0`（本工具无自身超时），等待/超时行为完全由目标工具契约决定——`on_timeout=fail` 到点报错、`auto/always` 转后台返回 pending、`manual/never` 返回 awaiting（可选 wait/cancel）；契约加 `policy_lock: true`，界面/CLI/调用级超时覆盖也不生效。宿主调用上限仅保留 24h 安全阀（`invokeHostTimeout`），不再产生本工具级超时。
 - 仍为基线（未改）：插件侧 `timeoutSec` 到点只结束等待，不取消目标（目标可能继续在后台执行）；调用级 `async` 未强制，异步目标按自身策略返回 pending；`mcp_invoke` 的跨场景工具白名单仍由 llm-server 在顶层按 `args.name` 判定。

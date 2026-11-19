@@ -9,7 +9,7 @@ hot: true
 output: stdout
 runtime: plugin
 timeout: 0
-on_timeout: background
+touch_files: false
 policy_lock: true
 ```
 

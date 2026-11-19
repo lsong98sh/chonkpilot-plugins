@@ -3,14 +3,14 @@
 name: file_detect
 title: 检测文件编码
 args: file_detect --input={RAW-INPUT-FILE}
-async: never
+async: sync
 category: file
 hot: true
 runtime: builtin
 idempotent: true
 output: stdout
 timeout: 120
-on_timeout: background
+touch_files: false
 ```
 
 # 摘要

@@ -1,0 +1,82 @@
+{
+  "schema": "chonkpilot.plugin/v1",
+  "id": "crontab",
+  "name": "定时任务",
+  "version": "1.0.0",
+  "description": "本机全局定时任务：执行命令（可选完成通知）/ 系统通知；5 个 crontab_* 工具 + 状态栏徽标 + 任务页",
+  "icon": "clock",
+  "publisher": "chonkpilot",
+  "product": true,
+  "runtime": {
+    "exe": "chonkpilot-plugin-crontab.exe",
+    "args": [],
+    "autostart": true,
+    "restart": { "backoff_ms": 1000, "max_backoff_ms": 30000, "max_fails": 3 },
+    "health": { "interval_ms": 15000, "timeout_ms": 3000, "fail_threshold": 3 },
+    "stop": { "grace_ms": 5000 }
+  },
+  "mcp": {
+    "mode": "http",
+    "namespace": "-",
+    "hot_tools": [
+      "crontab_add",
+      "crontab_update",
+      "crontab_list",
+      "crontab_toggle",
+      "crontab_delete"
+    ],
+    "timeout_sec": 60,
+    "category": "crontab",
+    "origin": "builtin"
+  },
+  "config": { "scope": "plugin" },
+  "ui": {
+    "selfServe": true,
+    "views": [
+      {
+        "id": "tasks",
+        "title": "定时任务",
+        "icon": "clock",
+        "entry": "webui/tasks.html",
+        "containers": ["preview", "tab", "drawer", "dialog"],
+        "default_size": { "width": 860, "height": 620 }
+      },
+      {
+        "id": "badge",
+        "title": "定时任务",
+        "icon": "clock",
+        "entry": "webui/badge.html",
+        "containers": ["statusbar"],
+        "default_size": { "width": 96, "height": 20 }
+      },
+      {
+        "id": "config",
+        "title": "定时任务设置",
+        "icon": "clock",
+        "entry": "webui/config.html",
+        "containers": ["preview", "tab", "drawer", "dialog"],
+        "default_size": { "width": 760, "height": 620 }
+      }
+    ],
+    "menus": [
+      { "location": "plugin", "label": "定时任务", "icon": "clock", "view": "tasks" }
+    ],
+    "statusbar": [
+      {
+        "id": "crontab",
+        "zone": "right",
+        "view": "badge",
+        "tooltip": "定时任务（点击查看）"
+      }
+    ],
+    "rpc": ["status", "ping", "list", "toggle", "delete", "run", "create", "runs", "badge", "load", "save", "reset"]
+  },
+  "permissions": {
+    "data": [],
+    "hooks": [],
+    "llm": {},
+    "session": [],
+    "ui": { "containers": ["preview", "tab", "drawer", "dialog", "statusbar"] },
+    "network": []
+  }
+}

@@ -1,0 +1,53 @@
+{
+  "schema": "chonkpilot.plugin/v1",
+  "id": "remote",
+  "name": "远程接入",
+  "version": "1.0.0",
+  "description": "通过 Remote Server 从手机 H5 继续桌面会话：插件主动出站 WSS，桌面不开放任何端口",
+  "icon": "link",
+  "publisher": "chonkpilot",
+  "product": true,
+  "runtime": {
+    "exe": "chonkpilot-plugin-remote.exe",
+    "args": [],
+    "autostart": true,
+    "restart": { "backoff_ms": 1000, "max_backoff_ms": 30000, "max_fails": 3 },
+    "health": { "interval_ms": 15000, "timeout_ms": 3000, "fail_threshold": 3 },
+    "stop": { "grace_ms": 5000 }
+  },
+  "mcp": { "mode": "none", "namespace": "-", "hot_tools": [], "category": "remote", "origin": "builtin" },
+  "config": { "scope": "plugin" },
+  "ui": {
+    "selfServe": true,
+    "views": [
+      {
+        "id": "config",
+        "title": "远程接入设置",
+        "icon": "link",
+        "entry": "webui/config.html",
+        "containers": ["preview", "tab", "drawer", "dialog"],
+        "default_size": { "width": 760, "height": 620 }
+      },
+      {
+        "id": "badge",
+        "title": "远程接入",
+        "icon": "link",
+        "entry": "webui/badge.html",
+        "containers": ["statusbar"],
+        "default_size": { "width": 96, "height": 20 }
+      }
+    ],
+    "statusbar": [
+      { "id": "remote", "zone": "right", "view": "badge", "tooltip": "远程接入" }
+    ],
+    "rpc": ["load", "save", "reset", "test", "status", "badge", "ping"]
+  },
+  "permissions": {
+    "data": [],
+    "hooks": [],
+    "llm": {},
+    "session": [],
+    "ui": { "containers": ["preview", "tab", "drawer", "dialog", "statusbar"] },
+    "network": []
+  }
+}

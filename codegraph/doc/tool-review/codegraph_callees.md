@@ -79,3 +79,19 @@ status: verified
 - `TestToolCalleesTargetsAndCandidates`：total/分页、candidates 0/1/2、id 优先、目标多命中 candidates、`not_callable`、offset 越界、三种 not_found note、参数校验。
 - 既有 `TestCallees`（by id/file+name/limit/not found/no calls/no index）与 `TestCallGraphTools`（callees by file+name/limit/not found）回归；`limit` 断言已更新为真实 `total + returned/truncated`。
 - 回归：`go test -count=1 ./server/...` 通过。
+## 8. P2 复核（2026-11-11）
+
+本轮未改，以下仍为基线：全项目唯一同名解析（无 receiver/类型）、被调名只保留最后一段（qualifier 丢失）、调用语义为去重+字典序而非源码顺序/次数。均已在契约声明，后续需更重的解析/索引改造。
+
+## 9. 关系增强（2026-11-11）
+
+按“关系不准确时全部列出”的口径补齐（仍不做类型/重载解析）：
+
+- **owner / ownerKind**：方法/构造函数记录所属类型与类别。Go 取自 receiver 或命名接口（`interface`）；Java 取最近 class/abstract class/interface/enum/record；TS/JS 取 class/abstract class/interface；Python 取 class；Rust 取 impl 类型（`impl`/`trait_impl`）或 trait（`trait`）。接口方法（Go `method_elem`、TS `method_signature`、Rust trait `function_signature_item`）也会入索引。
+- **dispatch**：`static`（唯一具体方法）/ `interface` / `trait` / `abstract` / `ambiguous`。
+- **全部候选**：`candidates>1` 时 `candidateSymbols` 列出全部同名定义（id/file/kind/line/owner/ownerKind），不再只给数量。
+- **可能实现**：接口/抽象类/trait 目标下，`possibleImplementations` 列出同名具体方法（owner 非抽象）；**不解析 implements/extends**，故命名为“可能实现”而非“确定实现”。
+- **递归/环**：`self_recursive`（目标就是源符号）；`recursive`（沿名字级调用边 ≤8 层/≤2000 节点可回到源符号，含自递归）。
+- **跨语言收窄**：新增 `lang` 过滤候选定义语言，避免多语言仓库里 `Run`/`run` 混在一起。
+- 测试：`TestGoInterfaceDispatch`、`TestTSInterfaceOwner`、`TestOwnerKindsAcrossLanguages`（Java 抽象类/Python 类/Rust trait）、`TestRecursionFlags`、`TestCalleesToolExposesDispatch`。
+- 仍为基线：无 receiver/类型/重载解析（`resolved` 仍是“唯一同名”）；被调名仍只保留最后一段（qualifier 丢失）；调用集合仍是去重+字典序、非源码顺序/次数。

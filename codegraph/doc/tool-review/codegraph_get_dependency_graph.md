@@ -78,3 +78,8 @@ status: verified
 - `TestToolDependencyGraphEmptyIndex`：空索引下 `no_dependencies` / `include_empty=true` 的 `no_indexed_files`。
 - 既有 `TestImports`（`Workspace.Imports` 旧接口）回归。
 - 回归：`go test -count=1 ./server/...` 通过。
+## 8. P2 修复（2026-11-11）
+
+- **覆盖率不可知**：响应新增 `coverage{indexed_files,parse_error_files,note}`，随 `IndexCoverage()` 给出本次结果基于的已索引文件与解析错误文件数；`note` 明确 >8MB/被排除/不支持语言的文件未计入。
+- 测试：`TestCoverageNotes`（dependency_graph 的 coverage 字段）。
+- 仍为基线：导入值仍是未解析原始串、无 import 行号；Python/Java/Rust 的别名/通配/嵌套 `use` 仍按原始串返回。

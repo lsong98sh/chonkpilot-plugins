@@ -137,3 +137,9 @@ LLM → gateway `doCall`（剥离 `tool_call_display_name`；`mcp.timeout_sec=18
 - 基线 §4 的路径规则**不适用**：`screenshot.path` 无绝对/相对校验，相对路径按引擎进程 cwd 解析；`file://` 读取不经任何白名单。
 - 基线 §3 的沙箱只对写工具生效：本插件唯一的写工具是 `screenshot`，但实现完全不读 `sandbox`（`src/main.go` 无 `cx.Sandbox` 引用）。
 - 基线 §5“不要假设运行时强校验”成立且更弱：`args` 是自由对象，插件层不做任何子参数校验，全部错误来自引擎。
+## 10. 修复记录（2026-11-08 / 2026-11-11）
+
+- **2026-11-08（P0 清零 + 契约化）**：`browser_run` 契约迁到 `src/tools/browser/browser_run.tool.md`（schema/描述/策略单源）；`eval` 参数键接受 `script/eval/expr/js/code`，action 别名 `script/js`；`screenshot` 缺省目录取配置、相对路径按工作目录解析，沙箱开启时落盘路径必须命中可写白名单（越界整次拒绝、不落盘）；context 归属（`instance_id/session`）随 start/operation/stop 下发，引擎 `enginehost` 拒绝跨实例/跨会话操作；`wait.timeoutMs` 限定 1..600000；`args` 补子 schema。
+- **2026-11-11（自愈与上限）**：隐式 context 失效（引擎 janitor/重启）→ 清理映射、自动重建并**重试一次**（显式 `context_id` 失效则返回可操作错误，不自动重建）；失效 context 的 `stop` 返回 `stopped:false` 并清映射；`start` 先回收同实例旧 context（避免泄漏到 `too_many_contexts`）；`html/text/eval value/console entries` 单字段超 **1MiB** 截断并标记 `truncated/total_bytes`；`debug_open` 在 `debug=false` 时明确报错（不再谎报 `opened:true`）。
+- 测试：`TestImplicitContextExpiredRecovers`、`TestExplicitContextExpiredNoRetry`、`TestStopExpiredContextIsIdempotent`、`TestCapOutput`、`TestStartRecyclesOldContext`、引擎 `TestDebugOpenRequiresDebug`。
+- 仍为基线（未改）：所有 context 共用同一 WebView2 profile（跨实例 cookie/localStorage 共享）；`wait` 超时不可真正取消引擎内轮询；错误文案仍以引擎原文为主。

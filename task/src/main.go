@@ -40,8 +40,6 @@ import (
 	"github.com/lsong98sh/chonkpilot-util/scriptrun"
 )
 
-const pluginVersion = "1.0.0"
-
 // toolsFS 是工具契约（`*.tool.md`）的 embed 源：插件自持，产物不带契约目录。
 //
 //go:embed all:tools
@@ -62,11 +60,14 @@ type taskPlugin struct {
 	cfg *configManager
 }
 
+// embeddedManifest 是插件 manifest（构建期嵌入 exe，随 `plugin.hello` 上报；宿主不再读盘）。
+//
+//go:embed manifest.json
+var embeddedManifest []byte
+
 func main() {
 	p, err := pluginsdk.New(pluginsdk.Options{
-		ID:      "task",
-		Name:    "任务工具",
-		Version: pluginVersion,
+		Manifest: embeddedManifest,
 		Features: map[string]any{
 			"mcp": "http",
 			"ui":  true,
@@ -92,7 +93,7 @@ func main() {
 	}
 
 	p.OnRequest("status", t.info)
-	p.OnRequest("ping", pluginsdk.PingHandler(pluginVersion))
+	p.OnRequest("ping", pluginsdk.PingHandler(p.Version()))
 	// 宿主资源通道（PLUGIN-UI-1）：插件自持 webui（embed），宿主经 UDS 逐文件拉取
 	// （GET /plugins/task/<path> → plugin/v1/ui.asset.get）。
 	p.OnRequest("plugin/v1/ui.asset.get", uiAssetGet)
@@ -331,8 +332,12 @@ func (t *taskPlugin) llm(ctx context.Context, args map[string]any, cx pluginsdk.
 		"title":        strings.TrimSpace(asString(args["title"])),
 		"display_name": cx.DisplayName,
 	}
-	if n := toInt(args["waitSec"]); n > 0 {
-		in["wait_sec"] = n
+	waitSec, _, werr := intArg(args, "waitSec", 0, 600)
+	if werr != nil {
+		return nil, werr
+	}
+	if waitSec > 0 {
+		in["wait_sec"] = waitSec
 	}
 	if d, ok := args["detach"].(bool); ok {
 		in["detach"] = d
@@ -340,7 +345,7 @@ func (t *taskPlugin) llm(ctx context.Context, args map[string]any, cx pluginsdk.
 	var out map[string]any
 	// P0（2026-11-08）：delegate 是长等待能力，不能沿用 SDK 缺省 15s 桥超时；按 waitSec
 	// 计算本次调用超时（有上限），否则 >15s 的子代理必然返回 context deadline exceeded。
-	if err := t.p.CallIntoWithTimeout(ctx, delegateTimeout(toInt(args["waitSec"]), args["detach"] == true),
+	if err := t.p.CallIntoWithTimeout(ctx, delegateTimeout(waitSec, args["detach"] == true),
 		"plugin/v1/agent.delegate", in, &out); err != nil {
 		return nil, err
 	}
@@ -388,8 +393,11 @@ func (t *taskPlugin) status(ctx context.Context, args map[string]any, cx plugins
 		return t.statusOne(ctx, args, cx, id)
 	}
 	cfg := t.cfg.Settings()
-	limit := toInt(args["limit"])
-	if limit <= 0 {
+	limit, limitSet, lerr := intArg(args, "limit", 1, 500)
+	if lerr != nil {
+		return nil, lerr
+	}
+	if !limitSet {
 		limit = cfg.StatusLimit
 	}
 	if limit <= 0 {
@@ -421,7 +429,10 @@ func (t *taskPlugin) statusOne(ctx context.Context, args map[string]any, cx plug
 	if cx.Turn == "" {
 		return nil, fmt.Errorf("缺少会话轮次（turn）：单任务查询必须在会话轮次内调用")
 	}
-	wait := toInt(args["timeout"])
+	wait, _, werr := intArg(args, "timeout", 0, 600)
+	if werr != nil {
+		return nil, werr
+	}
 	var deadline time.Time
 	if wait > 0 {
 		deadline = time.Now().Add(time.Duration(wait) * time.Second)
@@ -768,7 +779,7 @@ func (t *taskPlugin) info(_ context.Context, _ map[string]any) (any, error) {
 	cfg := t.cfg.Settings()
 	return map[string]any{
 		"ok":                true,
-		"version":           pluginVersion,
+		"version":           t.p.Version(),
 		"defaultTimeoutSec": cfg.DefaultTimeoutSec,
 		"defaultCwd":        cfg.DefaultCwd,
 		"shell":             cfg.Shell,
@@ -780,3 +791,30 @@ func (t *taskPlugin) info(_ context.Context, _ map[string]any) (any, error) {
 }
 
 // 参数取值 / 信封解包见文件头的复用层别名（pluginsdk.Str/Int/Unwrap）。
+
+// intArg 严格读取整数参数（JSON 整数/浮点整数；字符串与越界报错）。
+// 用于 task_llm.waitSec / task_status.timeout·limit，避免 toInt 静默把非法值当 0。
+func intArg(args map[string]any, key string, min, max int) (int, bool, error) {
+	raw, ok := args[key]
+	if !ok || raw == nil {
+		return 0, false, nil
+	}
+	var n int
+	switch v := raw.(type) {
+	case int:
+		n = v
+	case int64:
+		n = int(v)
+	case float64:
+		if v != float64(int64(v)) {
+			return 0, false, fmt.Errorf("%s 必须是整数（收到 %v）", key, raw)
+		}
+		n = int(v)
+	default:
+		return 0, false, fmt.Errorf("%s 必须是整数（收到 %T）", key, raw)
+	}
+	if n < min || n > max {
+		return 0, false, fmt.Errorf("%s 必须在 %d..%d 之间（收到 %d）", key, min, max, n)
+	}
+	return n, true, nil
+}

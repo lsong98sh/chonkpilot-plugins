@@ -1,0 +1,63 @@
+{
+  "schema": "chonkpilot.plugin/v1",
+  "id": "session",
+  "name": "会话工具",
+  "version": "1.0.0",
+  "description": "会话工具：跨会话 / 跨用户检索历史、列会话、读元数据与分页原文、查会话状态与最终回复、新建顶层会话并自动跑首轮、向会话追发消息、改名、打开窗口（9 个 session_* 工具）；跨用户模式 private / llm / public",
+  "icon": "chat",
+  "publisher": "chonkpilot",
+  "product": true,
+  "runtime": {
+    "exe": "chonkpilot-plugin-session.exe",
+    "args": [],
+    "autostart": true,
+    "restart": { "backoff_ms": 1000, "max_backoff_ms": 30000, "max_fails": 3 },
+    "health": { "interval_ms": 15000, "timeout_ms": 3000, "fail_threshold": 3 },
+    "stop": { "grace_ms": 5000 }
+  },
+  "mcp": {
+    "mode": "http",
+    "namespace": "-",
+    "hot_tools": [
+      "session_search",
+      "session_list",
+      "session_get",
+      "session_history",
+      "session_status",
+      "session_create",
+      "session_send",
+      "session_rename",
+      "session_open"
+    ],
+    "timeout_sec": 60,
+    "category": "session",
+    "origin": "builtin"
+  },
+  "config": { "scope": "plugin" },
+  "ui": {
+    "selfServe": true,
+    "views": [
+      {
+        "id": "config",
+        "title": "会话工具设置",
+        "icon": "chat",
+        "entry": "webui/config.html",
+        "containers": ["preview", "tab", "drawer", "dialog"],
+        "default_size": { "width": 640, "height": 480 }
+      }
+    ],
+    "menus": [
+      { "location": "plugin", "label": "会话工具", "icon": "chat", "view": "config" }
+    ],
+    "statusbar": [],
+    "rpc": ["load", "save", "reset", "ping"]
+  },
+  "permissions": {
+    "data": [],
+    "hooks": [],
+    "llm": {},
+    "session": ["session.browse", "session.read", "session.search", "session.status", "session.run"],
+    "ui": { "containers": ["preview", "tab", "drawer", "dialog"] },
+    "network": []
+  }
+}

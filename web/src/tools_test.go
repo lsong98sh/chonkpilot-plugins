@@ -31,8 +31,13 @@ func TestEmbeddedToolContracts(t *testing.T) {
 		if !tool.Hot || tool.Category != "web" {
 			t.Errorf("%s: hot/category = %v/%q", name, tool.Hot, tool.Category)
 		}
-		if tool.Async != "auto" || tool.OnTimeout != "background" || tool.Timeout != 180 {
-			t.Errorf("%s: 策略 = async:%s timeout:%d on_timeout:%s", name, tool.Async, tool.Timeout, tool.OnTimeout)
+		if tool.Async != "auto" || tool.Timeout != 180 {
+			t.Errorf("%s: 策略 = async:%s timeout:%d", name, tool.Async, tool.Timeout)
+		}
+		// 打点口径：仅 web_download 落盘 → true。
+		wantTouch := name == "web_download"
+		if !tool.TouchFilesSet || tool.TouchFiles != wantTouch {
+			t.Errorf("%s: touch_files = %v(set=%v)，期望 %v", name, tool.TouchFiles, tool.TouchFilesSet, wantTouch)
 		}
 		meta := contract.MetaFor(tool)
 		if meta["source"] != "md" {
@@ -40,6 +45,9 @@ func TestEmbeddedToolContracts(t *testing.T) {
 		}
 		if meta["hot"] != true || meta["category"] != "web" {
 			t.Errorf("%s: _meta hot/category = %v/%v", name, meta["hot"], meta["category"])
+		}
+		if v, ok := meta["touch_files"].(bool); !ok || v != wantTouch {
+			t.Errorf("%s: _meta.touch_files = %v（存在=%v），期望 %v", name, meta["touch_files"], ok, wantTouch)
 		}
 		if tool.Schema == nil {
 			t.Errorf("%s: schema 为空", name)

@@ -53,9 +53,10 @@ type Workspace struct {
 	// 文件索引全量重建不会清空它会话索引）。
 	SessionStore string
 
-	mu    sync.Mutex // 保护 meta
-	recMu sync.Mutex // 就绪/重建单飞：同一 workdir 不平行执行
-	zmu   sync.Mutex // zvec 集合操作串行 + 保护集合的生命周期
+	mu     sync.Mutex // 保护 meta
+	metaMu sync.Mutex // 串行化 meta.json 读/写（marshal→rename 同一临界区）：避免并发 Configure/Status 的旧快照覆盖 reserveNextPK 刚持久化的 NextPK
+	recMu  sync.Mutex // 就绪/重建单飞：同一 workdir 不平行执行
+	zmu    sync.Mutex // zvec 集合操作串行 + 保护集合的生命周期
 	// coll 是集合句柄的**单原子指针**（由 zmu 临界区内的 setColl 唯一写入）：「是否已载入」
 	// 由 coll.Load() != nil 派生（见 isLoaded）。Status / EnsureReady 据此读取载入态，无需等待
 	// Initialize 的整段长 zmu 临界区；单原子写入消除「先改 coll 再改标志」两段式带来的瞬时误报。
@@ -186,6 +187,8 @@ func (w *Workspace) Meta() Meta {
 }
 
 func (w *Workspace) loadMeta() error {
+	w.metaMu.Lock()
+	defer w.metaMu.Unlock()
 	b, err := os.ReadFile(filepath.Join(filepath.FromSlash(w.Store), metaName))
 	if err != nil {
 		return err // 首次无 meta 属正常
@@ -201,6 +204,11 @@ func (w *Workspace) loadMeta() error {
 		m.Err = ""
 	}
 	w.mu.Lock()
+	// NextPK 只增不减：跨进程/并发 ReloadMeta 读到旧 meta 时不得把内存游标拉回，
+	// 否则随后的 saveMeta 会把已预留的主键游标写回旧值（崩溃后可能复用主键）。
+	if w.meta.NextPK > m.NextPK {
+		m.NextPK = w.meta.NextPK
+	}
 	w.meta = m
 	w.mu.Unlock()
 	return nil
@@ -212,6 +220,8 @@ func (w *Workspace) ReloadMeta() error {
 }
 
 func (w *Workspace) saveMeta() error {
+	w.metaMu.Lock()
+	defer w.metaMu.Unlock()
 	w.mu.Lock()
 	b, err := json.MarshalIndent(w.meta, "", "  ")
 	w.mu.Unlock()

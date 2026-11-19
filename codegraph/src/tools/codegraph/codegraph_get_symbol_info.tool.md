@@ -5,7 +5,7 @@ name: codegraph_get_symbol_info
 title: 符号详情
 async: auto
 timeout: 30
-on_timeout: background
+touch_files: false
 category: codegraph
 hot: true
 ```

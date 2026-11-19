@@ -6,18 +6,17 @@
 
 | 工具 | 结论 | P0 | P1 | P2 | 文档 |
 |---|---|:--:|:--:|:--:|---|
-| codegraph_find_circular_deps | 可用（2026-11-10 已修：limit/offset 分页、相对路径、确定性枚举、自环、空结果 `[]`、严格参数、只读查询） | 0 | 0 | 4 | [codegraph_find_circular_deps.md](./codegraph_find_circular_deps.md) |
-| codegraph_analyze_complexity | 可用（2026-11-10 已修：默认只含函数类、topN 上限/truncated、稳定排序、嵌套闭包剪枝、coverage、严格参数、只读查询） | 0 | 0 | 2 | [codegraph_analyze_complexity.md](./codegraph_analyze_complexity.md) |
-| codegraph_get_module_summary | 可用（2026-11-10 已修：path 路径段边界/大小写不敏感、topComplexity5 只含函数类 + 稳定排序、scope=workdir、parseErrorFiles/lastIndexedAt、严格参数、只读查询） | 0 | 0 | 1 | [codegraph_get_module_summary.md](./codegraph_get_module_summary.md) |
+| codegraph_find_circular_deps | 可用（2026-11-10 已修：limit/offset 分页、相对路径、确定性枚举、自环、空结果 `[]`、严格参数、只读查询；2026-11-11 补 max_cycle_length/path/ctx） | 0 | 0 | 1 | [codegraph_find_circular_deps.md](./codegraph_find_circular_deps.md) |
+| codegraph_analyze_complexity | 可用（2026-11-10 已修：默认只含函数类、topN 上限/truncated、稳定排序、嵌套闭包剪枝、coverage、严格参数、只读查询；2026-11-11 补 coverage.note） | 0 | 0 | 2 | [codegraph_analyze_complexity.md](./codegraph_analyze_complexity.md) |
+| codegraph_get_module_summary | 可用（2026-11-10 已修：path 路径段边界/大小写不敏感、topComplexity5 只含函数类 + 稳定排序、scope=workdir、parseErrorFiles/lastIndexedAt、严格参数、只读查询；2026-11-11 补 coverageNote） | 0 | 0 | 1 | [codegraph_get_module_summary.md](./codegraph_get_module_summary.md) |
 | vfts_query | 可用（2026-11-10 已修：topK 上限/truncated、scope/role/match·query 严格校验、会话先相关度后 ts、path_ignored、session_filter_applied、score/line 口径、readiness 文案） | 0 | 0 | 1 | [vfts_query.md](./vfts_query.md) |
-| codegraph_symbol_search | 可用（2026-11-10 已修：真实 total/分页、kind 校验、limit 上限、空结果 note、只读查询） | 0 | 0 | 3 | [codegraph_symbol_search.md](./codegraph_symbol_search.md) |
-| codegraph_get_symbol_info | 可用（2026-11-10 已修：id 优先、多命中候选、file/id 大小写、not_found note、严格参数、只读查询） | 0 | 0 | 2 | [codegraph_get_symbol_info.md](./codegraph_get_symbol_info.md) |
-| codegraph_callers | 可用（2026-11-10 已修：id 优先、真实 total/分页、目标身份、空结果 note、严格参数、只读查询） | 0 | 0 | 3 | [codegraph_callers.md](./codegraph_callers.md) |
-| codegraph_callees | 可用（2026-11-10 已修：id 优先、目标多命中候选、candidates 0/1/>1、真实 total/分页、not_callable、严格参数、只读查询） | 0 | 0 | 3 | [codegraph_callees.md](./codegraph_callees.md) |
-| codegraph_get_dependency_graph | 可用（2026-11-10 已修：真实 total/分页、include_empty、file 大小写不敏感+路径段后缀、空结果 note、Go 分组 import、Rust pub use、严格参数、只读查询） | 0 | 0 | 4 | [codegraph_get_dependency_graph.md](./codegraph_get_dependency_graph.md) |
+| codegraph_symbol_search | 可用（2026-11-10 已修：真实 total/分页、kind 校验、limit 上限、空结果 note、只读查询；2026-11-11 去掉全量符号复制 + 开放 status） | 0 | 0 | 1 | [codegraph_symbol_search.md](./codegraph_symbol_search.md) |
+| codegraph_get_symbol_info | 可用（2026-11-10 已修：id 优先、多命中候选、file/id 大小写、not_found note、严格参数、只读查询；2026-11-11 byID/byName 索引定位） | 0 | 0 | 1 | [codegraph_get_symbol_info.md](./codegraph_get_symbol_info.md) |
+| codegraph_callers | 可用（2026-11-10 已修：id 优先、真实 total/分页、目标身份、空结果 note、严格参数、只读查询；2026-11-11 file 改路径段匹配 + lang 过滤） | 0 | 0 | 1 | [codegraph_callers.md](./codegraph_callers.md) |
+| codegraph_callees | 可用（2026-11-10 已修：id 优先、目标多命中候选、candidates 0/1/>1、真实 total/分页、not_callable、严格参数、只读查询；2026-11-11 补 owner/dispatch/全部候选/可能实现/递归环/lang） | 0 | 0 | 3 | [codegraph_callees.md](./codegraph_callees.md) |
+| codegraph_get_dependency_graph | 可用（2026-11-10 已修：真实 total/分页、include_empty、file 大小写不敏感+路径段后缀、空结果 note、Go 分组 import、Rust pub use、严格参数、只读查询；2026-11-11 补 coverage） | 0 | 0 | 3 | [codegraph_get_dependency_graph.md](./codegraph_get_dependency_graph.md) |
 
-**本组合计（按各文档 §6 行数累计；跨工具共性问题会在每个受影响工具的文档里重复计）：P0 = 0，P1 = 0，P2 = 23。**
-其中 A 组 5 个工具：P0 = 0，P1 = 0，P2 = 15；B 组 4 个工具：P0 = 0，P1 = 0，P2 = 8。
+**本组合计（2026-11-11 复核）：P0 = 0，P1 = 0，P2 = 14**（审查基线为 23；已修 9 项，其中 callees 的候选透明化/关系增强不改变其 3 项“无类型解析”基线计数）。剩余 P2 见各文档 §8/§9 的“仍为基线”清单。
 
 ## 范围差异与注册链核实（B 组）
 
@@ -55,3 +54,4 @@
 8. **`total` 语义（2026-11-10 已修）**：`symbol_search` / `callers` / `callees` / `get_dependency_graph` 均返回**未截断的真实 total**，并带 `limit/offset/returned/truncated`；模型可判断是否漏结果并续取。
 9. **查询只读（2026-11-10 已修）**：查询不再 `MkdirAll`、不再 `Reconcile`、不写索引库；同 workdir 的并发查询只读加载。`Initialize` 仍未持 `recMu`（index.go:184），与 `Clear`/`Reconcile` 的单飞约定不一致，自动重建与查询并发时仍有交错写风险（[推断]，P2/管理面）。
 10. **Go 分组 import（2026-11-10 已修）**：`extractImports` 递归 `import_spec_list`；`TestDependencyGraphExtraction` 已验证 `import ( "fmt"; "os" )` 可被提取。Rust `pub use` / `pub(crate) use` 同步修复。
+> **2026-11-11 产品决策与 callee 关系增强**：按拍板结果——复杂度口径保持现状、门禁保持 `isError=false`、**仅开放 `codegraph_status` 给 LLM**（8 查询 + status = 9 个可见 codegraph 工具，`codegraph_initialize/configure/index_paths` 仍隐藏）。`codegraph_callees` 补 `owner/ownerKind`、`dispatch`、全部 `candidateSymbols`、`possibleImplementations`、`self_recursive`/`recursive` 与 `lang` 过滤（接口/抽象类/trait 方法可区分，实现类按同名具体方法近似列出，不解析 implements）。计数：P0=0、P1=0、**P2=14**（原 23；本轮再修 symbol_search 维护工具可见性 1 项；callees 的 3 项仍为“无类型解析/qualifier 丢失/调用语义”基线，但关系已可枚举）。

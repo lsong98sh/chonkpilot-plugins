@@ -32,8 +32,6 @@ import (
 	pluginsdk "github.com/lsong98sh/chonkpilot-plugin-framework/sdk"
 )
 
-const pluginVersion = "2.0.0"
-
 // apiResponseMaxBytes 是 web_search / web_fetch 上游响应的读取上限（8 MiB）。
 // 超限不再静默截断：直接返回明确错误（截断会让 JSON 解析必然失败）。
 const apiResponseMaxBytes = 8 << 20
@@ -71,11 +69,14 @@ type searcher struct {
 	lastN   int
 }
 
+// embeddedManifest 是插件 manifest（构建期嵌入 exe，随 `plugin.hello` 上报；宿主不再读盘）。
+//
+//go:embed manifest.json
+var embeddedManifest []byte
+
 func main() {
 	p, err := pluginsdk.New(pluginsdk.Options{
-		ID:      "web",
-		Name:    "联网能力",
-		Version: pluginVersion,
+		Manifest: embeddedManifest,
 		Features: map[string]any{
 			"mcp": "http",
 			"ui":  true,
@@ -89,7 +90,7 @@ func main() {
 
 	s := &searcher{p: p, cfg: newConfigManager(p)}
 
-	// 契约 → 工具注册：schema / description / 策略（async/timeout/on_timeout/hot）均取自 md，
+	// 契约 → 工具注册：schema / description / 策略（async/timeout/touch_files/hot）均取自 md，
 	// `_meta.source="md"` 由 contract.MetaFor 写入。
 	contracts, err := loadContracts()
 	if err != nil {

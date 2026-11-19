@@ -3,7 +3,7 @@
 // 形态：独立 exe（插件桥 UDS + 自建 MCP HTTP）；任务为**本机全局**，不区分项目。
 // 动作三选一：`run`（执行命令）/ `notify`（系统通知）/ `agent`（完整智能体，全工具面）。
 // 调度：周期 cron 或一次性 at/delay；1s ticker 扫描（单 goroutine），同任务不重入；
-// 一次性任务执行一次后自动停用。状态落 <插件数据目录>/tasks.json。
+// 一次性任务执行一次后自动停用。状态落 <插件数据目录>/crontab.db（SQLite，WAL）。
 // UI：任务页 / 状态栏徽标 / 配置页（webui，embed）；数字变化经 plugin-event 主动推送，零轮询。
 package main
 
@@ -30,8 +30,6 @@ import (
 	"github.com/lsong98sh/chonkpilot-util/strx"
 )
 
-const pluginVersion = "1.0.0"
-
 //go:embed all:tools
 var toolsFS embed.FS
 
@@ -55,11 +53,14 @@ type crontabPlugin struct {
 	sched    *scheduler
 }
 
+// embeddedManifest 是插件 manifest（构建期嵌入 exe，随 `plugin.hello` 上报；宿主不再读盘）。
+//
+//go:embed manifest.json
+var embeddedManifest []byte
+
 func main() {
 	p, err := pluginsdk.New(pluginsdk.Options{
-		ID:      "crontab",
-		Name:    "定时任务",
-		Version: pluginVersion,
+		Manifest: embeddedManifest,
 		Features: map[string]any{
 			"mcp": "http",
 			"ui":  true,
@@ -73,8 +74,9 @@ func main() {
 
 	store := newStore(dataDir())
 	if err := store.Load(); err != nil {
-		p.Logger().Warn("crontab: 读取任务文件失败（按空任务启动）", "err", err)
+		p.Logger().Warn("crontab: 打开任务数据库失败（按空任务启动）", "err", err)
 	}
+	defer store.Close()
 	cfg := newConfigManager(p)
 	if err := cfg.Init(context.Background()); err != nil {
 		p.Logger().Warn("crontab: 读取配置失败（按默认值运行）", "err", err)
@@ -122,11 +124,13 @@ func main() {
 	p.OnRequest("list", t.uiList)
 	p.OnRequest("toggle", t.uiToggle)
 	p.OnRequest("delete", t.uiDelete)
+	p.OnRequest("run", t.uiRun)
+	p.OnRequest("create", t.uiCreate)
 	p.OnRequest("runs", t.uiRuns)
 	p.OnRequest("detail", t.uiDetail)
 	p.OnRequest("badge", t.uiBadge)
 	p.OnRequest("status", t.info)
-	p.OnRequest("ping", pluginsdk.PingHandler(pluginVersion))
+	p.OnRequest("ping", pluginsdk.PingHandler(p.Version()))
 	p.OnRequest("plugin/v1/ui.asset.get", uiAssetGet)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -213,7 +217,7 @@ func withJSONError(fn pluginsdk.ToolFunc) pluginsdk.ToolFunc {
 // ── 工具：crontab_add ─────────────────────────
 
 func (t *crontabPlugin) add(_ context.Context, args map[string]any, cx pluginsdk.CallContext) (any, error) {
-	if err := rejectUnknownArgs(args, "cron", "at", "delay", "action", "sandbox"); err != nil {
+	if err := rejectUnknownArgs(args, "cron", "at", "delay", "action", "sandbox", "session_mode"); err != nil {
 		return nil, err
 	}
 	now := time.Now()
@@ -226,6 +230,10 @@ func (t *crontabPlugin) add(_ context.Context, args map[string]any, cx pluginsdk
 		return nil, err
 	}
 	sandbox, _, err := parseSandboxArg(args["sandbox"])
+	if err != nil {
+		return nil, err
+	}
+	sessionMode, err := parseSessionMode(args["session_mode"])
 	if err != nil {
 		return nil, err
 	}
@@ -256,10 +264,12 @@ func (t *crontabPlugin) add(_ context.Context, args map[string]any, cx pluginsdk
 		CreatedBy: CreatedBy{
 			InstanceID: cx.InstanceID,
 			SessionID:  cx.Session,
+			TopSession: cx.TopSession,
 			WorkDir:    cx.WorkDir,
 		},
-		NextRunAt: next,
-		Sandbox:   sandbox,
+		SessionMode: sessionMode,
+		NextRunAt:   next,
+		Sandbox:     sandbox,
 	}
 	// 上限判定与写入在同一把锁内，避免并发 add 越过 max-tasks。
 	if err := t.store.AddLimited(task, cfg.MaxTasks); err != nil {
@@ -282,7 +292,7 @@ func (t *crontabPlugin) add(_ context.Context, args map[string]any, cx pluginsdk
 // ── 工具：crontab_update ──────────────────────
 
 func (t *crontabPlugin) update(_ context.Context, args map[string]any, _ pluginsdk.CallContext) (any, error) {
-	if err := rejectUnknownArgs(args, "task_id", "cron", "at", "delay", "action", "sandbox"); err != nil {
+	if err := rejectUnknownArgs(args, "task_id", "cron", "at", "delay", "action", "sandbox", "session_mode"); err != nil {
 		return nil, err
 	}
 	id := strings.TrimSpace(asString(args["task_id"]))
@@ -329,6 +339,15 @@ func (t *crontabPlugin) update(_ context.Context, args map[string]any, _ plugins
 	if err != nil {
 		return nil, err
 	}
+	var sessionMode string
+	sessionModeSet := false
+	if raw, ok := args["session_mode"]; ok && raw != nil {
+		sessionMode, err = parseSessionMode(raw)
+		if err != nil {
+			return nil, err
+		}
+		sessionModeSet = true
+	}
 	// 动作改到 run/agent 时，复用任务创建时的 work_dir；目录失效则**在写入前**拒绝，
 	// 避免把已有任务改成「首次触发即停用」的死任务。
 	finalType := existing.Action.Type
@@ -354,7 +373,10 @@ func (t *crontabPlugin) update(_ context.Context, args map[string]any, _ plugins
 	if sandboxSet {
 		changed = append(changed, "sandbox")
 	}
-	// UpdateTx：mutate / 落盘任一失败都回滚内存，避免「报告失败但状态已改」。
+	if sessionModeSet {
+		changed = append(changed, "session_mode")
+	}
+	// UpdateTx：mutate / 写事务任一失败都回滚，避免「报告失败但状态已改」。
 	updated, err := t.store.UpdateTx(id, func(cur *Task) error {
 		if scheduleSet {
 			cur.Cron, cur.Once, cur.RunAt = sched.Cron, sched.Once, sched.RunAt
@@ -375,6 +397,9 @@ func (t *crontabPlugin) update(_ context.Context, args map[string]any, _ plugins
 		}
 		if sandboxSet {
 			cur.Sandbox = sandbox // nil = 恢复「继承插件配置」
+		}
+		if sessionModeSet {
+			cur.SessionMode = sessionMode
 		}
 		// 只有调度真的变化时才重算 next_run_at；仅改 action/sandbox 不推进到期时间，
 		// 避免「任务已到期但尚未被 tick 认领」时丢掉本次触发。停用任务保持 0。
@@ -587,7 +612,7 @@ func (t *crontabPlugin) delete(_ context.Context, args map[string]any, _ plugins
 	return map[string]any{
 		"ok": true, "task_id": id, "deleted": true,
 		"remaining": remaining, "count": remaining, // count 保留为 remaining 的旧别名
-		"running": task.RunningSince > 0, // 删除不中止在飞执行：命令仍会跑完并写 runs.jsonl
+		"running": task.RunningSince > 0, // 删除不中止在飞执行：命令仍会跑完并写入 runs 表
 	}, nil
 }
 
@@ -613,6 +638,31 @@ func (t *crontabPlugin) uiToggle(_ context.Context, payload map[string]any) (any
 
 func (t *crontabPlugin) uiDelete(ctx context.Context, payload map[string]any) (any, error) {
 	return t.delete(ctx, payload, pluginsdk.CallContext{})
+}
+
+// uiRun 立即执行一次（人工补跑）：不改变 next_run_at / enabled / 一次性终态；
+// 执行结果进 crontab.db 的 runs 表（trigger=manual），供漏跑清单与任务页复查。
+func (t *crontabPlugin) uiRun(_ context.Context, payload map[string]any) (any, error) {
+	id := strings.TrimSpace(asString(payload["task_id"]))
+	if err := t.sched.RunNow(id); err != nil {
+		return nil, err
+	}
+	return map[string]any{"ok": true, "started": true, "task_id": id}, nil
+}
+
+// uiCreate 人工创建任务（任务页表单）：payload = 工具 args + work_dir / notify_session_id。
+//
+// work_dir 决定 run/agent 的执行目录与默认通知归属；notify_session_id 省略 = 只用任务页/系统通知。
+func (t *crontabPlugin) uiCreate(ctx context.Context, payload map[string]any) (any, error) {
+	wd := strings.TrimSpace(asString(payload["work_dir"]))
+	sess := strings.TrimSpace(asString(payload["notify_session_id"]))
+	args := map[string]any{}
+	for _, k := range []string{"cron", "at", "delay", "action", "sandbox", "session_mode"} {
+		if v, ok := payload[k]; ok {
+			args[k] = v
+		}
+	}
+	return t.add(ctx, args, pluginsdk.CallContext{Session: sess, TopSession: sess, WorkDir: wd})
 }
 
 func (t *crontabPlugin) uiRuns(_ context.Context, payload map[string]any) (any, error) {
@@ -693,7 +743,7 @@ func (t *crontabPlugin) info(_ context.Context, _ map[string]any) (any, error) {
 	cfg := t.cfg.Settings()
 	return map[string]any{
 		"ok":                true,
-		"version":           pluginVersion,
+		"version":           t.p.Version(),
 		"tasks":             len(t.store.List()),
 		"defaultTimeoutSec": cfg.DefaultTimeoutSec,
 		"missedGraceSec":    cfg.MissedGraceSec,
@@ -769,6 +819,8 @@ func taskView(t Task) map[string]any {
 		"run_count":   t.RunCount,
 		"created_at":  t.CreatedAt,
 		"work_dir":    t.CreatedBy.WorkDir,
+		// session_mode：main（默认，通知主会话）/ own（独立顶层会话、不通知）。
+		"session_mode": sessionModeOf(t),
 		// running = 已有一次执行被认领且尚未收口；delete/toggle/update 不会取消它。
 		"running": t.RunningSince > 0,
 		// sandbox = 任务级开关（null = 继承插件配置）；effective_sandbox 由 `detail` 动作实时解析。
@@ -982,6 +1034,27 @@ func parseSandboxArg(v any) (*bool, bool, error) {
 		return nil, false, errors.New("sandbox 必须是布尔值（true/false）或 \"inherit\"（继承插件配置）")
 	}
 	return &b, true, nil
+}
+
+// sessionModeOf 返回任务的会话模式（空 = main，兼容旧任务）。
+func sessionModeOf(t Task) string {
+	if strings.TrimSpace(t.SessionMode) == SessionModeOwn {
+		return SessionModeOwn
+	}
+	return SessionModeMain
+}
+
+// parseSessionMode 解析 session_mode（省略 = main；own = 独立顶层会话、不通知）。
+func parseSessionMode(v any) (string, error) {
+	s := strings.ToLower(strings.TrimSpace(argString(v)))
+	switch s {
+	case "", SessionModeMain, "notify", "notify_main":
+		return SessionModeMain, nil
+	case SessionModeOwn, "session", "new_session", "own_session":
+		return SessionModeOwn, nil
+	default:
+		return "", fmt.Errorf("session_mode 只接受 main / own（收到 %q）", s)
+	}
 }
 
 // newTaskID 生成 `ct_<8 hex>`。

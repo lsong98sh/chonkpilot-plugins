@@ -25,3 +25,4 @@
 
 - 分配清单只要求 `browser_run`，已全覆盖；未发现虚拟/隐藏工具。
 - 未执行 build/test/插件进程；未启动浏览器引擎。所有结论基于源码（`src/`、`chonkpilot-framework`、`chonkpilot-agent/gateway`、主仓 manifest）。
+> **2026-11-08 / 2026-11-11 修复说明**：P0 已清零——`eval` 参数名/别名与契约一致；`screenshot` 落盘过沙箱白名单（缺省目录来自配置）；context 归属（instance/session）由 `enginehost` 校验，跨实例操作被拒。2026-11-11 补：隐式 context 失效自动重建并重试一次、失效 stop 幂等、`start` 回收旧 context、文本输出 1MiB 上限、`debug_open` 未开 debug 明确报错。明细见 `browser_run.md` §10；上表计数仍为审查时基线。仍存：所有 context 共用 WebView2 profile、`wait` 不可取消、错误文案未统一。

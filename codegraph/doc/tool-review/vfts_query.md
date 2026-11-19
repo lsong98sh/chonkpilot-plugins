@@ -84,3 +84,6 @@ status: verified
 - `TestQuerySessionsPageMatchedAndTruncated`：topK=1 时 matched=3/truncated；topK=20 全量；展示按 ts 升序。
 - 既有 Query/QuerySessions 全部回归（相关度、去重、path、会话过滤/role/删除/清理）。
 - 回归：vfts `go test ./...`、插件 `go test ./...` 通过。
+## 8. P2 复核（2026-11-11）
+
+- 双注册点维护性仍为基线：插件用 `RegisterManagementTools` + 自注册 `vfts_query`，引擎 `RegisterTools` 仍含同名工具（仅独立引擎 exe 使用）。当前无重复注册；已由索引与 `tools_test` 守卫，若将来误用会静默替换 schema。

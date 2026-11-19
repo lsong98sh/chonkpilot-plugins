@@ -80,3 +80,12 @@ status: verified
 - `TestToolSymbolSearchPaginationAndNotes`：handler 分页/truncated、`kind:"FUNC"`、`file_not_indexed`/`no_match`/`offset_beyond_total`、非法 kind/未知参数。
 - 已有 `TestSearchSymbol`、`TestWorkdirFromMeta`、`TestWorkdirValidation`、`TestContractMetaListed` 回归。
 - 回归：`go test -count=1 ./...`（server 包）。
+## 8. P2 修复（2026-11-11）
+
+- **全量符号复制**：`SearchSymbolPage` 改为直接遍历 `ix.syms`，不再先 `AllSymbols()` 复制整份索引；命中集合排序/分页逻辑不变，`total` 仍是真实值。
+- 仍为基线：子串检索本身仍是 O(符号数) 扫描（无按名索引预筛/服务端缓存）；`codegraph_initialize/status` 仍 hot=false，模型只能按 `status` 提示请用户初始化。
+
+## 9. 维护工具开放（2026-11-11）
+
+- `codegraph_status` 改为 hot=true（新增 `tools/codegraph/codegraph_status.tool.md`，manifest `hot_tools` 同步），LLM 可在查询工具返回 `status=not_initialized|pending|error` 后查看进度/规模/错误；它仍是只读、**不触发建索引**。`codegraph_initialize` / `codegraph_configure` / `codegraph_index_paths` 继续对 LLM 不可见。
+- 本条解决原 P2“索引维护工具对 LLM 不可见”中的状态查询部分。

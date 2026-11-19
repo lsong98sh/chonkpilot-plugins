@@ -32,6 +32,11 @@ type Symbol struct {
 	EndLine    int    `json:"endLine"`
 	Complexity int    `json:"complexity"` // 圈复杂度（决策点启发式，>=1；仅 func/method/constructor）
 	Signature  string `json:"signature"`
+	// Owner / OwnerKind：方法的所属类型（Go receiver / Java·TS 类 / Python 类 / Rust impl·trait）
+	// 与类型类别（interface / trait / abstract_class / class / type / impl / trait_impl / enum）。
+	// 仅方法/构造函数有值；用于区分接口/抽象基类方法与具体实现（无类型解析）。
+	Owner     string `json:"owner,omitempty"`
+	OwnerKind string `json:"ownerKind,omitempty"`
 	// Calls 该符号内直接调用的被调名（最后一段，去重 + 排序；仅 func/method/constructor）。
 	// 语义为调用点文本的**名字级启发式**（无类型/重载解析），如 `a.b.Foo()` → "Foo"。
 	Calls []string `json:"calls,omitempty"`
@@ -55,10 +60,11 @@ type Index struct {
 	syms   []Symbol
 	byName map[string][]int // 小写名 → syms 下标
 	byCall map[string][]int // 小写被调名（最后一段）→ 调用方 syms 下标（Calls 反向索引）
+	byID   map[string][]int // 小写 symbol id → syms 下标（按 id 精确定位）
 }
 
 func newIndex() *Index {
-	return &Index{Files: map[string]*FileInfo{}, byName: map[string][]int{}, byCall: map[string][]int{}}
+	return &Index{Files: map[string]*FileInfo{}, byName: map[string][]int{}, byCall: map[string][]int{}, byID: map[string][]int{}}
 }
 
 func (ix *Index) AddFile(fi *FileInfo) {
@@ -68,6 +74,7 @@ func (ix *Index) AddFile(fi *FileInfo) {
 		ix.syms = append(ix.syms, s)
 		idx := len(ix.syms) - 1
 		ix.byName[strings.ToLower(s.Name)] = append(ix.byName[strings.ToLower(s.Name)], idx)
+		ix.byID[strings.ToLower(s.ID)] = append(ix.byID[strings.ToLower(s.ID)], idx)
 		for _, c := range s.Calls {
 			k := strings.ToLower(strings.TrimSpace(c))
 			if k == "" {
@@ -87,6 +94,7 @@ func (ix *Index) RemoveFile(path string) {
 	syms := make([]Symbol, 0, len(ix.syms))
 	byName := map[string][]int{}
 	byCall := map[string][]int{}
+	byID := map[string][]int{}
 	for _, s := range ix.syms {
 		if s.File == path {
 			continue
@@ -94,6 +102,7 @@ func (ix *Index) RemoveFile(path string) {
 		idx := len(syms)
 		syms = append(syms, s)
 		byName[strings.ToLower(s.Name)] = append(byName[strings.ToLower(s.Name)], idx)
+		byID[strings.ToLower(s.ID)] = append(byID[strings.ToLower(s.ID)], idx)
 		for _, c := range s.Calls {
 			k := strings.ToLower(strings.TrimSpace(c))
 			if k == "" {
@@ -105,6 +114,7 @@ func (ix *Index) RemoveFile(path string) {
 	ix.syms = syms
 	ix.byName = byName
 	ix.byCall = byCall
+	ix.byID = byID
 }
 
 func (ix *Index) AllSymbols() []Symbol {
@@ -396,7 +406,7 @@ func (w *Workspace) SearchSymbolPage(q, kind, file string, limit, offset int) ([
 	kind = strings.TrimSpace(kind)
 	fileRel := w.norm(file)
 	out := make([]Symbol, 0)
-	for _, s := range ix.AllSymbols() {
+	for _, s := range ix.syms {
 		if kind != "" && !strings.EqualFold(s.Kind, kind) {
 			continue
 		}
@@ -473,20 +483,31 @@ func (w *Workspace) FindSymbol(id, file, name string) []Symbol {
 	fileRel := w.norm(file)
 	name = strings.TrimSpace(name)
 	id = strings.TrimSpace(id)
-	var out []Symbol
-	for _, s := range ix.AllSymbols() {
-		if id != "" {
-			if !strings.EqualFold(s.ID, id) && !strings.EqualFold(s.ID, w.norm(id)) {
-				continue
+	var picks []int
+	switch {
+	case id != "":
+		// byID 精确命中（相对 id 与绝对→相对归一两种写法）；不再线性扫描全部符号。
+		for _, key := range []string{strings.ToLower(id), strings.ToLower(w.norm(id))} {
+			if ids, ok := ix.byID[key]; ok {
+				picks = append(picks, ids...)
+				break
 			}
-		} else if file != "" && name != "" {
-			if !strings.EqualFold(s.File, fileRel) || !strings.EqualFold(s.Name, name) {
-				continue
-			}
-		} else {
-			continue
 		}
-		out = append(out, w.absSym(s))
+	case file != "" && name != "":
+		for _, i := range ix.byName[strings.ToLower(name)] {
+			if i < 0 || i >= len(ix.syms) {
+				continue
+			}
+			if strings.EqualFold(ix.syms[i].File, fileRel) {
+				picks = append(picks, i)
+			}
+		}
+	default:
+		return nil
+	}
+	out := make([]Symbol, 0, len(picks))
+	for _, i := range picks {
+		out = append(out, w.absSym(ix.syms[i]))
 	}
 	sort.Slice(out, func(i, j int) bool {
 		if out[i].File != out[j].File {
@@ -504,12 +525,36 @@ func (w *Workspace) FindSymbol(id, file, name string) []Symbol {
 type CalleeRef struct {
 	Name     string `json:"name"`
 	Resolved bool   `json:"resolved"` // 是否在索引内唯一命中符号
-	// Candidates = 索引内同名定义数：0 = 未索引/外部符号；1 = resolved；>1 = 同名多处无法解析。
+	// Candidates = 索引内同名定义数：0 = 未索引/外部符号；1 = resolved；>1 = 同名多处。
 	Candidates int    `json:"candidates"`
 	Kind       string `json:"kind,omitempty"`
 	File       string `json:"file,omitempty"`
 	Line       int    `json:"line,omitempty"`
 	ID         string `json:"id,omitempty"`
+	// Owner/OwnerKind 是唯一命中时的所属类型；Dispatch 给出分派性质：
+	// static / interface / trait / abstract / ambiguous。
+	Owner     string `json:"owner,omitempty"`
+	OwnerKind string `json:"ownerKind,omitempty"`
+	Dispatch  string `json:"dispatch,omitempty"`
+	// CandidateSymbols 列出全部同名定义（Candidates>1 时），供调用方自行判断。
+	CandidateSymbols []CalleeCandidate `json:"candidateSymbols,omitempty"`
+	// PossibleImplementations 是接口/抽象类/ trait 目标下同名具体方法（按“同名+具体 owner”近似，
+	// 不解析 implements/extends 声明，故为“可能实现”）。
+	PossibleImplementations []CalleeCandidate `json:"possibleImplementations,omitempty"`
+	// SelfRecursive = 目标就是源符号自身；Recursive = 沿调用边可回到源符号（含自递归）。
+	SelfRecursive bool `json:"self_recursive,omitempty"`
+	Recursive     bool `json:"recursive,omitempty"`
+}
+
+// CalleeCandidate 一个同名候选定义的简要信息。
+type CalleeCandidate struct {
+	ID        string `json:"id"`
+	File      string `json:"file"`
+	Kind      string `json:"kind"`
+	Name      string `json:"name"`
+	Line      int    `json:"line"`
+	Owner     string `json:"owner,omitempty"`
+	OwnerKind string `json:"ownerKind,omitempty"`
 }
 
 // Callers 返回调用了 target 的符号（limit<=0 = 不限；结果按 file/line/name 排序后截断）。
@@ -521,6 +566,12 @@ func (w *Workspace) Callers(target, file string, limit int) []Symbol {
 // CallersPage 是 Callers 的分页版本：先收集并排序全部调用方，再按 offset/limit 切片，
 // 同时返回**未截断的真实调用方总数**（total）。
 func (w *Workspace) CallersPage(target, file string, limit, offset int) ([]Symbol, int) {
+	return w.CallersPageLang(target, file, "", limit, offset)
+}
+
+// CallersPageLang 同 CallersPage，额外按索引语言（go/javascript/typescript/tsx/python/rust/java）
+// 过滤调用方；lang 为空 = 不过滤。
+func (w *Workspace) CallersPageLang(target, file, lang string, limit, offset int) ([]Symbol, int) {
 	ix := w.indexSnapshot()
 	target = strings.TrimSpace(target)
 	if ix == nil || target == "" {
@@ -538,7 +589,7 @@ func (w *Workspace) CallersPage(target, file string, limit, offset int) ([]Symbo
 	}
 	sort.Ints(idx)
 
-	syms := ix.AllSymbols()
+	syms := ix.syms
 	fileRel := w.norm(file)
 	out := make([]Symbol, 0)
 	for _, i := range idx {
@@ -547,6 +598,9 @@ func (w *Workspace) CallersPage(target, file string, limit, offset int) ([]Symbo
 		}
 		s := syms[i]
 		if file != "" && !w.fileHit(s.File, fileRel, file) {
+			continue
+		}
+		if lang != "" && !strings.EqualFold(s.Lang, lang) {
 			continue
 		}
 		if !anyCallMatches(s.Calls, target) {
@@ -626,24 +680,69 @@ func (w *Workspace) CalleesPage(id, file, name string, limit, offset int) ([]Cal
 
 // CalleesOf 基于已定位的目标符号生成调用目标列表；candidates 给出来源同名定义数
 // （0 = 外部/未索引，1 = 唯一解析，>1 = 同名多处）。
+//
+// 每个目标额外给出：owner/ownerKind（接口/trait/抽象类/类）、dispatch（静态/接口/trait/抽象/
+// 多义）、全部同名候选（>1 时）与“可能实现”（接口/抽象目标下同名具体方法，按同名近似，
+// 不解析 implements 声明），以及 self_recursive / recursive（沿调用边可回到源符号）。
 func (w *Workspace) CalleesOf(target Symbol, limit, offset int) ([]CalleeRef, int) {
+	return w.CalleesOfLang(target, "", limit, offset)
+}
+
+// CalleesOfLang 同 CalleesOf，可限定候选定义的语言（多语言仓库里同名跨语言时收窄）。
+func (w *Workspace) CalleesOfLang(target Symbol, lang string, limit, offset int) ([]CalleeRef, int) {
 	ix := w.indexSnapshot()
 	if ix == nil {
 		return []CalleeRef{}, 0
 	}
-	syms := ix.AllSymbols()
+	syms := ix.syms
 	all := make([]CalleeRef, 0, len(target.Calls))
 	for _, c := range target.Calls {
-		ids := ix.byName[strings.ToLower(c)]
-		ref := CalleeRef{Name: c, Candidates: len(ids)}
-		if len(ids) == 1 && ids[0] < len(syms) {
-			s := w.absSym(syms[ids[0]])
-			ref.Resolved = true
-			ref.Kind = s.Kind
-			ref.File = s.File
-			ref.Line = s.Line
-			ref.ID = s.ID
+		rawIDs := ix.byName[strings.ToLower(c)]
+		ids := make([]int, 0, len(rawIDs))
+		for _, i := range rawIDs {
+			if lang != "" && (i < 0 || i >= len(syms) || !strings.EqualFold(syms[i].Lang, lang)) {
+				continue
+			}
+			ids = append(ids, i)
 		}
+		ref := CalleeRef{Name: c, Candidates: len(ids)}
+		cands := make([]CalleeCandidate, 0, len(ids))
+		for _, i := range ids {
+			if i < 0 || i >= len(syms) {
+				continue
+			}
+			s := w.absSym(syms[i])
+			cands = append(cands, CalleeCandidate{
+				ID: s.ID, File: s.File, Kind: s.Kind, Name: s.Name, Line: s.Line,
+				Owner: s.Owner, OwnerKind: s.OwnerKind,
+			})
+		}
+		ref.Candidates = len(cands)
+		switch len(cands) {
+		case 0:
+			// 未索引/外部符号：无分派信息。
+		case 1:
+			s := cands[0]
+			ref.Resolved = true
+			ref.Kind, ref.File, ref.Line, ref.ID = s.Kind, s.File, s.Line, s.ID
+			ref.Owner, ref.OwnerKind = s.Owner, s.OwnerKind
+			if s.Kind == "method" && s.OwnerKind == "" {
+				ref.Dispatch = "unknown" // 旧索引未记录 owner：不谎报 static
+			} else {
+				ref.Dispatch = dispatchOf(s.OwnerKind)
+			}
+		default:
+			ref.CandidateSymbols = cands
+			ref.Dispatch = dispatchOfMany(cands)
+			if ref.Dispatch == "interface" || ref.Dispatch == "trait" || ref.Dispatch == "abstract" {
+				for _, s := range cands {
+					if !abstractOwnerKind(s.OwnerKind) && s.Owner != "" {
+						ref.PossibleImplementations = append(ref.PossibleImplementations, s)
+					}
+				}
+			}
+		}
+		ref.SelfRecursive, ref.Recursive = w.recursionFlags(ix, target, c, cands)
 		all = append(all, ref)
 	}
 	total := len(all)
@@ -659,12 +758,141 @@ func (w *Workspace) CalleesOf(target Symbol, limit, offset int) ([]CalleeRef, in
 	return all, total
 }
 
+// abstractOwnerKind 判断 owner 是否为接口/抽象类/trait（可分派到具体实现）。
+func abstractOwnerKind(kind string) bool {
+	return kind == "interface" || kind == "trait" || kind == "abstract_class"
+}
+
+// dispatchOf 单候选的分派性质。
+func dispatchOf(ownerKind string) string {
+	switch ownerKind {
+	case "interface":
+		return "interface"
+	case "trait":
+		return "trait"
+	case "abstract_class":
+		return "abstract"
+	default:
+		return "static"
+	}
+}
+
+// dispatchOfMany 多候选：优先报告抽象分派（接口/trait/抽象类），否则 ambiguous。
+func dispatchOfMany(cands []CalleeCandidate) string {
+	kind := ""
+	for _, c := range cands {
+		switch c.OwnerKind {
+		case "interface":
+			return "interface"
+		case "trait":
+			kind = "trait"
+		case "abstract_class":
+			if kind == "" {
+				kind = "abstract"
+			}
+		}
+	}
+	if kind != "" {
+		return kind
+	}
+	return "ambiguous"
+}
+
+// recursionFlags 判断该调用边是否自递归，以及沿调用边能否回到源符号（近似环）。
+func (w *Workspace) recursionFlags(ix *Index, target Symbol, callee string, cands []CalleeCandidate) (self, cyclic bool) {
+	targetID := target.ID
+	for _, c := range cands {
+		if targetID != "" && strings.EqualFold(c.ID, targetID) {
+			self = true
+			break
+		}
+	}
+	if strings.EqualFold(strings.TrimSpace(callee), target.Name) && self {
+		cyclic = true
+		return self, cyclic
+	}
+	if len(cands) == 0 {
+		return self, false
+	}
+	start := make([]string, 0, len(cands))
+	for _, c := range cands {
+		if c.Name != "" {
+			start = append(start, strings.ToLower(c.Name))
+		}
+	}
+	return self, self || w.reachesName(ix, start, strings.ToLower(target.Name), 8, 2000)
+}
+
+// reachesName 在名字级调用图上做有界 BFS：从 start 名字出发，是否能到达 target。
+func (w *Workspace) reachesName(ix *Index, start []string, target string, maxDepth, maxNodes int) bool {
+	target = strings.ToLower(strings.TrimSpace(target))
+	if target == "" {
+		return false
+	}
+	type node struct {
+		name  string
+		depth int
+	}
+	queue := make([]node, 0, len(start))
+	visited := map[string]bool{}
+	for _, n := range start {
+		if n == "" || visited[n] {
+			continue
+		}
+		visited[n] = true
+		queue = append(queue, node{n, 0})
+	}
+	expanded := 0
+	for len(queue) > 0 && expanded < maxNodes {
+		cur := queue[0]
+		queue = queue[1:]
+		if cur.depth >= maxDepth {
+			continue
+		}
+		for _, i := range ix.byName[cur.name] {
+			if i < 0 || i >= len(ix.syms) {
+				continue
+			}
+			for _, call := range ix.syms[i].Calls {
+				next := strings.ToLower(strings.TrimSpace(call))
+				if next == "" {
+					continue
+				}
+				if next == target {
+					return true
+				}
+				if !visited[next] {
+					visited[next] = true
+					queue = append(queue, node{next, cur.depth + 1})
+				}
+			}
+			expanded++
+			if expanded >= maxNodes {
+				return false
+			}
+		}
+	}
+	return false
+}
+
 // fileHit 文件过滤：相对路径子串或绝对路径子串命中（与 SearchSymbol 同口径）。
 func (w *Workspace) fileHit(sFile, fileRel, fileInput string) bool {
-	if strings.Contains(strings.ToLower(sFile), strings.ToLower(fileRel)) {
+	// 路径段后缀匹配：`main.go` 命中 `src/main.go`，但 `a.go` 不再命中 `data.go`。
+	// fileRel 已是 norm(input)（绝对输入→workdir 相对）；再兼容直接给绝对路径的场景。
+	if pathSegmentHit(sFile, fileRel) {
 		return true
 	}
-	return strings.Contains(strings.ToLower(w.abs(sFile)), strings.ToLower(fileInput))
+	return pathSegmentHit(w.abs(sFile), w.norm(fileInput))
+}
+
+// pathSegmentHit 判断 rel 是否等于 path 或为其路径段后缀（大小写不敏感）。
+func pathSegmentHit(path, rel string) bool {
+	p := strings.ToLower(strings.Trim(path, "/"))
+	r := strings.ToLower(strings.Trim(rel, "/"))
+	if r == "" {
+		return false
+	}
+	return p == r || strings.HasSuffix(p, "/"+r)
 }
 
 // callLookupKeys 查询目标 → byCall 检索键（本体 + 最后一段，均小写）。

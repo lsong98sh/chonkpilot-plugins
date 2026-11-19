@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -181,7 +182,13 @@ func (w *Workspace) parseEntry(e srcEntry) (*FileInfo, error) {
 
 // Initialize 全量索引（同步，直到完成并落盘；进度写入 meta 供跨进程 status 读取）。
 // exts / skipDirs / stackGitignore 传非 nil 时先更新配置（exts 空切片 = 回落全部受支持语言）。
+//
+// 与 Reconcile/IndexPaths/Clear/EnsureReady 共用 recMu 单飞（同一 workdir 不并行重建/差分）。
+// 落盘顺序：先写新快照 → 成功后才替换内存索引；保存失败只标 error，内存保持旧索引
+// （避免「内存新、磁盘旧」的不一致状态）。
 func (w *Workspace) Initialize(exts, skipDirs []string, stackGitignore *bool) error {
+	w.recMu.Lock()
+	defer w.recMu.Unlock()
 	if exts != nil || skipDirs != nil || stackGitignore != nil {
 		if err := w.Configure(nil, exts, skipDirs, stackGitignore); err != nil {
 			return err
@@ -220,6 +227,11 @@ func (w *Workspace) Initialize(exts, skipDirs []string, stackGitignore *bool) er
 			_ = w.saveMeta()
 		}
 	}
+	// 先落盘新快照；保存失败**不换**内存索引（磁盘仍是旧快照，内存也保持旧快照）。
+	if err := w.saveIndexSnapshot(next); err != nil {
+		w.markError(fmt.Sprintf("save index: %v", err))
+		return err
+	}
 	w.mu.Lock()
 	w.ix = next
 	w.meta.State = "ready"
@@ -227,10 +239,6 @@ func (w *Workspace) Initialize(exts, skipDirs []string, stackGitignore *bool) er
 	w.meta.ProgressTotal = total
 	w.meta.LastIndexedAt = time.Now().UnixNano()
 	w.mu.Unlock()
-	if err := w.SaveIndex(); err != nil {
-		w.markError(fmt.Sprintf("save index: %v", err))
-		return err
-	}
 	return w.saveMeta()
 }
 
@@ -273,9 +281,17 @@ func cloneIndex(ix *Index) *Index {
 
 // Reconcile 自愈增量：基线快检（mtime/size）→ 差异增删改 → 落盘。
 // 返回 changed 表示发生过更新。未初始化返回 ErrNotInitialized。
+// 与 Initialize/Clear/IndexPaths 共用 recMu 单飞（避免与并发重建/清除互踩）。
 var ErrNotInitialized = fmt.Errorf("索引未初始化（请先 codegraph_initialize）")
 
 func (w *Workspace) Reconcile() (changed bool, err error) {
+	w.recMu.Lock()
+	defer w.recMu.Unlock()
+	return w.reconcile()
+}
+
+// reconcile 是 Reconcile 的单飞内实现：调用方须持 recMu（EnsureReady 直接调用以避免重入）。
+func (w *Workspace) reconcile() (changed bool, err error) {
 	ok, err := w.LoadIndex()
 	if err != nil {
 		return false, err
@@ -347,16 +363,18 @@ func (w *Workspace) Reconcile() (changed bool, err error) {
 		}
 	}
 	if updated > 0 {
+		// 先落盘增量（只依赖 upserts/removed，不读 w.ix）；保存失败**不换**内存索引，
+		// 磁盘与内存都保持旧快照，仅状态标 error。saveIndexDelta 不持 w.mu，IO 安全。
+		if err := w.saveIndexDelta(upserts, removed); err != nil {
+			w.markError(fmt.Sprintf("save index: %v", err))
+			return true, err
+		}
 		w.mu.Lock()
 		w.ix = next
 		w.meta.State = "ready"
 		w.meta.Err = ""
 		w.meta.LastIndexedAt = time.Now().UnixNano()
 		w.mu.Unlock()
-		if err := w.saveIndexDelta(upserts, removed); err != nil {
-			w.markError(fmt.Sprintf("save index: %v", err))
-			return true, err
-		}
 		_ = w.saveMeta()
 	}
 	return updated > 0, nil
@@ -388,7 +406,7 @@ func (w *Workspace) EnsureReady() (string, error) {
 	if st == "indexing" {
 		return "indexing", nil
 	}
-	if _, err := w.Reconcile(); err != nil {
+	if _, err := w.reconcile(); err != nil {
 		return "not_initialized", err
 	}
 	return "ready", nil
@@ -522,6 +540,13 @@ func (w *Workspace) FindCycles() [][]string {
 	return cycles
 }
 
+// CycleFilter 是环枚举的过滤/裁剪选项。
+type CycleFilter struct {
+	IncludeSelf    bool
+	MaxCycleLength int    // >0：只枚举节点数 ≤ 该值的环（达到上限即剪枝，更长环不枚举）
+	PathPrefix     string // 非空：只在该 workdir 相对路径前缀（目录或文件）子图内枚举
+}
+
 // FindCyclesPage 确定性枚举简单环并分页。
 //
 //   - 路径为 workdir 相对路径；闭环在末尾重复起点（如 ["a.go","b.go","a.go"]）。
@@ -530,15 +555,33 @@ func (w *Workspace) FindCycles() [][]string {
 //   - limit<=0 表示不限（仅在内部/测试使用）；否则最多枚举 offset+limit+1 条，
 //     返回 truncated 表示是否还有下一页。
 func (w *Workspace) FindCyclesPage(limit, offset int, includeSelf bool) (cycles [][]string, truncated bool) {
+	cycles, truncated, _ = w.FindCyclesPageFiltered(context.Background(), limit, offset, CycleFilter{IncludeSelf: includeSelf})
+	return cycles, truncated
+}
+
+// FindCyclesPageFiltered 是 FindCyclesPage 的可过滤版本：支持路径前缀子图、环长度上限
+// 与 ctx 取消（取消返回 ctx.Err()，已完成结果丢弃）。枚举顺序与分页语义不变。
+func (w *Workspace) FindCyclesPageFiltered(ctx context.Context, limit, offset int, f CycleFilter) (out [][]string, truncated bool, err error) {
 	w.mu.Lock()
 	ix := w.ix
 	w.mu.Unlock()
 	if ix == nil {
-		return [][]string{}, false
+		return [][]string{}, false, nil
+	}
+	prefix := strings.Trim(strings.ToLower(w.norm(f.PathPrefix)), "/")
+	inScope := func(p string) bool {
+		if prefix == "" {
+			return true
+		}
+		lp := strings.ToLower(strings.Trim(p, "/"))
+		return lp == prefix || strings.HasPrefix(lp, prefix+"/")
 	}
 	indexed := map[string]bool{}
 	nodes := make([]string, 0, len(ix.Files))
 	for p := range ix.Files {
+		if !inScope(p) {
+			continue
+		}
 		indexed[p] = true
 		nodes = append(nodes, p)
 	}
@@ -556,7 +599,7 @@ func (w *Workspace) FindCyclesPage(limit, offset int, includeSelf bool) (cycles 
 			if t == "" || seen[t] {
 				continue
 			}
-			if t == p && !includeSelf {
+			if t == p && !f.IncludeSelf {
 				continue
 			}
 			seen[t] = true
@@ -569,17 +612,25 @@ func (w *Workspace) FindCyclesPage(limit, offset int, includeSelf bool) (cycles 
 	if limit > 0 {
 		capN = offset + limit + 1 // 多枚举 1 条用于判断 truncated
 	}
-	var out [][]string
 	var path []string
 	inPath := map[string]bool{}
 	stopped := false
+	maxLen := f.MaxCycleLength
 
 	var dfs func(start string, startIdx int, u string)
 	dfs = func(start string, startIdx int, u string) {
 		if stopped {
 			return
 		}
+		if err := ctx.Err(); err != nil {
+			stopped = true
+			return
+		}
 		for _, v := range adj[u] {
+			if err := ctx.Err(); err != nil {
+				stopped = true
+				return
+			}
 			if order[v] < startIdx {
 				continue // 每个环只从最小节点出发
 			}
@@ -597,6 +648,9 @@ func (w *Workspace) FindCyclesPage(limit, offset int, includeSelf bool) (cycles 
 			if inPath[v] {
 				continue
 			}
+			if maxLen > 0 && len(path) >= maxLen {
+				continue // 再展开就会超过环长度上限
+			}
 			inPath[v] = true
 			path = append(path, v)
 			dfs(start, startIdx, v)
@@ -610,6 +664,10 @@ func (w *Workspace) FindCyclesPage(limit, offset int, includeSelf bool) (cycles 
 
 	for si, start := range nodes {
 		if stopped {
+			break
+		}
+		if err := ctx.Err(); err != nil {
+			stopped = true
 			break
 		}
 		inPath[start] = true
@@ -632,8 +690,11 @@ func (w *Workspace) FindCyclesPage(limit, offset int, includeSelf bool) (cycles 
 			}
 		}
 	}
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return [][]string{}, false, ctxErr
+	}
 	if out == nil {
 		out = [][]string{}
 	}
-	return out, truncated
+	return out, truncated, nil
 }

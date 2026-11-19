@@ -5,7 +5,7 @@ name: browser_run
 title: 浏览器操作
 async: auto
 timeout: 60
-on_timeout: background
+touch_files: false
 category: browser
 hot: true
 idempotent: false
@@ -32,10 +32,11 @@ idempotent: false
 
 约定：
 
-- `context_id` 可显式指定，但必须属于当前实例/会话；跨实例操作会被拒绝。省略时复用当前实例的 context，没有则自动 start。
+- `context_id` 可显式指定，但必须属于当前实例/会话；跨实例操作会被拒绝。省略时复用当前实例的 context，没有则自动 start；**隐式 context 已过期（引擎 janitor/重启）时自动清理映射、重建 context 并重试一次**。显式传入已失效的 `context_id` 不自动重建，会返回可操作错误（改用 `action=start` 或省略 `context_id`）。
 - `ready:false` 表示页面在超时内未加载完成，不是失败；可稍后用 `wait`/`text` 检查。
-- `html` / `text` / `console_dump` / `eval` 的返回没有分页；超大页面可能触发传输上限。
-- `debug_open` 需要插件配置开启 debug（DevTools）。
+- `html` / `text` / `console_dump` / `eval` 的返回没有分页；单字段超过 **1MiB** 时按 UTF-8 边界截断，返回 `truncated:true` 与 `total_bytes`（缩小页面/selector 范围或用 `eval` 取片段）。
+- `start` 会先回收同一实例的旧 context（失败不阻断），避免反复 start 泄漏 context。
+- `debug_open` 需要插件配置开启 debug（DevTools）；未开启时明确报 `devtools disabled`。
 
 # 参数
 

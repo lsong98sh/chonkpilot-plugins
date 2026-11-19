@@ -26,18 +26,21 @@ import (
 	"github.com/lsong98sh/chonkpilot-plugin-framework/sdk"
 )
 
-const pluginVersion = "1.0.0"
-
 //go:embed all:tools
 var toolsFS embed.FS
 
 // toolsRoot 是 embed 内契约目录（`tools/mcp/*.tool.md`）。
 const toolsRoot = "tools/mcp"
 
-// hostCallTimeout 是单次宿主能力面调用的上限。
-// SDK 缺省 15s 会把 mcp_invoke 的同步等待截断（timeoutSec 失效），故放宽到
-// invokeTimeoutMax 之上；外层 gateway 仍按 `.tool.md` 的 timeout 裁决。
-const hostCallTimeout = time.Duration(invokeTimeoutMax+60) * time.Second
+// hostCallTimeout 是 SDK 的单次宿主调用缺省/启动 dial 上限。
+// find/load 另有 metaToolTimeout（60s）收敛；mcp_invoke 用 invokeHostTimeout 单独放宽。
+const hostCallTimeout = 60 * time.Second
+
+// invokeHostTimeout 是 mcp_invoke 单次宿主等待的安全阀。
+// mcp_invoke **不设自己的超时**：目标工具按其契约的 async / async-threshold / timeout 决定
+// （sync 到执行硬上限报错 / auto 到阈值转后台 / manual 到阈值返回 awaiting 待 detach|cancel），
+// 这里只防桥挂死。
+const invokeHostTimeout = 24 * time.Hour
 
 // invokeResultMaxBytes 是 mcp_invoke 单次返回的上限。目标工具/资源的正文可能远大于
 // LLM 上下文预算（如 mcp_load 读资源）；超出时截断并标记 truncated/total_bytes，
@@ -74,12 +77,15 @@ type entry struct {
 	Schema      map[string]any `json:"input_schema,omitempty"`
 }
 
+// embeddedManifest 是插件 manifest（构建期嵌入 exe，随 `plugin.hello` 上报；宿主不再读盘）。
+//
+//go:embed manifest.json
+var embeddedManifest []byte
+
 func main() {
 	p, err := pluginsdk.New(pluginsdk.Options{
-		ID:      "mcp",
-		Name:    "MCP 工具",
-		Version: pluginVersion,
-		Timeout: hostCallTimeout,
+		Timeout:  hostCallTimeout,
+		Manifest: embeddedManifest,
 		Features: map[string]any{
 			"mcp": "http",
 			"ui":  true,
@@ -108,7 +114,7 @@ func main() {
 	}
 
 	p.OnRequest("status", m.info)
-	p.OnRequest("ping", pluginsdk.PingHandler(pluginVersion))
+	p.OnRequest("ping", pluginsdk.PingHandler(p.Version()))
 	// 宿主资源通道（PLUGIN-UI-1）：插件自持 webui（embed），宿主经 UDS 逐文件拉取
 	// （GET /plugins/mcp/<path> → plugin/v1/ui.asset.get）。
 	p.OnRequest("plugin/v1/ui.asset.get", uiAssetGet)
@@ -343,24 +349,12 @@ func (m *mcpPlugin) invoke(ctx context.Context, args map[string]any, cx pluginsd
 		return nil, err
 	}
 
-	cfg := m.cfg.Settings()
-	timeout := cfg.InvokeTimeoutSec
-	if n := toInt(args["timeoutSec"]); n > 0 {
-		timeout = n
-	}
-	if timeout < invokeTimeoutMin {
-		timeout = invokeTimeoutMin
-	}
-	if timeout > invokeTimeoutMax {
-		timeout = invokeTimeoutMax
-	}
-	cctx, cancel := context.WithTimeout(ctx, time.Duration(timeout)*time.Second)
-	defer cancel()
-
+	// 不设本工具自己的超时：等待时长完全由目标工具的契约策略决定
+	// （fail / 自动转后台 / awaiting 可选转后台）。宿主调用上限见 hostCallTimeout（安全阀）。
 	// `request_id` 让桥走「命令类 + 等待」同步分支（bridge/forwardMQ），拿回目标工具的
 	// 真实结果/错误/超时/取消，而不是 `{accepted:true}` 受理回执。
 	payload := invokeRequest(name, arguments, cx)
-	raw, err := m.p.Call(cctx, "plugin/v1/tools.call", payload)
+	raw, err := m.p.CallWithTimeout(ctx, invokeHostTimeout, "plugin/v1/tools.call", payload)
 	if err != nil {
 		return nil, err
 	}
@@ -796,7 +790,7 @@ func resultText(res map[string]any) string {
 	return strings.Join(parts, "\n")
 }
 
-// mergeLoad 组装 mcp_load 返回：tool → input_schema；skill/prompt/resource → content（+ text 兼容）。
+// mergeLoad 组装 mcp_load 返回：tool → input_schema；skill/prompt/resource → content。
 func mergeLoad(e entry, content, mimeType string) map[string]any {
 	if e.Type == "" {
 		e.Type = e.Kind
@@ -819,13 +813,11 @@ func mergeLoad(e entry, content, mimeType string) map[string]any {
 		out["input_schema"] = e.Schema
 	case "skill", "prompt":
 		out["content"] = content
-		out["text"] = content
 	case "resource":
 		if e.URI != "" {
 			out["uri"] = e.URI
 		}
 		out["content"] = content
-		out["text"] = content
 		if mimeType != "" {
 			out["mimeType"] = mimeType
 		}
@@ -836,11 +828,10 @@ func mergeLoad(e entry, content, mimeType string) map[string]any {
 func (m *mcpPlugin) info(_ context.Context, _ map[string]any) (any, error) {
 	cfg := m.cfg.Settings()
 	return map[string]any{
-		"ok":               true,
-		"version":          pluginVersion,
-		"defaultLimit":     cfg.DefaultLimit,
-		"includeNonHot":    cfg.IncludeNonHot,
-		"invokeTimeoutSec": cfg.InvokeTimeoutSec,
+		"ok":            true,
+		"version":       m.p.Version(),
+		"defaultLimit":  cfg.DefaultLimit,
+		"includeNonHot": cfg.IncludeNonHot,
 	}, nil
 }
 

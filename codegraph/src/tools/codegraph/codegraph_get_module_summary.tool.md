@@ -5,7 +5,7 @@ name: codegraph_get_module_summary
 title: 模块摘要
 async: auto
 timeout: 30
-on_timeout: background
+touch_files: false
 category: codegraph
 hot: true
 ```
@@ -15,7 +15,7 @@ hot: true
 目录/项目摘要：文件数、语言分布、符号数、最高复杂度函数（全部基于索引统计）。
 
 - `path` 为目录前缀，按**路径段边界**且大小写不敏感匹配（`src` 命中 `src/a.go`，不命中 `srcfoo/a.go`）；可传相对或 workdir 内绝对路径；省略时统计整个项目，`scope` 返回 workdir。
-- `files` = 范围内**已索引文件数**（≤8MB、受 exts/skip/gitignore 限制；不包含未索引/不支持语言/被排除文件，也不是仓库文件总数）。
+- `files` = 范围内**已索引文件数**（≤8MB、受 exts/skip/gitignore 限制；不包含未索引/不支持语言/被排除文件，也不是仓库文件总数）；返回的 `coverageNote` 明确该口径。
 - `symbols` = 范围内全部符号数（含 func/method/class/type/interface/enum/trait/constructor，不只是函数）。
 - `topComplexity5` 只含 **func/method/constructor**，按复杂度降序 → 文件 → 行号 → 名称 → kind 稳定排序，最多 5 条。
 - `langCounts` 以语言名为键（`go/javascript/typescript/tsx/python/rust/java`，不是扩展名；`tsx` 单列）。

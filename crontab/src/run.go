@@ -66,7 +66,7 @@ type runner struct {
 	agents agentHost
 }
 
-// execute 执行任务动作并返回运行记录（不落盘；调用方负责写 store / runs.jsonl）。
+// execute 执行任务动作并返回运行记录（不落盘；调用方负责写 store / runs 表）。
 func (r *runner) execute(ctx context.Context, t Task, spec *ActionSpec) RunRecord {
 	now := time.Now().Unix()
 	switch spec.Type {
@@ -116,8 +116,9 @@ func (r *runner) runCommand(ctx context.Context, t Task, spec *ActionSpec, now i
 	rec.SessionID, rec.DialogID, rec.TurnID = ref.SessionID, ref.DialogID, ref.TurnID
 	r.finishCronRound(ctx, strings.TrimSpace(t.CreatedBy.WorkDir), ref, rec)
 
-	if enabled, text := spec.NotifySetting(); enabled {
-		body := buildCompletionBody(t.Description, text, rec)
+	enabled, text := spec.NotifySetting()
+	body := buildCompletionBody(t.Description, text, rec)
+	if enabled {
 		if nerr := r.notifier.Notify("ChonkPilot 定时任务", body, ""); nerr != nil {
 			rec.Detail = appendDetail(rec.Detail, "notify_error: "+nerr.Error())
 			if r.logf != nil {
@@ -125,6 +126,9 @@ func (r *runner) runCommand(ctx context.Context, t Task, spec *ActionSpec, now i
 			}
 		}
 	}
+	// 创建者会话通知**始终发送**（LLM 创建的任务必须回主会话；manual 任务可指定目标会话）。
+	// `notify` 只控制 Windows 系统 Toast，不关闭会话内完成通知。
+	r.notifyCreator(ctx, t, rec, body)
 	return rec
 }
 
@@ -163,12 +167,16 @@ func (r *runner) runAgent(ctx context.Context, t Task, spec *ActionSpec, now int
 	if displayName == "" {
 		displayName = "定时任务"
 	}
+	kind := sessionKindCrontabTask
+	if sessionModeOf(t) == SessionModeOwn {
+		kind = sessionKindCrontabOwn
+	}
 	res, err := r.agents.RunAgent(ctx, agentRunReq{
 		WorkDir:     strings.TrimSpace(t.CreatedBy.WorkDir),
 		InstanceID:  t.CreatedBy.InstanceID,
 		SessionID:   ref.SessionID,
 		DialogID:    ref.DialogID,
-		SessionKind: sessionKindCrontabTask,
+		SessionKind: kind,
 		Prompt:      spec.Agent.Prompt,
 		AgentName:   spec.Agent.Agent,
 		Title:       title,
@@ -197,8 +205,9 @@ func (r *runner) runAgent(ctx context.Context, t Task, spec *ActionSpec, now int
 		rec.TurnID = res.TurnID
 	}
 
-	if enabled, text := spec.AgentNotifySetting(); enabled {
-		body := buildAgentBody(t.Description, text, rec, res.Text)
+	enabled, text := spec.AgentNotifySetting()
+	body := buildAgentBody(t.Description, text, rec, res.Text)
+	if enabled {
 		if nerr := r.notifier.Notify("ChonkPilot 定时任务", body, ""); nerr != nil {
 			rec.Detail = appendDetail(rec.Detail, "notify_error: "+nerr.Error())
 			if r.logf != nil {
@@ -206,6 +215,8 @@ func (r *runner) runAgent(ctx context.Context, t Task, spec *ActionSpec, now int
 			}
 		}
 	}
+	// 创建者会话通知**始终发送**（见 runCommand 同注释）。
+	r.notifyCreator(ctx, t, rec, body)
 	return rec
 }
 

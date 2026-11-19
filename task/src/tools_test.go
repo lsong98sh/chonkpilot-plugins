@@ -405,3 +405,21 @@ func TestSettingsInterpreterMap(t *testing.T) {
 		t.Fatal("未配置的解释器不应入表")
 	}
 }
+
+// TestIntArg 严格整数参数：缺省 OK；整数/浮点整数接受；字符串/小数/越界报错。
+func TestIntArg(t *testing.T) {
+	if n, ok, err := intArg(map[string]any{}, "waitSec", 0, 600); ok || err != nil || n != 0 {
+		t.Fatalf("缺省应返回 (0,false,nil): %d %v %v", n, ok, err)
+	}
+	if n, ok, err := intArg(map[string]any{"waitSec": float64(30)}, "waitSec", 0, 600); err != nil || !ok || n != 30 {
+		t.Fatalf("浮点整数应接受: %d %v %v", n, ok, err)
+	}
+	if n, ok, err := intArg(map[string]any{"waitSec": 30}, "waitSec", 0, 600); err != nil || !ok || n != 30 {
+		t.Fatalf("int 应接受: %d %v %v", n, ok, err)
+	}
+	for _, bad := range []any{"30", 1.5, -1, 601, true} {
+		if _, _, err := intArg(map[string]any{"waitSec": bad}, "waitSec", 0, 600); err == nil {
+			t.Errorf("waitSec=%v 应报错", bad)
+		}
+	}
+}

@@ -260,6 +260,9 @@ func (e *webviewEngine) Do(action string, args map[string]any) (map[string]any, 
 		return map[string]any{"ready": e.waitReady(10 * time.Second)}, nil
 
 	case "debug_open":
+		if !e.opts.Debug {
+			return nil, fmt.Errorf("devtools disabled (start with debug=true)")
+		}
 		if d, ok := e.wv.(webview2.DevTools); ok {
 			d.OpenDevToolsWindow()
 			return map[string]any{"opened": true}, nil

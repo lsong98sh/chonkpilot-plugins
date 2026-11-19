@@ -3,14 +3,14 @@
 name: file_write
 title: 写入文件
 args: file_write --input={RAW-INPUT-FILE}
-async: never
+async: sync
 category: file
 hot: true
 runtime: builtin
 idempotent: false
 output: stdout
 timeout: 120
-on_timeout: background
+touch_files: true
 ```
 
 # 摘要

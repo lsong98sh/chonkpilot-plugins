@@ -187,13 +187,19 @@ func TestMergeLoad(t *testing.T) {
 	}
 
 	skill := mergeLoad(entry{Name: "ux-audit", Kind: "skill", Type: "skill", Description: "审计"}, "正文", "")
-	if skill["kind"] != "skill" || skill["content"] != "正文" || skill["text"] != "正文" {
-		t.Fatalf("skill 应返回 content/text: %v", skill)
+	if skill["kind"] != "skill" || skill["content"] != "正文" {
+		t.Fatalf("skill 应返回 content: %v", skill)
+	}
+	if _, ok := skill["text"]; ok {
+		t.Fatalf("skill 不应再返回 text 双份: %v", skill)
 	}
 
 	res := mergeLoad(entry{Name: "doc", Kind: "resource", Type: "resource", URI: "kb://doc/1"}, "内容", "text/markdown")
 	if res["kind"] != "resource" || res["content"] != "内容" || res["mimeType"] != "text/markdown" {
 		t.Fatalf("resource 应返回 content/mimeType: %v", res)
+	}
+	if _, ok := res["text"]; ok {
+		t.Fatalf("resource 不应再返回 text 双份: %v", res)
 	}
 	if res["uri"] != "kb://doc/1" {
 		t.Fatalf("resource 应保留 uri: %v", res)

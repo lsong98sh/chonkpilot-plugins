@@ -74,3 +74,7 @@ status: verified
 - `TestToolComplexityFiltersAndCap`：默认只含函数类、`kind=all/method`、topN 截断与 `total`/`truncated`、topN 上限 200、稳定排序、minCc 空结果、file 子串/未命中、coverage、严格参数（未知键/0/非法 kind/类型/小数）。
 - 既有 `TestTopComplexity`（兼容接口：top3/minCc/file/no index）回归。
 - 回归：`go test -count=1 ./server/...` 通过。
+## 8. P2 口径补充（2026-11-11）
+
+- `coverage` 新增 `note`：“只统计已索引文件；>8MB、被排除或不支持语言的文件未计入”，避免把 `indexed_files` 误当仓库文件总数。
+- 仍为基线：复杂度口径与 gocyclo 不同（不计 `&&`/`||`，switch/default 各计 1）；改动会改变所有数值，需产品确认后再动。

@@ -28,11 +28,11 @@ func syntheticContracts() []ContractTool {
 				},
 			},
 			Meta: map[string]any{
-				"hot":        true,
-				"source":     "md",
-				"async":      "auto",
-				"timeout":    30,
-				"on_timeout": "background",
+				"hot":         true,
+				"source":      "md",
+				"async":       "auto",
+				"timeout":     30,
+				"touch_files": false,
 			},
 		})
 	}
@@ -89,7 +89,7 @@ func callText(t *testing.T, cs *mcp.ClientSession, params *mcp.CallToolParams) (
 	return tc.Text, res.IsError
 }
 
-// TestContractMetaListed：注册面必须带上 md 的 _meta（source=md / async / timeout / on_timeout）。
+// TestContractMetaListed：注册面必须带上 md 的 _meta（source=md / async / timeout / touch_files）。
 func TestContractMetaListed(t *testing.T) {
 	cs := newTestClient(t)
 	res, err := cs.ListTools(context.Background(), nil)
@@ -112,11 +112,14 @@ func TestContractMetaListed(t *testing.T) {
 	if found.Meta["hot"] != true {
 		t.Errorf("_meta.hot = %v，want true", found.Meta["hot"])
 	}
-	if found.Meta["async"] != "auto" || found.Meta["on_timeout"] != "background" {
-		t.Errorf("_meta 策略不完整: %v", found.Meta)
+	if found.Meta["async"] != "auto" {
+		t.Errorf("_meta.async = %v，want auto", found.Meta["async"])
 	}
 	if toInt(found.Meta["timeout"]) != 30 {
 		t.Errorf("_meta.timeout = %v，want 30", found.Meta["timeout"])
+	}
+	if v, ok := found.Meta["touch_files"].(bool); !ok || v {
+		t.Errorf("_meta.touch_files = %v（存在=%v），want false", found.Meta["touch_files"], ok)
 	}
 }
 

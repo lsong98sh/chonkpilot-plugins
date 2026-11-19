@@ -71,3 +71,8 @@ status: verified
 - `TestToolModuleSummaryScopeAndCoverage`：全项目 scope=workdir、files/symbols、parseErrorFiles（含语法错误文件）、lastIndexedAt、topComplexity5 只含函数；`src`/`SRC`/`./src/`/绝对路径均命中、不吞 `srcfoo`；未命中 `path_not_indexed`；严格参数。
 - 既有 `TestModuleSummary`（3 文件/5 符号/语言分布/topComplexity5 函数类/前缀过滤/no index）回归，topComplexity5 断言已改为 3 条函数。
 - 回归：`go test -count=1 ./server/...` 通过。
+## 8. P2 口径补充（2026-11-11）
+
+- 响应新增 `coverageNote`：“files 只统计已索引文件；>8MB、被排除或不支持语言的文件未计入”，与 `files` 字段并列，避免当成仓库文件总数。
+- 测试：`TestCoverageNotes`（module summary 的 `coverageNote`）。
+- 仍为基线：未索引/被排除文件仍无法逐项列出（索引不记录这些文件）。

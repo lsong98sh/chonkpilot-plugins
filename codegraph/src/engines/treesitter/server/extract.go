@@ -12,12 +12,12 @@ import (
 // nameKinds: 可充当"名字"的叶子节点类型（无 name 字段时回退查找）
 // decisionKinds: 计入圈复杂度的分支/循环节点类型
 var defKinds = map[string]map[string]string{
-	"go":         {"function_declaration": "func", "method_declaration": "method", "type_declaration": "type", "type_spec": "type"},
+	"go":         {"function_declaration": "func", "method_declaration": "method", "method_elem": "method", "type_declaration": "type", "type_spec": "type"},
 	"javascript": {"function_declaration": "func", "generator_function_declaration": "func", "class_declaration": "class", "method_definition": "method"},
-	"typescript": {"function_declaration": "func", "generator_function_declaration": "func", "class_declaration": "class", "abstract_class_declaration": "class", "method_definition": "method", "interface_declaration": "interface", "type_alias_declaration": "type", "enum_declaration": "enum"},
-	"tsx":        {"function_declaration": "func", "generator_function_declaration": "func", "class_declaration": "class", "abstract_class_declaration": "class", "method_definition": "method", "interface_declaration": "interface", "type_alias_declaration": "type", "enum_declaration": "enum"},
+	"typescript": {"function_declaration": "func", "generator_function_declaration": "func", "class_declaration": "class", "abstract_class_declaration": "class", "method_definition": "method", "method_signature": "method", "interface_declaration": "interface", "type_alias_declaration": "type", "enum_declaration": "enum"},
+	"tsx":        {"function_declaration": "func", "generator_function_declaration": "func", "class_declaration": "class", "abstract_class_declaration": "class", "method_definition": "method", "method_signature": "method", "interface_declaration": "interface", "type_alias_declaration": "type", "enum_declaration": "enum"},
 	"python":     {"function_definition": "func", "class_definition": "class"},
-	"rust":       {"function_item": "func", "struct_item": "type", "enum_item": "enum", "trait_item": "trait", "type_item": "type"},
+	"rust":       {"function_item": "func", "function_signature_item": "func", "struct_item": "type", "enum_item": "enum", "trait_item": "trait", "type_item": "type"},
 	"java":       {"class_declaration": "class", "interface_declaration": "interface", "enum_declaration": "enum", "record_declaration": "class", "method_declaration": "method", "constructor_declaration": "constructor"},
 }
 
@@ -130,12 +130,17 @@ func parseFile(langName, path string, src []byte) (*FileInfo, error) {
 					cc = complexityOf(langName, dec, n)
 					calls = callsWithin(langName, n, src)
 				}
+				owner, ownerKind := "", ""
+				if kind == "method" || kind == "constructor" {
+					owner, ownerKind = ownerOf(langName, n, src)
+				}
 				fi.Symbols = append(fi.Symbols, Symbol{
 					File: path, Kind: kind, Lang: langName, Name: name,
 					Line: int(n.StartPosition().Row) + 1, EndLine: int(n.EndPosition().Row) + 1,
 					Complexity: cc,
 					Signature:  firstLine(src, n),
-					Calls:      calls,
+					Owner:      owner, OwnerKind: ownerKind,
+					Calls: calls,
 				})
 			}
 			// 类/结构体内的定义继续下钻（如 python 类内 def → method）
@@ -486,4 +491,147 @@ func extSpecFor(name string) (langSpec, bool) {
 		}
 	}
 	return langSpec{}, false
+}
+
+// ownerOf 取方法的所属类型与类型类别（无类型解析，按语法结构近似）。
+// 返回空串表示无法确定（如匿名接口方法、顶层函数）。
+func ownerOf(lang string, n *ts.Node, src []byte) (name, kind string) {
+	switch lang {
+	case "go":
+		switch n.Kind() {
+		case "method_declaration":
+			if r := n.ChildByFieldName("receiver"); r != nil {
+				return goReceiverType(r, src), "type"
+			}
+		case "method_elem":
+			// 命名接口：owner 取外层 type_spec 名；匿名 interface{...} 无法命名 → 空 owner。
+			inInterface := false
+			for p := n.Parent(); p != nil; p = p.Parent() {
+				if p.Kind() == "interface_type" {
+					inInterface = true
+				}
+				if inInterface && p.Kind() == "type_spec" {
+					return defName(p, nameKinds["go"], src), "interface"
+				}
+			}
+			if inInterface {
+				return "", "interface"
+			}
+		}
+	case "java":
+		for p := n.Parent(); p != nil; p = p.Parent() {
+			switch p.Kind() {
+			case "class_declaration":
+				k := "class"
+				if hasModifier(src, p, "abstract") {
+					k = "abstract_class"
+				}
+				return defName(p, nameKinds[lang], src), k
+			case "interface_declaration":
+				return defName(p, nameKinds[lang], src), "interface"
+			case "enum_declaration":
+				return defName(p, nameKinds[lang], src), "enum"
+			case "record_declaration":
+				return defName(p, nameKinds[lang], src), "class"
+			}
+		}
+	case "javascript", "typescript", "tsx":
+		for p := n.Parent(); p != nil; p = p.Parent() {
+			switch p.Kind() {
+			case "class_declaration":
+				return defName(p, nameKinds[lang], src), "class"
+			case "abstract_class_declaration":
+				return defName(p, nameKinds[lang], src), "abstract_class"
+			case "interface_declaration":
+				return defName(p, nameKinds[lang], src), "interface"
+			}
+		}
+	case "python":
+		for p := n.Parent(); p != nil; p = p.Parent() {
+			if p.Kind() == "class_definition" {
+				return defName(p, nameKinds[lang], src), "class"
+			}
+		}
+	case "rust":
+		for p := n.Parent(); p != nil; p = p.Parent() {
+			switch p.Kind() {
+			case "trait_item":
+				return defName(p, nameKinds[lang], src), "trait"
+			case "impl_item":
+				name := ""
+				if t := p.ChildByFieldName("type"); t != nil {
+					name = strings.TrimSpace(nodeText(src, t))
+				}
+				if name == "" {
+					name = defName(p, nameKinds[lang], src)
+				}
+				if p.ChildByFieldName("trait") != nil {
+					return name, "trait_impl"
+				}
+				return name, "impl"
+			}
+		}
+	}
+	return "", ""
+}
+
+// goReceiverType 从 method_declaration 的 receiver 取接收者类型名（去指针/泛型）。
+func goReceiverType(receiver *ts.Node, src []byte) string {
+	for i := 0; i < int(receiver.NamedChildCount()); i++ {
+		p := receiver.NamedChild(uint(i))
+		if t := p.ChildByFieldName("type"); t != nil {
+			return goTypeName(t, src)
+		}
+	}
+	return ""
+}
+
+// goTypeName 取 Go 类型表达式的名字：type_identifier / *T / T[P] / pkg.T。
+func goTypeName(n *ts.Node, src []byte) string {
+	if n == nil {
+		return ""
+	}
+	switch n.Kind() {
+	case "type_identifier":
+		return strings.TrimSpace(nodeText(src, n))
+	case "pointer_type":
+		if n.NamedChildCount() > 0 {
+			return goTypeName(n.NamedChild(0), src)
+		}
+	case "generic_type":
+		if t := n.ChildByFieldName("type"); t != nil {
+			return goTypeName(t, src)
+		}
+		if n.NamedChildCount() > 0 {
+			return goTypeName(n.NamedChild(0), src)
+		}
+	case "qualified_type":
+		if n.NamedChildCount() > 0 {
+			return goTypeName(n.NamedChild(uint(n.NamedChildCount()-1)), src)
+		}
+	}
+	return ""
+}
+
+// hasModifier 判断 Java 类/方法是否带指定修饰符（如 abstract）。
+func hasModifier(src []byte, n *ts.Node, word string) bool {
+	if m := n.ChildByFieldName("modifiers"); m != nil {
+		return containsWord(nodeText(src, m), word)
+	}
+	for i := 0; i < int(n.NamedChildCount()); i++ {
+		c := n.NamedChild(uint(i))
+		if c.Kind() == "modifiers" {
+			return containsWord(nodeText(src, c), word)
+		}
+	}
+	return false
+}
+
+func containsWord(s, word string) bool {
+	for _, f := range strings.Fields(s) {
+		if f == word {
+			return true
+		}
+	}
+	return false
 }

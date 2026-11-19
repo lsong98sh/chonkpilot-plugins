@@ -117,3 +117,12 @@ J. 输出体积：`text` 为子代理最终回复全文，无截断/无长度上
 
 - 同 task_run：**基线 6 不成立**。契约 `async/timeout` 只存在于插件 embed 的 md，不进 gateway；实际档位由宿主强制 `always`，因此“超时裁决 wait/cancel”对本工具在正常链路不可达。
 - 基线 2（展示名）：`task_llm` 的 `title` 是工具**自有**参数，与 gateway 注入的 `tool_call_display_name`（→ `purpose`）并存；插件把 `cx.Purpose` 也转给宿主作为任务节点 purpose（`main.go:283`），两者不要混为一谈。
+## 10. 修复记录（2026-11-12）
+
+- **P0（2026-11-08）**：SDK 15s 桥超时击穿已修——`task_llm` 改用 `CallIntoWithTimeout`，按 `waitSec` 计算（0/缺省 600s，detach 30s，waitSec+15s 余量封顶 600s），长委派不再被 15s 截断。
+- **P1 agent 拼错静默退化**：宿主 `plugin/v1/agent.delegate` 先按当前场景 agent / app 级注册表解析；未命中返回 `agent_not_found` 并列出可用 agent，**不再**退化为全能力子代理（`TestPluginAgentDelegateRejectsUnknownAgent`）。
+- **P1 传输失败丢 result_summary**：`finalizeDelegatedNode` 在 `werr != nil` 时仍写入子轮次已产出的 `out.Text`；`delegatedWireResult` 同步附 `partial`。
+- **P2 同 session_id 并发**：`startChildTurn` 检查 `busy` 键，已在跑 → 返回 session_busy 错误，不再覆盖宿主 busy/共享上下文。
+- **P2 waitSec 范围**：插件严格校验整数 0..600（负数/小数/字符串/越界报参数错误），越界不再被静默忽略。
+- **P2 缺省标题**：改为 prompt **首个非空行**（≤60 rune），与契约“首行”一致（原 `oneLine` 会把多行压成一行）。
+- 仍为基线：无嵌套深度/并发上限（子代理可继续再委派），属产品策略，未改。

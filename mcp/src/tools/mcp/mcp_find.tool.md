@@ -9,7 +9,7 @@ runtime: plugin
 idempotent: true
 output: stdout
 timeout: 60
-on_timeout: fail
+touch_files: false
 ```
 
 # 摘要

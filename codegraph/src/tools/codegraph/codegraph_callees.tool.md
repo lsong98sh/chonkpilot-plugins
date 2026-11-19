@@ -5,7 +5,7 @@ name: codegraph_callees
 title: 被调方查询
 async: auto
 timeout: 30
-on_timeout: background
+touch_files: false
 category: codegraph
 hot: true
 ```
@@ -15,6 +15,10 @@ hot: true
 查「它调用了谁」：按 id（优先）或 file+name 定位符号，返回其直接调用的目标名（含 resolved、candidates 与解析到的 file/line）。
 
 - 语义为调用点文本的**名字级启发式**：无类型/重载解析；被调名只保留最后一段（`a.b.Foo()` → `Foo`），receiver/qualifier 丢失。
+- **关系增强（无类型解析，按语法结构近似）**：每个 callee 附 `owner`/`ownerKind`（`interface`/`trait`/`abstract_class`/`class`/`type`/`impl`/`trait_impl`/`enum`）与 `dispatch`（`static`/`interface`/`trait`/`abstract`/`ambiguous`/`unknown`）；`candidates>1` 时 `candidateSymbols` **列出全部同名定义**；接口/抽象类/trait 目标另给 `possibleImplementations`（同名具体方法，按 owner 非抽象近似，**不解析 implements/extends**，故为“可能实现”）。
+- **递归/环**：`self_recursive=true` 表示目标就是源符号自身；`recursive=true` 表示沿名字级调用边（≤8 层、节点上限 2000）能回到源符号（含自递归）。
+- `lang` 可限定候选定义语言（多语言仓库同名跨语言时收窄）；返回回声 `lang`。
+- owner/dispatch 依赖索引中记录的方法所属类型：**旧索引（升级前建立）可能为空**，此时 `dispatch=unknown`；重建索引（`codegraph_initialize`）后补齐。
 - `id` 优先；file+name 定位时 file 为精确路径（绝对/相对、大小写不敏感），name 大小写不敏感。
 - 同一 file+name 多命中：`matches` 为总数，`symbol` 为首条，`symbols` 为全部候选，`ambiguous=true`；`callees` 只针对首条目标。
 - 每个 callee 的 `candidates` = 索引内同名定义数：`0` = 未索引/外部符号，`1` = `resolved=true` 并回填 file/line/kind/id，`>1` = 同名多处无法解析。
@@ -34,6 +38,7 @@ hot: true
     "id": {"type": "string", "description": "符号 id（file:line:name:kind）；提供时忽略 file/name"},
     "file": {"type": "string", "description": "符号所在文件（精确匹配，大小写不敏感；配 name 定位）"},
     "name": {"type": "string", "description": "符号名（大小写不敏感全名；配 file 定位）"},
+    "lang": {"type": "string", "enum": ["go", "javascript", "typescript", "tsx", "python", "rust", "java"], "description": "候选定义语言过滤（可选）"},
     "limit": {"type": "integer", "minimum": 1, "maximum": 500, "default": 50, "description": "返回上限（缺省 50，硬上限 500）"},
     "offset": {"type": "integer", "minimum": 0, "default": 0, "description": "排序后跳过条数（翻页）"}
   }
@@ -55,7 +60,10 @@ hot: true
   "offset": 0,
   "truncated": false,
   "callees": [
-    { "name": "Run", "resolved": false, "candidates": 4 },
+    { "name": "Run", "resolved": false, "candidates": 4, "dispatch": "interface",
+      "candidateSymbols": [ { "id": "E:/proj/i.go:3:Run:method", "file": "E:/proj/i.go", "kind": "method", "name": "Run", "line": 3, "owner": "Runner", "ownerKind": "interface" },
+                           { "id": "E:/proj/t.go:7:Run:method", "file": "E:/proj/t.go", "kind": "method", "name": "Run", "line": 7, "owner": "Impl", "ownerKind": "type" } ],
+      "possibleImplementations": [ { "id": "E:/proj/t.go:7:Run:method", "file": "E:/proj/t.go", "kind": "method", "name": "Run", "line": 7, "owner": "Impl", "ownerKind": "type" } ] },
     { "name": "Helper", "resolved": true, "candidates": 1, "kind": "func", "file": "E:/proj/b.go", "line": 3, "id": "E:/proj/b.go:3:Helper:func" }
   ]
 }

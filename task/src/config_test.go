@@ -8,6 +8,8 @@ import (
 	"strings"
 	"sync"
 	"testing"
+
+	pluginsdk "github.com/lsong98sh/chonkpilot-plugin-framework/sdk"
 )
 
 // ─── 测试桩：配置存储 ────────────────────────────────────────────
@@ -309,7 +311,7 @@ func TestInfoUsesSettings(t *testing.T) {
 		KeyStatusLimit:       "10",
 	})
 	m := newTestManager(t, store, nil)
-	p := &taskPlugin{cfg: m}
+	p := &taskPlugin{cfg: m, p: &pluginsdk.Plugin{}}
 	res, err := p.info(context.Background(), nil)
 	if err != nil {
 		t.Fatalf("info: %v", err)

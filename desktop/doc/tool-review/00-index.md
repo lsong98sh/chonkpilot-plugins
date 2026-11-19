@@ -26,3 +26,4 @@
 
 - 分配清单只要求 `desktop_run`，已全覆盖；未发现虚拟/隐藏工具。
 - 未执行 build/test/插件进程；未启动桌面引擎、未注入输入。所有结论基于源码与 gateway 代码。
+> **2026-11-08 / 2026-11-11 修复说明**：P0 已清零——screenshot 无目标不再崩引擎（recover + 整屏语义）、目标窗口绑定/说明可达、截图落盘过沙箱、context 归属（instance/session）由 enginehost 校验；move/size 不再破坏窗口尺寸/位置；list_windows 补齐 class/visible。2026-11-11 补：隐式 context 失效自动重建并重试一次（复用 start 绑定）、失效 stop 幂等、start 回收旧 context、click 失败不再静默成功、截图缺路径在开会话前报错。明细见 `desktop_run.md` §10；上表计数仍为审查时基线。仍存：跨 context 对同一窗口无互斥、输入注入全局状态、EnumWindows callback 未释放、stop/ping 先 Ensure。

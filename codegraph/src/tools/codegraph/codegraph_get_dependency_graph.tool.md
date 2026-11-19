@@ -5,7 +5,7 @@ name: codegraph_get_dependency_graph
 title: 文件依赖图
 async: auto
 timeout: 30
-on_timeout: background
+touch_files: false
 category: codegraph
 hot: true
 ```
@@ -20,6 +20,7 @@ hot: true
 - `deps` 键为文件绝对路径，值为原始导入串（按源码出现顺序，未去重）。原始串可能是外部模块、相对路径或包名；能否解析为仓库内文件见 `codegraph_find_circular_deps`。
 - 仅覆盖**已索引文件**的**静态**导入：JS/TS 的 `require()` / 动态 `import()` 不提取；Go 的分组 `import ( ... )` 已支持；Rust `pub use` 已支持。
 - 空结果带 `note`：`file_not_indexed`（file 未命中）、`no_dependencies`（有已索引文件但无导入）、`no_indexed_files`（索引为空）、`offset_beyond_total`。
+- `coverage.indexed_files` / `coverage.parse_error_files` 说明结果基于的已索引文件与解析错误数；`coverage.note` 明确 >8MB/被排除/不支持语言的文件未计入。
 - workdir 缺省取调用上下文的 `_meta.chonkpilot.work_dir`；显式传入时必须是当前项目内的绝对路径。
 
 # 参数
@@ -51,6 +52,7 @@ hot: true
   "truncated": false,
   "edges": 5,
   "totalEdges": 31,
+  "coverage": { "indexed_files": 12, "parse_error_files": 0, "note": "只统计已索引文件；>8MB、被排除或不支持语言的文件未计入" },
   "deps": {
     "E:/proj/a.go": ["fmt", "os"],
     "E:/proj/b.go": ["example.com/x/y"]

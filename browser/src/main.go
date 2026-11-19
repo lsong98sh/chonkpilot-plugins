@@ -17,6 +17,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/lsong98sh/chonkpilot-plugin-framework/contract"
 	"github.com/lsong98sh/chonkpilot-plugin-framework/sdk"
@@ -24,8 +25,6 @@ import (
 	"github.com/lsong98sh/chonkpilot-util/pathx"
 	"github.com/lsong98sh/chonkpilot-util/sandbox"
 )
-
-const pluginVersion = "1.0.0"
 
 // toolContractsFS 内嵌 browser_run 的 `.tool.md`（契约是 schema / 策略的唯一源）。
 //
@@ -35,13 +34,29 @@ var toolContractsFS embed.FS
 // maxWaitTimeoutMs 是 wait 轮询上限：超过它会让该 context 长时间持锁，后续调用排队超时。
 const maxWaitTimeoutMs = 600000
 
+// maxOutputBytes 是单次操作返回文本字段（html/text/eval value/console entries）的上限。
+// 引擎帧上限约 8MiB，但 1MiB 已足以避免一次调用灌满 LLM 上下文；超出时截断并标记。
+const maxOutputBytes = 1 << 20
+
 type browserPlugin struct {
 	p     *pluginsdk.Plugin
 	cfg   *configManager
-	eng   *engineclient.Client
+	eng   engineClient
 	mu    sync.Mutex
 	ctxID map[string]string // instance_id → context_id
 }
+
+// engineClient 是插件对引擎客户端的最小依赖面（便于单测注入假引擎）。
+type engineClient interface {
+	Ensure(ctx context.Context) error
+	Call(ctx context.Context, endpoint string, params any) (map[string]any, error)
+	Socket() string
+}
+
+// embeddedManifest 是插件 manifest（构建期嵌入 exe，随 `plugin.hello` 上报；宿主不再读盘）。
+//
+//go:embed manifest.json
+var embeddedManifest []byte
 
 func main() {
 	tool, err := loadBrowserContract()
@@ -50,7 +65,7 @@ func main() {
 		os.Exit(1)
 	}
 	p, err := pluginsdk.New(pluginsdk.Options{
-		ID: "browser", Name: "浏览器", Version: pluginVersion,
+		Manifest: embeddedManifest,
 		Features: map[string]any{"mcp": "http", "ui": true},
 	})
 	if err != nil {
@@ -72,9 +87,9 @@ func main() {
 	}
 	// 契约（schema / 描述 / 策略）全部来自内嵌 md；`_meta.source=md` 由 contract.MetaFor 写入。
 	p.ToolWithMeta(tool.Name, tool.Description, tool.Schema, contract.MetaFor(tool), b.run)
-	p.OnRequest("status", pluginsdk.StatusHandler(pluginVersion, b.status))
+	p.OnRequest("status", pluginsdk.StatusHandler(p.Version(), b.status))
 	p.OnRequest("contexts", b.contexts)
-	p.OnRequest("ping", pluginsdk.PingHandler(pluginVersion))
+	p.OnRequest("ping", pluginsdk.PingHandler(p.Version()))
 	// 宿主资源通道（PLUGIN-UI-1）：插件自持 webui（embed），宿主经 UDS 逐文件拉取
 	// （GET /plugins/browser/<path> → plugin/v1/ui.asset.get）。
 	p.OnRequest("plugin/v1/ui.asset.get", uiAssetGet)
@@ -141,6 +156,10 @@ func (b *browserPlugin) run(ctx context.Context, args map[string]any, cx plugins
 			return map[string]any{"ok": true, "stopped": false, "reason": "无活动 context"}, nil
 		}
 		res, err := b.eng.Call(ctx, "stop", withOwner(map[string]any{"context_id": id}, cx))
+		if isUnknownContext(err) {
+			// 引擎 janitor/重启后映射可能已失效：stop 视为“已停止”，并已由 take 清理映射。
+			return map[string]any{"ok": true, "stopped": false, "reason": "context 已失效（已清理映射）", "context_id": id}, nil
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -159,7 +178,8 @@ func (b *browserPlugin) run(ctx context.Context, args map[string]any, cx plugins
 		return nil, err
 	}
 
-	id := pluginsdk.Str(args["context_id"])
+	explicitID := strings.TrimSpace(pluginsdk.Str(args["context_id"]))
+	id := explicitID
 	if id == "" {
 		id = b.get(cx.InstanceID)
 	}
@@ -172,11 +192,49 @@ func (b *browserPlugin) run(ctx context.Context, args map[string]any, cx plugins
 	}
 	params := withOwner(map[string]any{"context_id": id, "action": action, "args": opArgs}, cx)
 	res, err := b.eng.Call(ctx, "operation", params)
+	if isUnknownContext(err) {
+		if explicitID != "" {
+			return nil, fmt.Errorf("%v（context 已失效；请 action=start 或省略 context_id 重建）", err)
+		}
+		// 隐式 context 失效（引擎 janitor/重启）：清理映射并新建一次 context 后重试。
+		// unknown_context 保证操作未执行，重试不会产生重复副作用。
+		b.drop(cx.InstanceID, id)
+		res, err = b.start(ctx, cx, pluginsdk.Str(args["purpose"]))
+		if err != nil {
+			return nil, err
+		}
+		id = pluginsdk.Str(res["context_id"])
+		params = withOwner(map[string]any{"context_id": id, "action": action, "args": opArgs}, cx)
+		res, err = b.eng.Call(ctx, "operation", params)
+	}
 	if err != nil {
 		return nil, err
 	}
+	capOutput(res)
 	res["context_id"] = id
 	return res, nil
+}
+
+// capOutput 截断过大的文本字段（UTF-8 边界），并标记 truncated / total_bytes。
+func capOutput(res map[string]any) {
+	for _, key := range []string{"html", "text", "value", "entries"} {
+		s, ok := res[key].(string)
+		if !ok || len(s) <= maxOutputBytes {
+			continue
+		}
+		cut := maxOutputBytes
+		for cut > 0 && !utf8.RuneStart(s[cut]) {
+			cut--
+		}
+		res[key] = s[:cut] + fmt.Sprintf("\n…（输出超过 %d 字节，已截断；请缩小页面/selector 范围或用 eval 取片段）", maxOutputBytes)
+		res["truncated"] = true
+		res["total_bytes"] = len(s)
+	}
+}
+
+// isUnknownContext 判断引擎是否报告 context 不存在/已过期（enginehost 错误码前缀）。
+func isUnknownContext(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "unknown_context:")
 }
 
 // withOwner 把调用归属（实例 / 会话）随请求下发，供引擎做 context 越权校验。
@@ -296,6 +354,11 @@ func (b *browserPlugin) start(ctx context.Context, cx pluginsdk.CallContext, pur
 	if purpose == "" {
 		purpose = "llm"
 	}
+	// 同一实例只保留一个 context：重复 start 先回收旧 context，避免 each start 泄漏。
+	// 回收失败（已失效/被占用）不阻断新 start。
+	if old := b.take(cx.InstanceID); old != "" {
+		_, _ = b.eng.Call(ctx, "stop", withOwner(map[string]any{"context_id": old}, cx))
+	}
 	res, err := b.eng.Call(ctx, "start", withOwner(map[string]any{
 		"purpose":  purpose,
 		"headless": cfg.Headless,
@@ -332,6 +395,18 @@ func (b *browserPlugin) take(instanceID string) string {
 	id := b.ctxID[instanceID]
 	delete(b.ctxID, instanceID)
 	return id
+}
+
+// drop 仅当映射仍指向 id 时删除，避免并发下误删新 context 的映射。
+func (b *browserPlugin) drop(instanceID, id string) {
+	if instanceID == "" || id == "" {
+		return
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.ctxID[instanceID] == id {
+		delete(b.ctxID, instanceID)
+	}
 }
 
 func (b *browserPlugin) status(ctx context.Context) map[string]any {

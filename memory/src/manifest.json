@@ -1,0 +1,74 @@
+{
+  "schema": "chonkpilot.plugin/v1",
+  "id": "memory",
+  "name": "记忆沉淀",
+  "version": "1.0.0",
+  "description": "每轮结束把新信息异步沉淀进记忆库（类别提示词 / 锚点增量 / min-turn-tokens 门控 / 子会话开关原样保留）",
+  "icon": "collection",
+  "publisher": "chonkpilot",
+  "product": true,
+  "runtime": {
+    "exe": "chonkpilot-memory.exe",
+    "args": [],
+    "autostart": true,
+    "restart": { "backoff_ms": 1000, "max_backoff_ms": 30000, "max_fails": 3 },
+    "health": { "interval_ms": 15000, "timeout_ms": 3000, "fail_threshold": 3 },
+    "stop": { "grace_ms": 8000 }
+  },
+  "mcp": {
+    "mode": "none",
+    "namespace": "-",
+    "hot_tools": [],
+    "category": "memory",
+    "origin": "builtin"
+  },
+  "config": { "scope": "plugin" },
+  "ui": {
+    "selfServe": true,
+    "views": [
+      {
+        "id": "config",
+        "title": "记忆沉淀设置",
+        "icon": "collection",
+        "entry": "webui/config.html",
+        "containers": ["preview", "tab", "drawer", "dialog"],
+        "default_size": { "width": 820, "height": 660 }
+      }
+    ],
+    "rpc": [
+      "config-load",
+      "config-save",
+      "category-content",
+      "category-save",
+      "category-delete",
+      "prompt-save",
+      "prompt-reset",
+      "flush"
+    ]
+  },
+  "permissions": {
+    "data": [
+      "config.prj.list",
+      "config.prj.set",
+      "config.usr.get",
+      "config.prompt.get",
+      "config.prompt.set",
+      "config.prompt.delete",
+      "session.get",
+      "session.active.get",
+      "session.history",
+      "session.messages",
+      "memory.list",
+      "memory.read",
+      "memory.write",
+      "memory.delete",
+      "memory.extract.load",
+      "memory.extract.save"
+    ],
+    "hooks": [],
+    "llm": { "step": true },
+    "session": [],
+    "ui": { "containers": ["preview", "tab", "drawer", "dialog"] },
+    "network": []
+  }
+}

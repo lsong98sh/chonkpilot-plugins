@@ -4,7 +4,7 @@ name: web_search
 title: 联网搜索
 async: auto
 timeout: 180
-on_timeout: background
+touch_files: false
 category: web
 hot: true
 ```

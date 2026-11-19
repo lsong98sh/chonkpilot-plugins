@@ -360,6 +360,10 @@ func (w *Workspace) Initialize(exts, skipDirs []string, stackGitignore *bool) (*
 	w.meta.ChunkCount = chunks
 	w.meta.Tokenizer = tokenizer
 	w.meta.LastIndexedAt = time.Now().UnixNano()
+	// 全量重建已在上方 RemoveAll 旧集合目录（失败即提前返回），新集合不存在旧 chunk 残留，
+	// 主键从 1 重新分配 → 此处重置 NextPK 不会复用旧主键。若崩在 flush/保存 meta 之前，
+	// 磁盘保留旧 NextPK，而后续增量以 time.Now 为 seq 基线且写入前先 reserveNextPK，
+	// 仍不会与本次未落 meta 的新主键冲突。
 	w.meta.NextPK = int64(seq) // 全量重建后主键序列重置为 N
 	w.meta.Docs.Service = docsServiceOf(w.meta.Docs)
 	w.meta.Docs.Skipped = skippedDocs
@@ -382,6 +386,26 @@ func chunkOfEntry(w *Workspace, docsOut map[int]docChunkOut, i int, e fileEntry)
 		return nil, false
 	}
 	return cs, false
+}
+
+// reserveNextPKSave 是 reserveNextPK 的落盘入口（默认 saveMeta）。
+// 提取为包级变量仅为测试可注入「预留落盘失败」，不对外暴露、不改变生产语义。
+var reserveNextPKSave = func(w *Workspace) error { return w.saveMeta() }
+
+// reserveNextPK 先把主键游标持久化到 meta.json，再允许调用方写入新 chunk（崩溃安全）。
+//   - 在 w.mu 下抬升 meta.NextPK = max(meta.NextPK, seq)，**释放锁后**才做 IO；
+//   - 预留失败返回错误（调用方必须放弃本批写入），成功则允许主键空洞：
+//     预留后若写 chunk 失败/进程崩溃，该段主键不再使用，但**绝不**复用已持久化 chunk 的主键。
+func (w *Workspace) reserveNextPK(seq int64) error {
+	if seq <= 0 {
+		return nil
+	}
+	w.mu.Lock()
+	if seq > w.meta.NextPK {
+		w.meta.NextPK = seq
+	}
+	w.mu.Unlock()
+	return reserveNextPKSave(w)
 }
 
 // Incremental 按文件增量：先按 files.doc_ids ∪ removes.doc_ids 删除旧块，再对 files
@@ -464,6 +488,13 @@ func (w *Workspace) Incremental(files []IncrementalFile, removes []IncrementalRe
 				seq++
 				cs[j].pk = strconv.FormatInt(seq, 10)
 				ids = append(ids, cs[j].pk)
+			}
+			// 先持久化主键游标，再写 chunk：若崩溃在「chunk 已写、meta 未存」之间，
+			// NextPK 只会偏大（留下主键空洞），不会偏小导致下次复用主键覆盖旧块。
+			// 按文件预留（简单正确）；批量预留可减少 meta 写盘次数，但需先算整批最大 seq。
+			if err := w.reserveNextPK(seq); err != nil {
+				w.markError(fmt.Sprintf("reserve next pk: %v", err))
+				return nil, err
 			}
 			if err := insertChunks(coll, cs); err != nil {
 				w.markError(fmt.Sprintf("insert %s: %v", rel, err))

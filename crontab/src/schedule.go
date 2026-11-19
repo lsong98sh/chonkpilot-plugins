@@ -159,6 +159,13 @@ func argString(v any) string {
 	}
 }
 
+// defaultMaxConcurrentRuns 是调度进程内同时执行的任务数上限（阶段 5：调度生命周期收口）。
+//
+// 到期任务不再无上限 `go s.execute(...)`：先占用一个槽，无槽则跳过本 tick
+// （**不认领**：不推进 next_run_at、不标记 running），下一 tick 重试。
+// 人工补跑（RunNow）无槽 → 明确报错，不认领。
+const defaultMaxConcurrentRuns = 4
+
 // scheduler 是 1s ticker 的调度内核（单 goroutine 扫描；任务级不重入）。
 type scheduler struct {
 	store  *Store
@@ -166,6 +173,10 @@ type scheduler struct {
 	runner *runner
 	logf   func(format string, args ...any)
 	now    func() time.Time
+
+	// slots 是并发执行闸门（容量 = defaultMaxConcurrentRuns）。占用 = 已认领且尚未收口的执行；
+	// Stop 不占用槽（只取消 + wg.Wait），因此不会被闸门阻塞。
+	slots chan struct{}
 
 	mu       sync.Mutex
 	lastTick time.Time
@@ -178,7 +189,31 @@ type scheduler struct {
 
 // newScheduler 构造调度器。
 func newScheduler(store *Store, cfg *configManager, r *runner, logf func(string, ...any)) *scheduler {
-	return &scheduler{store: store, cfg: cfg, runner: r, logf: logf, now: time.Now}
+	return &scheduler{
+		store: store, cfg: cfg, runner: r, logf: logf, now: time.Now,
+		slots: make(chan struct{}, defaultMaxConcurrentRuns),
+	}
+}
+
+// tryAcquire 非阻塞占用一个执行槽；已满 → false（调用方跳过本任务，不认领）。
+func (s *scheduler) tryAcquire() bool {
+	if s.slots == nil { // 兜底：直接构造 scheduler 的测试 / 旧装配
+		return true
+	}
+	select {
+	case s.slots <- struct{}{}:
+		return true
+	default:
+		return false
+	}
+}
+
+// release 释放一个执行槽（必须与成功的 tryAcquire 一一对应）。
+func (s *scheduler) release() {
+	if s.slots == nil {
+		return
+	}
+	<-s.slots
 }
 
 // Start 先做启动恢复，再起 1s ticker。
@@ -213,6 +248,9 @@ func (s *scheduler) Stop() {
 }
 
 // Recover 启动恢复：清理中断标记、重算 next_run_at、按 grace 补跑 / 记 skipped:missed。
+//
+// 注意：「补跑」只把 next_run_at 置为 now（保持 pending 语义），实际执行仍由下一 tick
+// 经并发闸门统一认领——无槽时该任务继续到期、下一 tick 重试，不会在此直接起 goroutine。
 func (s *scheduler) Recover(now time.Time) {
 	grace := int64(s.cfg.Settings().MissedGraceSec)
 	nowU := now.Unix()
@@ -339,7 +377,13 @@ func (s *scheduler) tick(now time.Time) {
 		}
 
 		id := t.ID
+		// 并发闸门：认领前先占槽。已满 → 跳过本任务（不推进 next_run_at、不标记 running），
+		// 下一 tick 重试。
+		if !s.tryAcquire() {
+			continue
+		}
 		var overlapRec *RunRecord
+		claimed := false
 		err = s.store.Update(id, func(cur *Task) error {
 			if !cur.Enabled || cur.NextRunAt == 0 || cur.NextRunAt > nowU {
 				return nil // 已被其它路径推进 / 停用
@@ -354,35 +398,49 @@ func (s *scheduler) tick(now time.Time) {
 			}
 			cur.NextRunAt = next
 			cur.RunningSince = nowU
+			claimed = true
 			return nil
 		})
 		if err != nil {
+			s.release()
 			if !errors.Is(err, ErrTaskNotFound) && s.logf != nil {
 				s.logf("crontab: 认领任务 %s 失败: %v", id, err)
 			}
 			continue
 		}
 		if overlapRec != nil {
+			s.release()
 			_ = s.store.AppendRun(*overlapRec)
 			continue
 		}
-		claimed, ok := s.store.Get(id)
+		if !claimed {
+			s.release()
+			continue
+		}
+		claimedTask, ok := s.store.Get(id)
 		if !ok {
+			s.release()
 			continue
 		}
 		s.wg.Add(1)
 		go func(task Task) {
+			defer s.release()
 			defer s.wg.Done()
-			s.execute(task)
-		}(claimed)
+			s.execute(task, "")
+		}(claimedTask)
 	}
 }
 
 // scheduleOnce 认领一条到期的一次性任务：NextRunAt 清零（不再重复），上一轮仍在跑 →
 // 记 skipped:overlap 并终态停用（一次性任务没有下一轮可推进）。
 func (s *scheduler) scheduleOnce(t *Task, nowU int64) {
+	// 并发闸门：认领前先占槽；已满 → 本轮跳过（NextRunAt / RunningSince 均不变），下一 tick 重试。
+	if !s.tryAcquire() {
+		return
+	}
 	id := t.ID
 	var overlapRec *RunRecord
+	claimed := false
 	err := s.store.Update(id, func(cur *Task) error {
 		if !cur.Enabled || !cur.Once || cur.NextRunAt == 0 || cur.NextRunAt > nowU {
 			return nil // 已被其它路径推进 / 停用
@@ -399,27 +457,85 @@ func (s *scheduler) scheduleOnce(t *Task, nowU int64) {
 		}
 		cur.NextRunAt = 0
 		cur.RunningSince = nowU
+		claimed = true
 		return nil
 	})
 	if err != nil {
+		s.release()
 		if !errors.Is(err, ErrTaskNotFound) && s.logf != nil {
 			s.logf("crontab: 认领一次性任务 %s 失败: %v", id, err)
 		}
 		return
 	}
 	if overlapRec != nil {
+		s.release()
 		_ = s.store.AppendRun(*overlapRec)
 		return
 	}
-	claimed, ok := s.store.Get(id)
+	if !claimed {
+		s.release()
+		return
+	}
+	claimedTask, ok := s.store.Get(id)
 	if !ok {
+		s.release()
 		return
 	}
 	s.wg.Add(1)
 	go func(task Task) {
+		defer s.release()
 		defer s.wg.Done()
-		s.execute(task)
-	}(claimed)
+		s.execute(task, "")
+	}(claimedTask)
+}
+
+// RunNow 立即执行一次任务（人工补跑，trigger=manual）。
+//
+// 语义：**不改变** next_run_at / enabled / 一次性终态；只认领 RunningSince 防重入，
+// 执行结果写 crontab.db 的 runs 表（trigger=manual），供漏跑清单人工补跑与任务页「立即运行」。
+func (s *scheduler) RunNow(id string) error {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return errors.New("task_id 必填")
+	}
+	t, ok := s.store.Get(id)
+	if !ok {
+		return ErrTaskNotFound
+	}
+	// 并发闸门：与定时触发共用同一组槽；无槽 → 明确报错且不认领（RunningSince 保持 0）。
+	if !s.tryAcquire() {
+		return errors.New("并发执行数已达上限，请稍后重试")
+	}
+	now := time.Now().Unix()
+	claimed := false
+	err := s.store.Update(id, func(cur *Task) error {
+		if cur.RunningSince > 0 {
+			return errors.New("任务正在执行中，请稍后重试")
+		}
+		cur.RunningSince = now
+		claimed = true
+		return nil
+	})
+	if err != nil {
+		s.release()
+		return err
+	}
+	if !claimed {
+		s.release()
+		return errors.New("任务未能认领")
+	}
+	t, ok = s.store.Get(id)
+	if !ok {
+		s.release()
+		return ErrTaskNotFound
+	}
+	s.wg.Add(1)
+	go func(task Task) {
+		defer s.release()
+		defer s.wg.Done()
+		s.execute(task, "manual")
+	}(t)
+	return nil
 }
 
 // execute 执行一条已认领的任务（完成 / 失败后清除运行标记并记运行明细）。
@@ -427,7 +543,11 @@ func (s *scheduler) scheduleOnce(t *Task, nowU int64) {
 // 执行前检查（P2 / C14）：run / agent 依赖项目目录，work_dir 不存在 → 任务停用
 // （`work_dir_missing`），记 `skipped:workdir-missing`，只通知一次，不执行。
 // notify 不访问工作目录，允许在无项目的全局会话中运行，不参与该检查。
-func (s *scheduler) execute(t Task) {
+func (s *scheduler) execute(t Task, trigger ...string) {
+	tr := ""
+	if len(trigger) > 0 {
+		tr = trigger[0]
+	}
 	now := time.Now().Unix()
 	if t.Action.Type != ActionNotify && !workDirExists(t.CreatedBy.WorkDir) {
 		s.disableForMissingWorkDir(t, now)
@@ -447,6 +567,7 @@ func (s *scheduler) execute(t Task) {
 	} else {
 		rec = s.runner.execute(s.ctx, t, spec)
 	}
+	rec.Trigger = tr
 	_ = s.store.Update(t.ID, func(cur *Task) error {
 		cur.RunningSince = 0
 		cur.RunCount++
@@ -455,7 +576,7 @@ func (s *scheduler) execute(t Task) {
 		// 一次性任务：执行一次即终态（成功 / 失败都不再重跑）。
 		// 仅当当前定义仍是「同一次调度」时才自动停用；若运行期间被 update 改期/改成周期，
 		// 不能把新定义清掉（旧执行只影响旧定义）。
-		if t.Once && cur.Once && cur.RunAt == t.RunAt {
+		if tr != "manual" && t.Once && cur.Once && cur.RunAt == t.RunAt {
 			cur.Enabled = false
 			cur.NextRunAt = 0
 			if cur.DisabledReason == "" {

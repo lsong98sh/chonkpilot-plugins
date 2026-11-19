@@ -34,6 +34,16 @@
     .detail-box .k { color: var(--ck-text-muted); }
     .detail-box .v { white-space: pre-wrap; overflow-wrap: anywhere; }
     .warn { color: var(--ck-danger); }
+    .card { border: 1px solid var(--ck-border); border-radius: 8px; padding: 12px; margin: 0 0 14px; background: var(--ck-surface); }
+    .card h2 { font-size: 13px; margin: 0 0 10px; }
+    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px 14px; }
+    .field { display: flex; flex-direction: column; gap: 4px; }
+    .field label { font-size: 11px; color: var(--ck-text-muted); }
+    .field input, .field select, .field textarea { padding: 6px 8px; border: 1px solid var(--ck-border); border-radius: 6px; background: transparent; color: inherit; font: inherit; }
+    .field textarea { min-height: 54px; resize: vertical; }
+    .field.wide { grid-column: 1 / -1; }
+    .missed { border-color: var(--ck-danger); }
+    .missed .item { display: flex; justify-content: space-between; gap: 8px; padding: 3px 0; font-size: 12px; }
   </style>
 </head>
 <body>
@@ -42,6 +52,37 @@
   <div class="bar">
     <span class="grow" id="summary"></span>
     <button id="refresh">刷新</button>
+    <button id="toggle-create">新建任务</button>
+  </div>
+  <div class="card" id="create-card" hidden>
+    <h2>新建定时任务（人工）</h2>
+    <div class="grid">
+      <div class="field wide"><label>工作目录（run / agent 必填）</label>
+        <div style="display:flex;gap:6px"><input id="c_work_dir" placeholder="E:/proj/a" style="flex:1" />
+        <button id="fill-context" type="button">填入当前项目/会话</button></div></div>
+      <div class="field"><label>调度</label><select id="c_sched">
+        <option value="cron">cron 周期</option><option value="delay">delay 一次性</option><option value="at">at 一次性</option>
+      </select></div>
+      <div class="field"><label>cron / delay / at</label><input id="c_sched_value" placeholder="*/5 * * * * 或 30m 或 2026-11-12 09:00" /></div>
+      <div class="field"><label>动作</label><select id="c_type">
+        <option value="agent">agent（LLM）</option><option value="run">run（命令）</option><option value="notify">notify（系统通知）</option>
+      </select></div>
+      <div class="field"><label>结果会话 / 通知</label><select id="c_session_mode">
+        <option value="main">通知主会话（任务在子会话执行）</option>
+        <option value="own">独立会话（结果自己看，不通知）</option>
+      </select></div>
+      <div class="field"><label>通知目标主会话 ID</label><input id="c_notify_session" placeholder="留空 = 仅系统通知/任务页" /></div>
+      <div class="field wide"><label>agent prompt / run command / notify HTML</label>
+        <textarea id="c_body" placeholder="agent：要执行的提示词；run：命令；notify：HTML 文本"></textarea></div>
+      <div class="field wide"><label><input type="checkbox" id="c_notify" checked /> 完成后系统通知（会话通知始终发送给上方目标会话）</label></div>
+    </div>
+    <div class="actions" style="margin-top:10px"><button class="primary" id="create">创建</button>
+      <button id="cancel-create" type="button">取消</button></div>
+    <div class="msg" id="create-msg"></div>
+  </div>
+  <div class="card missed" id="missed-card" hidden>
+    <h2>漏跑 / 冲突跳过记录</h2>
+    <div id="missed-list"></div>
   </div>
   <table>
     <thead><tr><th style="width:34px">状态</th><th>简述</th><th style="width:130px">cron</th><th style="width:150px">下次执行</th><th style="width:120px">最近一次</th><th style="width:170px"></th></tr></thead>
@@ -88,9 +129,11 @@
       if (!r) return '-';
       const head = r.kind === 'skipped' ? '跳过' : r.kind === 'interrupted' ? '中断' : (r.ok ? '成功' : '失败');
       const bits = [fmt(r.at) + ' · ' + head];
+      if (r.trigger === 'manual') bits.push('人工补跑');
       if (r.detail) bits.push('原因：' + r.detail);
       if (r.error) bits.push(r.error);
       if (typeof r.exit_code === 'number' && r.exit_code !== 0) bits.push('exit ' + r.exit_code);
+      if (r.output_tail) bits.push('结果：' + String(r.output_tail).slice(0, 400));
       return bits.join(' · ');
     }
 
@@ -175,6 +218,9 @@
       addKV('调度', (t.once || t.schedule_type === 'once')
         ? ('一次性 · ' + fmt(t.run_at)) : ('cron · ' + t.cron));
       addKV('work_dir', t.work_dir);
+      addKV('结果会话', t.session_mode === 'own'
+        ? '独立顶层会话（进会话列表，不通知）'
+        : '任务子会话 → 完成后通知主会话');
       addKV('沙箱状态', sandboxText(body.sandbox), body.sandbox && body.sandbox.available === false);
       addKV('会话', sessionText(body.session), !(body.session && body.session.available));
       // 「打开会话内容」（G-99 / G-105）：经既有 gui.window.open-chat 打开该任务的子会话
@@ -225,6 +271,16 @@
         const detail = document.createElement('button');
         detail.textContent = '详情';
         detail.onclick = () => toggleDetail(t, tr);
+        const runNow = document.createElement('button');
+        runNow.textContent = '运行';
+        runNow.style.marginLeft = '6px';
+        runNow.onclick = async () => {
+          try {
+            await api('run', { task_id: t.id });
+            show('已开始执行：' + t.description);
+            await refresh();
+          } catch (e) { show('执行失败: ' + e.message, true); }
+        };
         const toggle = document.createElement('button');
         toggle.textContent = t.enabled ? '停用' : '启用';
         toggle.style.marginLeft = '6px';
@@ -235,6 +291,7 @@
         del.style.marginLeft = '6px';
         del.onclick = () => { if (confirm('删除任务：' + t.description + '？')) act('delete', { task_id: t.id }); };
         tdOps.appendChild(detail);
+        tdOps.appendChild(runNow);
         tdOps.appendChild(toggle);
         tdOps.appendChild(del);
         tr.appendChild(tdState); tr.appendChild(tdDesc); tr.appendChild(tdCron);
@@ -260,7 +317,100 @@
     }
 
     document.getElementById('refresh').onclick = refresh;
-    refresh();
+
+    // ── 人工创建 / 立即运行 / 漏跑清单 ──
+    const createCard = document.getElementById('create-card');
+    document.getElementById('toggle-create').onclick = () => { createCard.hidden = !createCard.hidden; };
+    document.getElementById('cancel-create').onclick = () => { createCard.hidden = true; };
+    document.getElementById('fill-context').onclick = async () => {
+      try {
+        const mq = window.top.ckMq.new(window);
+        const initEnv = await mq.emit('gui.init-data', {});
+        const init = (initEnv && initEnv.backend && initEnv.backend.result) || {};
+        const wd = init.workDir || init.work_dir || '';
+        if (wd) document.getElementById('c_work_dir').value = wd;
+        const actEnv = await mq.emit('data-session-active-get', {});
+        const act = (actEnv && actEnv.backend && actEnv.backend.result) || {};
+        const sid = act.session_id || '';
+        if (sid) document.getElementById('c_notify_session').value = sid;
+        if (!wd && !sid) show('未读到当前项目/会话，请手工填写', true);
+      } catch (e) { show('读取当前上下文失败，请手工填写: ' + e.message, true); }
+    };
+    // own 模式没有“通知目标”：禁用并清空目标会话/系统通知勾选（提交时也不发送）。
+function syncSessionMode() {
+  const own = document.getElementById('c_session_mode').value === 'own';
+  document.getElementById('c_notify_session').disabled = own;
+  document.getElementById('c_notify').disabled = own;
+}
+document.getElementById('c_session_mode').onchange = syncSessionMode;
+syncSessionMode();
+document.getElementById('create').onclick = async () => {
+      const out = document.getElementById('create-msg');
+      const sched = document.getElementById('c_sched').value;
+      const val = document.getElementById('c_sched_value').value.trim();
+      const typ = document.getElementById('c_type').value;
+      const body = document.getElementById('c_body').value.trim();
+      const notify = document.getElementById('c_notify').checked;
+      const sessionMode = document.getElementById('c_session_mode').value;
+      const payload = {
+        work_dir: document.getElementById('c_work_dir').value.trim(),
+        // own = 独立顶层会话（不通知）；main = 通知上方主会话。
+        session_mode: sessionMode,
+        notify_session_id: sessionMode === 'own' ? '' : document.getElementById('c_notify_session').value.trim(),
+      };
+      if (sched === 'cron') payload.cron = val;
+      else if (sched === 'delay') payload.delay = val;
+      else payload.at = val;
+      if (typ === 'agent') payload.action = { type: 'agent', param: { prompt: body, notify } };
+      else if (typ === 'run') payload.action = { type: 'run', param: { command: body, notify } };
+      else payload.action = { type: 'notify', param: { html: body } };
+      if (!val || !body) {
+        out.textContent = '调度值与动作内容必填';
+        out.className = 'msg err';
+        return;
+      }
+      try {
+        await api('create', payload);
+        out.textContent = ''; out.className = 'msg';
+        createCard.hidden = true;
+        show('已创建任务');
+        await refresh();
+        await loadMissed();
+      } catch (e) { out.textContent = '创建失败: ' + e.message; out.className = 'msg err'; }
+    };
+
+    // loadMissed 列出「补偿窗口外错过（once_missed）/ 并发冲突（overlap）」的运行记录，
+    // 供人工一键补跑（run 动作 trigger=manual，不改变原调度基点）。
+    async function loadMissed() {
+      try {
+        const r = await api('runs', { limit: 200 });
+        const rows = (r && r.runs) || [];
+        const missed = rows.filter((x) => x && x.kind === 'skipped' &&
+          (x.detail === 'missed' || x.detail === 'overlap'));
+        const card = document.getElementById('missed-card');
+        if (!missed.length) { card.hidden = true; return; }
+        const box = document.getElementById('missed-list');
+        box.innerHTML = '';
+        for (const m of missed.slice(0, 8)) {
+          const div = document.createElement('div'); div.className = 'item';
+          const sp = document.createElement('span');
+          sp.textContent = fmt(m.at) + ' · ' + m.task_id + ' · ' + (m.detail || m.kind);
+          const btn = document.createElement('button'); btn.textContent = '补跑';
+          btn.onclick = async () => {
+            try {
+              await api('run', { task_id: m.task_id });
+              show('已开始补跑：' + m.task_id);
+              await loadMissed();
+            } catch (e) { show('补跑失败: ' + e.message, true); }
+          };
+          div.appendChild(sp); div.appendChild(btn); box.appendChild(div);
+        }
+        card.hidden = false;
+      } catch (_) { document.getElementById('missed-card').hidden = true; }
+    }
+
+    refresh().then(loadMissed);
+    setInterval(loadMissed, 15000);
 
     // 变更事件（plugin-event）：工具创建 / 删除后即时刷新，零轮询。
     try {

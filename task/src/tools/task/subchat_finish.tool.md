@@ -3,12 +3,13 @@
 name: subchat_finish
 title: subchat_finish
 args: subchat_finish --input={RAW-INPUT-FILE}
-async: never
+async: sync
 category: task
 hot: true
 output: stdout
 runtime: plugin
 timeout: 0
+touch_files: false
 ```
 
 # 摘要

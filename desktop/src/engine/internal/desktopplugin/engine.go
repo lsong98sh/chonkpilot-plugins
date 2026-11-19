@@ -90,7 +90,9 @@ func (e *engine) Do(action string, args map[string]any) (out map[string]any, err
 		button := strings.ToLower(argString(args, "button"))
 		rect := desktop.ClientScreenRect(h)
 		sx, sy := rect.Left+x, rect.Top+y
-		clickAt(sx, sy, button)
+		if !clickAt(sx, sy, button) {
+			return nil, fmt.Errorf("click failed: SetCursorPos(%d,%d) rejected (coordinates out of screen?)", sx, sy)
+		}
 		return map[string]any{"hwnd": int64(h), "screen_x": sx, "screen_y": sy, "button": button}, nil
 
 	case "input", "type":

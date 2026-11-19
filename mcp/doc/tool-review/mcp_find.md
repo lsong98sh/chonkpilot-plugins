@@ -42,7 +42,7 @@ LLM tool_call
 - 描述说“skill 是 prompt 别名”，实现确实**不按 kind 过滤**（`main.go:361-371,406-420`），`type=skill` 会把 prompt 一起返回，反之亦然。
 - 宿主注入的系统指引仍按旧内置 schema 描述本工具：`memory_guide.go:162` 与 `scenarios/default/main.agent.md:16` 都让模型传 `purpose`，但代码 schema 没有该参数（`main.go:70-76`），传了会被忽略。
 
-插件配置（非 manifest 字段，`src/config.go:34-38`）：`plugins.mcp.default-limit`（1–200）、`plugins.mcp.include-non-hot`、`plugins.mcp.invoke-timeout-sec`；默认 `20 / true / 120`（`config.go:85-87`）。manifest 声明 `hot_tools` 3 个、`timeout_sec 600`、`category meta`、`namespace "-"`（`src/initdata/.../mcp/manifest.json:18-24`）。
+插件配置（非 manifest 字段，`src/config.go:34-38`）：`plugins.mcp.default-limit`（1–200）、`plugins.mcp.include-non-hot`；默认 `20 / true`（`config.go:80-86`）。manifest 声明 `hot_tools` 3 个、`timeout_sec 600`、`category meta`、`namespace "-"`（`src/initdata/.../mcp/manifest.json:18-24`）。
 
 ## 4. 实现面
 

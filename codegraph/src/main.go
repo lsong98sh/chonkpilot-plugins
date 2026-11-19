@@ -29,16 +29,16 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
-const pluginVersion = "1.0.0"
-
-// toolContractsFS 内嵌 9 个 LLM 可见查询工具的 `.tool.md`（契约是 schema/策略的唯一源）。
+// toolContractsFS 内嵌 10 个 LLM 可见工具的 `.tool.md`（契约是 schema/策略的唯一源）。
 // 管理工具（hot=false，LLM 不可见）不纳入 md，仍由引擎内部注册。
 //
 //go:embed tools/codegraph/*.tool.md
 var toolContractsFS embed.FS
 
-// hotTools 是注入 LLM 的工具（与管理工具 codegraph_configure / codegraph_status 区分）。
+// hotTools 是注入 LLM 的工具（管理工具 codegraph_configure / codegraph_initialize /
+// codegraph_index_paths 仍对 LLM 不可见；codegraph_status 开放为只读查询）。
 var hotTools = []string{
+	"codegraph_status",
 	"codegraph_symbol_search",
 	"codegraph_get_symbol_info",
 	"codegraph_callers",
@@ -50,7 +50,7 @@ var hotTools = []string{
 	"vfts_query",
 }
 
-// loadToolContracts 解析内嵌 `.tool.md`（9 个 LLM 可见工具）并按 name 索引。
+// loadToolContracts 解析内嵌 `.tool.md`（10 个 LLM 可见工具）并按 name 索引。
 func loadToolContracts() (map[string]contract.Tool, error) {
 	paths, err := fs.Glob(toolContractsFS, "tools/codegraph/*.tool.md")
 	if err != nil {
@@ -85,7 +85,7 @@ func loadToolContracts() (map[string]contract.Tool, error) {
 	return out, nil
 }
 
-// codegraphContracts 把 md 契约转成引擎注册面（8 个 codegraph_* 查询工具；vfts_query 单独注册）。
+// codegraphContracts 把 md 契约转成引擎注册面（9 个 codegraph_* 查询工具；vfts_query 单独注册）。
 func codegraphContracts(all map[string]contract.Tool) []codegraph.ContractTool {
 	out := make([]codegraph.ContractTool, 0, len(all))
 	for _, name := range hotTools {
@@ -103,6 +103,11 @@ func codegraphContracts(all map[string]contract.Tool) []codegraph.ContractTool {
 	return out
 }
 
+// embeddedManifest 是插件 manifest（构建期嵌入 exe，随 `plugin.hello` 上报；宿主不再读盘）。
+//
+//go:embed manifest.json
+var embeddedManifest []byte
+
 func main() {
 	contracts, err := loadToolContracts()
 	if err != nil {
@@ -110,9 +115,7 @@ func main() {
 		os.Exit(1)
 	}
 	p, err := pluginsdk.New(pluginsdk.Options{
-		ID:      "codegraph",
-		Name:    "代码知识库",
-		Version: pluginVersion,
+		Manifest: embeddedManifest,
 		Features: map[string]any{
 			"mcp":   "http",
 			"ui":    true,
@@ -145,12 +148,12 @@ func main() {
 	p.MCPHot(hotTools...)
 
 	p.OnRequest("ping", func(_ context.Context, _ map[string]any) (any, error) {
-		return map[string]any{"ok": true, "version": pluginVersion}, nil
+		return map[string]any{"ok": true, "version": p.Version()}, nil
 	})
 	p.OnRequest("status", func(_ context.Context, _ map[string]any) (any, error) {
 		return map[string]any{
 			"ok":      true,
-			"version": pluginVersion,
+			"version": p.Version(),
 			"engines": []string{"codegraph", "vfts"},
 			"tools":   hotTools,
 		}, nil

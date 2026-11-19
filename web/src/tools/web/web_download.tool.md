@@ -4,7 +4,7 @@ name: web_download
 title: 下载/抓取原始内容
 async: auto
 timeout: 180
-on_timeout: background
+touch_files: true
 category: web
 hot: true
 ```

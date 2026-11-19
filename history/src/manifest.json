@@ -1,0 +1,34 @@
+{
+  "schema": "chonkpilot.plugin/v1",
+  "id": "history",
+  "name": "文件历史",
+  "version": "1.0.0",
+  "description": "执行工具前自动打点的文件检查点链（独立 ref，不进用户分支）；提供 history_status / history_diff / history_show / history_restore",
+  "icon": "clock",
+  "publisher": "chonkpilot",
+  "product": true,
+  "runtime": {
+    "exe": "chonkpilot-history.exe",
+    "args": [],
+    "autostart": true,
+    "restart": { "backoff_ms": 1000, "max_backoff_ms": 30000, "max_fails": 3 },
+    "health": { "interval_ms": 15000, "timeout_ms": 3000, "fail_threshold": 3 },
+    "stop": { "grace_ms": 8000 }
+  },
+  "mcp": {
+    "mode": "none",
+    "namespace": "-",
+    "hot_tools": [],
+    "category": "history",
+    "origin": "builtin"
+  },
+  "config": { "scope": "plugin" },
+  "permissions": {
+    "data": ["config.prj.get", "config.prj.set"],
+    "hooks": [],
+    "llm": {},
+    "session": [],
+    "ui": {},
+    "network": []
+  }
+}

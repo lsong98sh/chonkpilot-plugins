@@ -3,14 +3,14 @@
 name: file_patch
 title: 应用补丁
 args: file_patch --input={RAW-INPUT-FILE}
-async: never
+async: sync
 category: file
 hot: true
 runtime: builtin
 idempotent: false
 output: stdout
 timeout: 120
-on_timeout: background
+touch_files: true
 ```
 
 # 摘要

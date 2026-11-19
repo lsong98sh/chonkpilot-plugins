@@ -32,34 +32,30 @@ import (
 
 // ─── 键命名空间（唯一源）────────────────────────────────────────────
 const (
-	KeyDefaultLimit     = "plugins.mcp.default-limit"
-	KeyIncludeNonHot    = "plugins.mcp.include-non-hot"
-	KeyInvokeTimeoutSec = "plugins.mcp.invoke-timeout-sec"
+	KeyDefaultLimit  = "plugins.mcp.default-limit"
+	KeyIncludeNonHot = "plugins.mcp.include-non-hot"
 )
 
 // 校验区间（与旧 manifest 声明一致）。
 const (
-	defaultLimitMin  = 1
-	defaultLimitMax  = 200
-	invokeTimeoutMin = 5
-	invokeTimeoutMax = 1800
+	defaultLimitMin = 1
+	defaultLimitMax = 200
 )
 
 // allKeys 是本插件的用户配置键全集（稳定序；load 恒回显这些键的有效值）。
-var allKeys = []string{KeyDefaultLimit, KeyIncludeNonHot, KeyInvokeTimeoutSec}
+var allKeys = []string{KeyDefaultLimit, KeyIncludeNonHot}
 
 // legacyKeyMap 旧宿主键 → 新命名空间键（**迁移专用**；除 migrateLocked 外不得读旧键）。
 var legacyKeyMap = []struct{ Old, New string }{
 	{"defaultLimit", KeyDefaultLimit},
 	{"includeNonHot", KeyIncludeNonHot},
-	{"invokeTimeoutSec", KeyInvokeTimeoutSec},
+	// `invokeTimeoutSec` 已下线（mcp_invoke 不再设自身超时，改由目标工具策略决定），旧值忽略。
 }
 
 // configFields 是配置页字段声明（页面据 type/min/max/secret 动态渲染）。
 var configFields = []fieldSpec{
 	{Key: KeyDefaultLimit, Type: "integer", Label: "mcp_find 默认返回条数", Min: configkit.IntPtr(defaultLimitMin), Max: configkit.IntPtr(defaultLimitMax)},
 	{Key: KeyIncludeNonHot, Type: "boolean", Label: "检索包含非 hot 工具"},
-	{Key: KeyInvokeTimeoutSec, Type: "integer", Label: "mcp_invoke 默认超时（秒）", Min: configkit.IntPtr(invokeTimeoutMin), Max: configkit.IntPtr(invokeTimeoutMax)},
 }
 
 // fieldSpec 是配置页字段（JSON 形状与旧 manifest config.fields 兼容）。
@@ -76,14 +72,13 @@ type fieldSpec struct {
 
 // settings 是本插件配置的内存视图（落盘形态 = allKeys 的字符串 KV）。
 type settings struct {
-	DefaultLimit     int
-	IncludeNonHot    bool
-	InvokeTimeoutSec int
+	DefaultLimit  int
+	IncludeNonHot bool
 }
 
 // defaultSettings 缺键兜底（与实际生效值一致）。
 func defaultSettings() settings {
-	return settings{DefaultLimit: 20, IncludeNonHot: true, InvokeTimeoutSec: 120}
+	return settings{DefaultLimit: 20, IncludeNonHot: true}
 }
 
 // settingsOf 由「已存在的 KV 键」构造配置快照（缺失 / 越界按默认）。
@@ -100,18 +95,14 @@ func settingsOf(values map[string]string) settings {
 			s.IncludeNonHot = false
 		}
 	}
-	if n, err := strconv.Atoi(strings.TrimSpace(values[KeyInvokeTimeoutSec])); err == nil && n >= invokeTimeoutMin && n <= invokeTimeoutMax {
-		s.InvokeTimeoutSec = n
-	}
 	return s
 }
 
 // values 把快照展开成 `键 → 字符串` 的有效值（load 回显用）。
 func (s settings) values() map[string]string {
 	return map[string]string{
-		KeyDefaultLimit:     strconv.Itoa(s.DefaultLimit),
-		KeyIncludeNonHot:    boolString(s.IncludeNonHot),
-		KeyInvokeTimeoutSec: strconv.Itoa(s.InvokeTimeoutSec),
+		KeyDefaultLimit:  strconv.Itoa(s.DefaultLimit),
+		KeyIncludeNonHot: boolString(s.IncludeNonHot),
 	}
 }
 
@@ -414,8 +405,6 @@ func normalizeValue(key string, raw any) (string, error) {
 	switch key {
 	case KeyDefaultLimit:
 		return normalizeInt(key, raw, defaultLimitMin, defaultLimitMax)
-	case KeyInvokeTimeoutSec:
-		return normalizeInt(key, raw, invokeTimeoutMin, invokeTimeoutMax)
 	case KeyIncludeNonHot:
 		s := strings.ToLower(strings.TrimSpace(pluginsdk.Str(raw)))
 		if s == "true" || s == "false" {

@@ -40,10 +40,10 @@ func setCursorPos(x, y int32) bool {
 	return r != 0
 }
 
-// clickAt 在屏幕坐标处点击一次。
-func clickAt(x, y int32, button string) {
+// clickAt 在屏幕坐标处点击一次；返回 false 表示光标定位失败（未点击）。
+func clickAt(x, y int32, button string) bool {
 	if !setCursorPos(x, y) {
-		return
+		return false
 	}
 	var down, up uintptr
 	switch button {
@@ -56,6 +56,7 @@ func clickAt(x, y int32, button string) {
 	}
 	procMouseEvent.Call(down, 0, 0, 0, 0)
 	procMouseEvent.Call(up, 0, 0, 0, 0)
+	return true
 }
 
 // focusWindow 把窗口置前。

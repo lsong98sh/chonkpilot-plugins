@@ -123,27 +123,29 @@ func TestParseSandboxArgAndEffective(t *testing.T) {
 	}
 }
 
-// 任务模型的 sandbox / disabled_reason 随 tasks.json 往返（nil = 继承，不落空值）。
+// 任务模型的 sandbox / disabled_reason 随 crontab.db tasks 表往返（nil = 继承）。
 func TestTaskSandboxPersistence(t *testing.T) {
 	on := true
+	dir := t.TempDir()
+	s := openStore(t, dir)
 	task := sampleTask("ct_p")
 	task.Sandbox = &on
 	task.DisabledReason = ReasonWorkDirMissing
-	raw, err := json.Marshal(task)
-	if err != nil {
+	if err := s.Add(task); err != nil {
 		t.Fatal(err)
 	}
-	var back Task
-	if err := json.Unmarshal(raw, &back); err != nil {
+	if err := s.Add(sampleTask("ct_i")); err != nil {
 		t.Fatal(err)
 	}
-	if back.Sandbox == nil || !*back.Sandbox || back.DisabledReason != ReasonWorkDirMissing {
+	_ = s.Close()
+
+	s2 := openStore(t, dir)
+	back, ok := s2.Get("ct_p")
+	if !ok || back.Sandbox == nil || !*back.Sandbox || back.DisabledReason != ReasonWorkDirMissing {
 		t.Fatalf("往返丢失字段: %+v", back)
 	}
-
-	inherit := sampleTask("ct_i")
-	raw, _ = json.Marshal(inherit)
-	if strings.Contains(string(raw), "sandbox") {
-		t.Fatalf("nil sandbox 不应落盘（保持「继承」语义）: %s", raw)
+	inherit, ok := s2.Get("ct_i")
+	if !ok || inherit.Sandbox != nil {
+		t.Fatalf("nil sandbox 应保持「继承」语义: %+v", inherit)
 	}
 }

@@ -23,8 +23,6 @@ import (
 	"github.com/lsong98sh/chonkpilot-util/pathx"
 )
 
-const pluginVersion = "1.0.0"
-
 // toolContractFS 内嵌 desktop_run 的 `.tool.md`（schema / async / timeout / hot 的唯一源）。
 //
 //go:embed tools/desktop/*.tool.md
@@ -33,14 +31,27 @@ var toolContractFS embed.FS
 type desktopPlugin struct {
 	p     *pluginsdk.Plugin
 	cfg   *configManager
-	eng   *engineclient.Client
+	eng   engineClient
 	mu    sync.Mutex
 	ctxID map[string]string
+	bound map[string]map[string]any // instance_id → start 时绑定的目标窗口 meta
 }
+
+// engineClient 是插件对引擎客户端的最小依赖面（便于单测注入假引擎）。
+type engineClient interface {
+	Ensure(ctx context.Context) error
+	Call(ctx context.Context, endpoint string, params any) (map[string]any, error)
+	Socket() string
+}
+
+// embeddedManifest 是插件 manifest（构建期嵌入 exe，随 `plugin.hello` 上报；宿主不再读盘）。
+//
+//go:embed manifest.json
+var embeddedManifest []byte
 
 func main() {
 	p, err := pluginsdk.New(pluginsdk.Options{
-		ID: "desktop", Name: "桌面操作", Version: pluginVersion,
+		Manifest: embeddedManifest,
 		Features: map[string]any{"mcp": "http", "ui": true},
 	})
 	if err != nil {
@@ -59,18 +70,19 @@ func main() {
 			Logf:       p.Logger().Info,
 		}),
 		ctxID: map[string]string{},
+		bound: map[string]map[string]any{},
 	}
 	// 契约唯一源：内嵌的 `tools/desktop/desktop_run.tool.md`。
-	// `_meta`（async/timeout/on_timeout/category/hot，source=md）由 contract.MetaFor 生成。
+	// `_meta`（async/timeout/touch_files/category/hot，source=md）由 contract.MetaFor 生成。
 	tool, err := loadDesktopContract()
 	if err != nil {
 		slog.Error("desktop: 解析内嵌工具契约失败", "err", err)
 		os.Exit(1)
 	}
 	p.ToolWithMeta(tool.Name, tool.Description, tool.Schema, contract.MetaFor(tool), d.run)
-	p.OnRequest("status", pluginsdk.StatusHandler(pluginVersion, d.status))
+	p.OnRequest("status", pluginsdk.StatusHandler(p.Version(), d.status))
 	p.OnRequest("contexts", d.contexts)
-	p.OnRequest("ping", pluginsdk.PingHandler(pluginVersion))
+	p.OnRequest("ping", pluginsdk.PingHandler(p.Version()))
 	// 宿主资源通道（PLUGIN-UI-1）：插件自持 webui（embed），宿主经 UDS 逐文件拉取
 	// （GET /plugins/desktop/<path> → plugin/v1/ui.asset.get）。
 	p.OnRequest("plugin/v1/ui.asset.get", uiAssetGet)
@@ -118,6 +130,23 @@ func (d *desktopPlugin) run(ctx context.Context, args map[string]any, cx plugins
 	if err := d.eng.Ensure(ctx); err != nil {
 		return nil, err
 	}
+	// 截图路径先校验（含默认目录与沙箱），非法参数不应先自动开会话。
+	if action == "screenshot" || action == "shot" {
+		raw := pluginsdk.Str(opArgs["path"])
+		if raw == "" {
+			if dir := pathx.ExpandHome(d.cfg.Settings().ScreenshotDir); dir != "" {
+				raw = filepath.Join(dir, fmt.Sprintf("desktop-%d.png", time.Now().UnixMilli()))
+			}
+		}
+		path, err := resolveSandboxPath(cx, raw)
+		if err != nil {
+			return nil, err
+		}
+		if path == "" {
+			return nil, errors.New("screenshot 需要 path 参数，或先在插件配置中设置「截图默认目录」")
+		}
+		opArgs["path"] = path
+	}
 	switch action {
 	case "ping", "status":
 		return d.eng.Call(ctx, "ping", nil)
@@ -132,15 +161,22 @@ func (d *desktopPlugin) run(ctx context.Context, args map[string]any, cx plugins
 		if id == "" {
 			return map[string]any{"ok": true, "stopped": false, "reason": "无活动 context"}, nil
 		}
-		res, err := d.eng.Call(ctx, "stop", map[string]any{"context_id": id})
+		res, err := d.eng.Call(ctx, "stop", withOwner(map[string]any{"context_id": id}, cx))
+		if isUnknownContext(err) {
+			// 引擎 janitor/重启后映射可能已失效：stop 视为“已停止”，并已由 take 清理映射。
+			d.clearBound(cx.InstanceID)
+			return map[string]any{"ok": true, "stopped": false, "reason": "context 已失效（已清理映射）", "context_id": id}, nil
+		}
 		if err != nil {
 			return nil, err
 		}
+		d.clearBound(cx.InstanceID)
 		res["context_id"] = id
 		return res, nil
 	}
 
-	id := pluginsdk.Str(args["context_id"])
+	explicitID := strings.TrimSpace(pluginsdk.Str(args["context_id"]))
+	id := explicitID
 	if id == "" {
 		id = d.get(cx.InstanceID)
 	}
@@ -156,27 +192,49 @@ func (d *desktopPlugin) run(ctx context.Context, args map[string]any, cx plugins
 		}
 		id = pluginsdk.Str(res["context_id"])
 	}
-	if action == "screenshot" || action == "shot" {
-		raw := pluginsdk.Str(opArgs["path"])
-		if raw == "" {
-			if dir := pathx.ExpandHome(d.cfg.Settings().ScreenshotDir); dir != "" {
-				raw = filepath.Join(dir, fmt.Sprintf("desktop-%d.png", time.Now().UnixMilli()))
-			}
-		}
-		path, err := resolveSandboxPath(cx, raw)
-		if err != nil {
-			return nil, err
-		}
-		if path != "" {
-			opArgs["path"] = path
-		}
+	call := func(ctxID string) (map[string]any, error) {
+		return d.eng.Call(ctx, "operation", withOwner(map[string]any{"context_id": ctxID, "action": action, "args": opArgs}, cx))
 	}
-	res, err := d.eng.Call(ctx, "operation", map[string]any{"context_id": id, "action": action, "args": opArgs})
+	res, err := call(id)
+	if isUnknownContext(err) {
+		if explicitID != "" {
+			return nil, fmt.Errorf("%v（context 已失效；请 action=start 或省略 context_id 重建）", err)
+		}
+		// 隐式 context 失效（引擎 janitor/重启）：清理映射并新建一次 context 后重试。
+		// unknown_context 保证操作未执行，重试不会产生重复副作用。
+		d.drop(cx.InstanceID, id)
+		meta := targetMeta(opArgs)
+		if len(meta) == 0 {
+			meta = d.boundMeta(cx.InstanceID)
+		}
+		startRes, serr := d.start(ctx, cx, pluginsdk.Str(args["purpose"]), meta)
+		if serr != nil {
+			return nil, serr
+		}
+		id = pluginsdk.Str(startRes["context_id"])
+		res, err = call(id)
+	}
 	if err != nil {
 		return nil, err
 	}
 	res["context_id"] = id
 	return res, nil
+}
+
+// withOwner 把调用归属（实例 / 会话）随请求下发，供引擎做 context 越权校验。
+func withOwner(params map[string]any, cx pluginsdk.CallContext) map[string]any {
+	if cx.InstanceID != "" {
+		params["instance_id"] = cx.InstanceID
+	}
+	if cx.Session != "" {
+		params["session"] = cx.Session
+	}
+	return params
+}
+
+// isUnknownContext 判断引擎是否报告 context 不存在/已过期（enginehost 错误码前缀）。
+func isUnknownContext(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "unknown_context:")
 }
 
 // requiresTarget 判断动作是否必须绑定目标窗口（与引擎 desktop.target 的分支一致）。
@@ -246,7 +304,12 @@ func (d *desktopPlugin) start(ctx context.Context, cx pluginsdk.CallContext, pur
 	if purpose == "" {
 		purpose = "llm"
 	}
-	params := map[string]any{"purpose": purpose}
+	// 同一实例只保留一个 context：重复 start 先回收旧 context，避免 each start 泄漏。
+	// 回收失败（已失效/被占用）不阻断新 start。
+	if old := d.take(cx.InstanceID); old != "" {
+		_, _ = d.eng.Call(ctx, "stop", withOwner(map[string]any{"context_id": old}, cx))
+	}
+	params := withOwner(map[string]any{"purpose": purpose}, cx)
 	if len(meta) > 0 {
 		params["meta"] = meta
 	}
@@ -257,6 +320,11 @@ func (d *desktopPlugin) start(ctx context.Context, cx pluginsdk.CallContext, pur
 	if id := pluginsdk.Str(res["context_id"]); id != "" && cx.InstanceID != "" {
 		d.mu.Lock()
 		d.ctxID[cx.InstanceID] = id
+		if len(meta) > 0 {
+			d.bound[cx.InstanceID] = meta
+		} else {
+			delete(d.bound, cx.InstanceID)
+		}
 		d.mu.Unlock()
 	}
 	return res, nil
@@ -280,6 +348,45 @@ func (d *desktopPlugin) take(instanceID string) string {
 	id := d.ctxID[instanceID]
 	delete(d.ctxID, instanceID)
 	return id
+}
+
+// drop 仅当映射仍指向 id 时删除，避免并发下误删新 context 的映射。
+func (d *desktopPlugin) drop(instanceID, id string) {
+	if instanceID == "" || id == "" {
+		return
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.ctxID[instanceID] == id {
+		delete(d.ctxID, instanceID)
+	}
+}
+
+// boundMeta 返回该实例 start 时绑定的目标窗口 meta（副本）。
+func (d *desktopPlugin) boundMeta(instanceID string) map[string]any {
+	if instanceID == "" {
+		return nil
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	meta := d.bound[instanceID]
+	if len(meta) == 0 {
+		return nil
+	}
+	out := make(map[string]any, len(meta))
+	for k, v := range meta {
+		out[k] = v
+	}
+	return out
+}
+
+func (d *desktopPlugin) clearBound(instanceID string) {
+	if instanceID == "" {
+		return
+	}
+	d.mu.Lock()
+	delete(d.bound, instanceID)
+	d.mu.Unlock()
 }
 
 func (d *desktopPlugin) status(ctx context.Context) map[string]any {

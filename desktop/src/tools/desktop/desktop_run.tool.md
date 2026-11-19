@@ -4,7 +4,7 @@ name: desktop_run
 title: 桌面操作
 async: auto
 timeout: 60
-on_timeout: background
+touch_files: false
 category: desktop
 hot: true
 runtime: plugin
@@ -30,9 +30,10 @@ idempotent: false
 - `size`：只把窗口尺寸改为 `w,h`，**不移动位置**；别名 `resize`。
 - `minimize` / `maximize` / `restore`：改变窗口显示状态。
 - `screenshot`：截取**目标窗口客户区**；未显式给目标时，若 `start` 绑定过窗口则截绑定窗口，否则（或 `full_screen=true`）截**主屏整屏**。`path` 必填，或由插件配置的「截图默认目录」自动补全文件名；落盘路径受沙箱 `writable_dirs` 限制，越界直接报错且不落盘。
-- `start`：可带 `purpose` 与 `title/class/hwnd`（预绑定目标窗口）；`stop`：结束当前实例的会话，**不关闭目标窗口**。
+- `start`：可带 `purpose` 与 `title/class/hwnd`（预绑定目标窗口）；重复 `start` 会先回收同实例旧会话（失败不阻断）；`stop`：结束当前实例的会话，**不关闭目标窗口**。
 - 别名：`type` = `input`，`shot` = `screenshot`，`resize` = `size`。
-- 同一实例复用同一会话；`context_id` 可显式指定会话（缺省按当前实例复用）。
+- 同一实例复用同一会话；`context_id` 可显式指定会话（缺省按当前实例复用），但必须属于当前实例/会话，跨实例操作会被拒绝。
+- **会话自愈**：隐式会话已过期（引擎 janitor/重启）时自动清理映射、重建会话（沿用 `start` 时绑定的目标窗口）并重试一次；显式传入的失效 `context_id` 不自动重建，会返回可操作错误（改用 `action=start` 或省略 `context_id`）。失效会话的 `stop` 返回 `stopped:false` 并清理映射。
 
 # 参数
 ```json

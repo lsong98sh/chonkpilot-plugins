@@ -122,8 +122,8 @@ func TestRunCommandBindsSessionAndCompletesTurn(t *testing.T) {
 	if rec.SessionID != "crontab-ct_run" || rec.DialogID != "dlg-host" || rec.TurnID == "" {
 		t.Fatalf("运行记录应带会话归属: %+v", rec)
 	}
-	if len(fake.completes) != 1 || fake.completes[0].status != "done" || fake.completes[0].ref.TurnID != rec.TurnID {
-		t.Fatalf("应收轮 done: %+v", fake.completes)
+	if len(fake.completes) != 1 || fake.completes[0].status != "complete" || fake.completes[0].ref.TurnID != rec.TurnID {
+		t.Fatalf("应收轮 complete: %+v", fake.completes)
 	}
 }
 

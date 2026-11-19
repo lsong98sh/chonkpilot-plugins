@@ -153,3 +153,8 @@ J. 输出体积：默认 256KB（约 6–7 万 token）可一次灌满上下文�
 - 契约：`src/tools/task/task_run.tool.md`。
 - 测试：`chonkpilot-util/scriptrun/exec_test.go`（`TestMergeChildEnvCaseInsensitive`、`TestRequiresElevationExit5NotElevation`、`TestBuildCommandShellFileWindows`、`TestOutputCaptureWritesFile`）；`task/src/tools_test.go`（`TestTaskRunOutputFile`、`TestTaskRunExit5NotElevation`、`TestTaskRunShellFileDispatch`）。
 - `crontab` 不传 `CaptureDir`，保持“只截断、不落盘”的旧行为；`Options`/`Result` 新增字段向后兼容。
+## 11. 复核（2026-11-12）
+
+- 原 P0（cwd 进写白名单 / requires 无沙箱）与 P1（exit 5 误判、`shell+file` 扩展名分派、async/timeout）已在 2026-11-08/09 修复；契约已写明 `cwd` 只作执行目录、requires 安装到 `.chonkpilot/deps` 且沙箱化/可取消、`exit 5` 按普通失败。
+- 参数级失败仍以 `isError` 文本返回（契约已明确），未改；截断时 `output` 尾部附提示、完整输出落盘 `output_file` 已生效。
+- 仍为基线（P2）：`args` 追加到 `command` 的语义随 runtime 变化（PowerShell `-Command` / cmd `/c`）未在契约展开；全局 `maxOutputKB` 上限仍可配到 4096KB（已有按调用 `maxOutputKB` 可收紧，但默认仍可能很大）。

@@ -5,7 +5,7 @@ name: vfts_query
 title: 全文检索
 async: auto
 timeout: 30
-on_timeout: background
+touch_files: false
 category: codegraph
 hot: true
 ```

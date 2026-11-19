@@ -33,8 +33,6 @@ import (
 	pluginsdk "github.com/lsong98sh/chonkpilot-plugin-framework/sdk"
 )
 
-const pluginVersion = "1.0.0"
-
 // toolsFS 是工具契约（`*.tool.md`）的 embed 源：插件自持，产物不带契约目录。
 //
 //go:embed all:tools
@@ -66,11 +64,14 @@ type sessionPlugin struct {
 	call capCaller
 }
 
+// embeddedManifest 是插件 manifest（构建期嵌入 exe，随 `plugin.hello` 上报；宿主不再读盘）。
+//
+//go:embed manifest.json
+var embeddedManifest []byte
+
 func main() {
 	p, err := pluginsdk.New(pluginsdk.Options{
-		ID:      "session",
-		Name:    "会话工具",
-		Version: pluginVersion,
+		Manifest: embeddedManifest,
 		Features: map[string]any{
 			"mcp": "http",
 			"ui":  true,
@@ -95,7 +96,7 @@ func main() {
 	}
 
 	p.OnRequest("status", t.info)
-	p.OnRequest("ping", pluginsdk.PingHandler(pluginVersion))
+	p.OnRequest("ping", pluginsdk.PingHandler(p.Version()))
 	// 自持 webui（配置页）：宿主经 UDS 逐文件拉取。
 	p.OnRequest("plugin/v1/ui.asset.get", uiAssetGet)
 	// 配置动作（load / save / reset）：页面唯一写入口。
@@ -171,7 +172,7 @@ func registerTools(p *pluginsdk.Plugin, t *sessionPlugin, tools []contract.Tool)
 
 func (t *sessionPlugin) info(context.Context, map[string]any) (any, error) {
 	return map[string]any{
-		"ok": true, "id": "session", "version": pluginVersion,
+		"ok": true, "id": "session", "version": t.p.Version(),
 		"tools": []string{
 			"session_search", "session_list", "session_get", "session_history", "session_status",
 			"session_create", "session_send", "session_rename", "session_open",

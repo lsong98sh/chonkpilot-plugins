@@ -1,0 +1,53 @@
+{
+  "schema": "chonkpilot.plugin/v1",
+  "id": "desktop",
+  "name": "桌面操作",
+  "version": "1.0.0",
+  "description": "本机桌面窗口操作（desktop_run 工具，Win32/UIA）",
+  "icon": "window",
+  "publisher": "chonkpilot",
+  "product": true,
+  "runtime": {
+    "exe": "chonkpilot-plugin-desktop.exe",
+    "args": [],
+    "autostart": true,
+    "restart": { "backoff_ms": 1000, "max_backoff_ms": 30000, "max_fails": 3 },
+    "health": { "interval_ms": 15000, "timeout_ms": 3000, "fail_threshold": 3 },
+    "stop": { "grace_ms": 5000 }
+  },
+  "mcp": {
+    "mode": "http",
+    "namespace": "-",
+    "hot_tools": ["desktop_run"],
+    "timeout_sec": 180,
+    "category": "desktop",
+    "origin": "builtin"
+  },
+  "config": { "scope": "prjusr" },
+  "ui": {
+    "selfServe": true,
+    "views": [
+      {
+        "id": "config",
+        "title": "桌面操作",
+        "icon": "window",
+        "entry": "webui/config.html",
+        "containers": ["preview", "tab", "drawer", "dialog"],
+        "default_size": { "width": 720, "height": 560 }
+      }
+    ],
+    "menus": [
+      { "location": "plugin", "label": "桌面操作", "icon": "window", "view": "config" }
+    ],
+    "statusbar": [],
+    "rpc": ["status", "contexts", "ping", "load", "save", "reset"]
+  },
+  "permissions": {
+    "data": [],
+    "hooks": [],
+    "llm": {},
+    "session": [],
+    "ui": { "containers": ["preview", "tab", "drawer", "dialog"] },
+    "network": []
+  }
+}

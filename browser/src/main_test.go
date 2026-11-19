@@ -1,9 +1,13 @@
 package main
 
 import (
+	"context"
+	"errors"
+	"fmt"
 	"path/filepath"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	pluginsdk "github.com/lsong98sh/chonkpilot-plugin-framework/sdk"
 )
@@ -23,11 +27,15 @@ func TestBrowserContract(t *testing.T) {
 	if tool.Category != "browser" {
 		t.Fatalf("category=%q", tool.Category)
 	}
-	if tool.Async != "auto" || tool.Timeout != 60 || tool.OnTimeout != "background" {
-		t.Fatalf("policy = %s/%d/%s", tool.Async, tool.Timeout, tool.OnTimeout)
+	if tool.Async != "auto" || tool.Timeout != 60 {
+		t.Fatalf("policy = %s/%d", tool.Async, tool.Timeout)
 	}
-	if tool.AsyncSet != true || tool.TimeoutSet != true || tool.OnTimeoutSet != true {
-		t.Fatalf("must be explicit: %+v", tool)
+	if tool.AsyncSet != true || tool.TimeoutSet != true {
+		t.Fatalf("async/timeout must be explicit: %+v", tool)
+	}
+	// 打点声明：browser 缺省不落盘 → touch_files: false（显式声明）。
+	if !tool.TouchFilesSet || tool.TouchFiles {
+		t.Fatalf("touch_files = %v(set=%v)，期望显式 false", tool.TouchFiles, tool.TouchFilesSet)
 	}
 	if tool.Description == "" || tool.Description == tool.Name {
 		t.Fatalf("摘要未解析: %q", tool.Description)
@@ -193,5 +201,127 @@ func TestScreenshotDefaultDirSandbox(t *testing.T) {
 	_, _, err := prepareOperation("screenshot", map[string]any{}, cx, settings{ScreenshotDir: denied})
 	if err == nil || !strings.Contains(err.Error(), "sandbox:") {
 		t.Fatalf("默认目录越界应拒绝: %v", err)
+	}
+}
+
+// fakeEngine 记录调用并按 context_id 模拟引擎的 unknown_context。
+type fakeEngine struct {
+	calls    []string
+	startSeq int
+}
+
+func (f *fakeEngine) Ensure(context.Context) error { return nil }
+func (f *fakeEngine) Socket() string               { return "" }
+func (f *fakeEngine) Call(_ context.Context, endpoint string, params any) (map[string]any, error) {
+	f.calls = append(f.calls, endpoint)
+	p, _ := params.(map[string]any)
+	switch endpoint {
+	case "start":
+		f.startSeq++
+		return map[string]any{"context_id": fmt.Sprintf("ctx-%d", f.startSeq)}, nil
+	case "stop", "operation":
+		id, _ := p["context_id"].(string)
+		if id == "stale" {
+			return nil, errors.New("unknown_context: unknown or expired context: " + id)
+		}
+		if endpoint == "stop" {
+			return map[string]any{"closed": true}, nil
+		}
+		return map[string]any{"done": true}, nil
+	}
+	return map[string]any{}, nil
+}
+
+// TestImplicitContextExpiredRecovers 验证隐式 context 失效后清理映射、重建并重试一次。
+func TestImplicitContextExpiredRecovers(t *testing.T) {
+	fe := &fakeEngine{}
+	b := &browserPlugin{cfg: &configManager{}, eng: fe, ctxID: map[string]string{"inst-1": "stale"}}
+	res, err := b.run(context.Background(), map[string]any{
+		"action": "navigate",
+		"args":   map[string]any{"url": "https://example.com"},
+	}, pluginsdk.CallContext{InstanceID: "inst-1"})
+	if err != nil {
+		t.Fatalf("隐式失效应自动恢复: %v", err)
+	}
+	if res.(map[string]any)["context_id"] != "ctx-1" {
+		t.Fatalf("应返回新 context: %+v", res)
+	}
+	if got := b.get("inst-1"); got != "ctx-1" {
+		t.Fatalf("映射未更新: %q", got)
+	}
+	want := []string{"operation", "start", "operation"}
+	if strings.Join(fe.calls, ",") != strings.Join(want, ",") {
+		t.Fatalf("调用顺序 = %v, want %v", fe.calls, want)
+	}
+}
+
+// TestExplicitContextExpiredNoRetry 显式 context 失效返回可操作错误，不自动重建。
+func TestExplicitContextExpiredNoRetry(t *testing.T) {
+	fe := &fakeEngine{}
+	b := &browserPlugin{cfg: &configManager{}, eng: fe, ctxID: map[string]string{}}
+	_, err := b.run(context.Background(), map[string]any{
+		"action":     "navigate",
+		"context_id": "stale",
+		"args":       map[string]any{"url": "https://example.com"},
+	}, pluginsdk.CallContext{InstanceID: "inst-1"})
+	if err == nil || !strings.Contains(err.Error(), "已失效") {
+		t.Fatalf("显式失效应报可操作错误: %v", err)
+	}
+	if strings.Contains(strings.Join(fe.calls, ","), "start") {
+		t.Fatalf("显式 context 不应自动 start: %v", fe.calls)
+	}
+}
+
+// TestStopExpiredContextIsIdempotent 失效 context 的 stop 返回 stopped=false 并清理映射。
+func TestStopExpiredContextIsIdempotent(t *testing.T) {
+	fe := &fakeEngine{}
+	b := &browserPlugin{cfg: &configManager{}, eng: fe, ctxID: map[string]string{"inst-1": "stale"}}
+	res, err := b.run(context.Background(), map[string]any{"action": "stop"}, pluginsdk.CallContext{InstanceID: "inst-1"})
+	if err != nil {
+		t.Fatalf("失效 context 的 stop 不应报错: %v", err)
+	}
+	out := res.(map[string]any)
+	if out["stopped"] != false {
+		t.Fatalf("stopped 应为 false: %+v", out)
+	}
+	if b.get("inst-1") != "" {
+		t.Fatal("stop 后映射应清空")
+	}
+}
+
+// TestCapOutput 验证超大文本字段按 UTF-8 边界截断并标记。
+func TestCapOutput(t *testing.T) {
+	big := strings.Repeat("a", maxOutputBytes+10)
+	res := map[string]any{"html": big, "text": "small"}
+	capOutput(res)
+	if res["truncated"] != true || res["total_bytes"] != len(big) {
+		t.Fatalf("应标记截断: %+v", res)
+	}
+	if out, _ := res["html"].(string); len(out) > maxOutputBytes+200 || !strings.Contains(out, "已截断") {
+		t.Fatalf("截断文本异常: len=%d", len(out))
+	}
+	if res["text"] != "small" {
+		t.Fatal("未超限字段不应改动")
+	}
+	zh := map[string]any{"value": strings.Repeat("中", maxOutputBytes/3+10)}
+	capOutput(zh)
+	if !utf8.ValidString(zh["value"].(string)) {
+		t.Fatal("截断点必须是合法 UTF-8")
+	}
+}
+
+// TestStartRecyclesOldContext 重复 start 应回收同实例旧 context。
+func TestStartRecyclesOldContext(t *testing.T) {
+	fe := &fakeEngine{}
+	b := &browserPlugin{cfg: &configManager{}, eng: fe, ctxID: map[string]string{"inst-1": "ctx-old"}}
+	res, err := b.run(context.Background(), map[string]any{"action": "start"}, pluginsdk.CallContext{InstanceID: "inst-1"})
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	if strings.Join(fe.calls, ",") != "stop,start" {
+		t.Fatalf("应先 stop 旧 context: %v", fe.calls)
+	}
+	if res.(map[string]any)["context_id"] != "ctx-1" || b.get("inst-1") != "ctx-1" {
+		t.Fatalf("新 context 未生效: %+v", res)
 	}
 }

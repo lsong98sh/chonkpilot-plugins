@@ -77,3 +77,8 @@ status: verified
 - `TestToolGetSymbolInfoCandidatesAndNotes`：id 优先（忽略错误 file/name）、file+name 多命中 `symbols[]`/`ambiguous`、file 大小写不敏感、name 大小写不敏感、三种 not_found note、参数错误。
 - `TestFindSymbol`：id/file+name/未命中/空索引回归。
 - 回归：`go test -count=1 ./server/...` 通过。
+## 8. P2 修复（2026-11-11）
+
+- **按 id 线性扫描**：`Index` 新增 `byID`（小写 id → syms 下标，多值）与既有 `byName`。`FindSymbol` 的 id 分支走 `byID`（兼容 id 原样与绝对→相对归一两种写法），file+name 分支走 `byName` 再按文件过滤，不再遍历/复制全部符号。
+- 测试：`TestFindSymbolByIndexID`（id 命中、file+name 命中、不存在 id 不回落全量扫描）。
+- 仍为基线：门禁 `not_initialized/pending/error` 仍 `isError=false`（按 `status` 处理，跨查询工具统一取舍）。

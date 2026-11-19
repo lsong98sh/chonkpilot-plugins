@@ -3,14 +3,14 @@
 name: crontab_add
 title: 新建定时任务
 args: crontab_add --input={RAW-INPUT-FILE}
-async: never
+async: sync
 category: crontab
 hot: true
 runtime: plugin
 idempotent: false
 output: json
 timeout: 30
-on_timeout: background
+touch_files: false
 ```
 
 # 摘要
@@ -26,6 +26,10 @@ on_timeout: background
 - `{type:"run", param:{command, notify?}}`：执行命令（`notify` = 完成后是否弹系统通知，可传 `true` 或自定义文案）；
 - `{type:"notify", param:"<b>HTML</b>"}`（或 `{html, click_url?}`）：在时间点弹系统通知；
 - `{type:"agent", param:{prompt, agent?, title?, display_name?, timeout_sec?, notify?}}`：以**完整智能体（全工具面）**执行 prompt，可读项目文件，适合「定时代码审查」；`agent` 指定场景智能体（省略 = 默认），`timeout_sec` 省略 / 0 = 插件默认超时，`notify` 省略 = true（完成后通知并附结果摘要）。执行结果写入任务运行记录（`output_tail`），并可在任务子会话查看完整对话。
+
+**结果会话 / 通知**：`session_mode` 二选一（省略 = `main`）：
+- `main`：`run` / `agent` 在项目「定时任务」隐藏对话的任务子会话执行；完成后把结果摘要**写回主会话**（`top_session`，回退创建会话）并广播 `tool-notify{notice:"cron-complete"}`。`notify` 只控制系统 Toast，不关闭会话通知。
+- `own`：任务自己就是**顶层会话**（独立对话，进会话列表，标题 = 任务简述）；完成后**不通知**，用户从会话一览直接看结果。
 
 **工作目录**：`run` / `agent` 必须由项目会话创建（`work_dir` 必须存在、是目录且命中配置白名单），否则直接失败；`notify` 不访问工作目录，可在无项目的全局会话创建。可选 `sandbox` 控制 `run` 是否以进程沙箱（Low IL + Job，只限写）执行（省略 / `"inherit"` = 继承插件配置）。创建成功会异步弹系统通知并在状态栏徽标即时计数。任务全局共享，不区分项目。
 
@@ -65,6 +69,11 @@ on_timeout: background
       "type": ["boolean", "string"],
       "enum": [true, false, "inherit"],
       "description": "run 任务的写隔离（可选；省略或 \"inherit\" = 继承插件配置 plugins.crontab.sandbox）：true = 以 Low IL + Job 执行，只允许写工作目录 / 项目可写白名单；false = 不隔离"
+    },
+    "session_mode": {
+      "type": "string",
+      "enum": ["main", "own"],
+      "description": "结果会话/通知（可选，省略 = main）：main = 任务子会话执行，完成后通知主会话；own = 任务自己是顶层会话（进会话列表），不通知"
     }
   }
 }

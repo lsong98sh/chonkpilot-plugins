@@ -3,14 +3,14 @@
 name: file_find
 title: 查找文件
 args: file_find --input={RAW-INPUT-FILE}
-async: never
+async: sync
 category: file
 hot: true
 runtime: builtin
 idempotent: true
 output: stdout
 timeout: 300
-on_timeout: background
+touch_files: false
 ```
 
 # 摘要

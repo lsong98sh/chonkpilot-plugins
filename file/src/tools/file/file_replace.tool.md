@@ -3,14 +3,14 @@
 name: file_replace
 title: 替换文本
 args: file_replace --input={RAW-INPUT-FILE}
-async: never
+async: sync
 category: file
 hot: true
 runtime: builtin
 idempotent: false
 output: stdout
 timeout: 120
-on_timeout: background
+touch_files: true
 ```
 
 # 摘要

@@ -1,0 +1,53 @@
+{
+  "schema": "chonkpilot.plugin/v1",
+  "id": "task",
+  "name": "任务工具",
+  "version": "1.0.0",
+  "description": "任务与会话编排工具：执行（task_run）/ 委派（task_llm）/ 状态（task_status）/ 终止（task_stop）/ 提问（ask_user）/ 续跑（next_run）/ 子聊天（subchat_open·subchat_finish）",
+  "icon": "play",
+  "publisher": "chonkpilot",
+  "product": true,
+  "runtime": {
+    "exe": "chonkpilot-plugin-task.exe",
+    "args": [],
+    "autostart": true,
+    "restart": { "backoff_ms": 1000, "max_backoff_ms": 30000, "max_fails": 3 },
+    "health": { "interval_ms": 15000, "timeout_ms": 3000, "fail_threshold": 3 },
+    "stop": { "grace_ms": 8000 }
+  },
+  "mcp": {
+    "mode": "http",
+    "namespace": "-",
+    "hot_tools": ["task_run", "task_llm", "task_status", "task_stop", "ask_user", "next_run", "subchat_open", "subchat_finish"],
+    "timeout_sec": 600,
+    "category": "task",
+    "origin": "builtin"
+  },
+  "config": { "scope": "plugin" },
+  "ui": {
+    "selfServe": true,
+    "views": [
+      {
+        "id": "config",
+        "title": "任务工具",
+        "icon": "play",
+        "entry": "webui/config.html",
+        "containers": ["preview", "tab", "drawer", "dialog"],
+        "default_size": { "width": 760, "height": 620 }
+      }
+    ],
+    "menus": [
+      { "location": "plugin", "label": "任务工具", "icon": "play", "view": "config" }
+    ],
+    "statusbar": [],
+    "rpc": ["status", "ping", "load", "save", "reset"]
+  },
+  "permissions": {
+    "data": ["task.tree", "task.tasks", "task.stop"],
+    "hooks": [],
+    "llm": { "step": true },
+    "session": ["ask.user", "next.run", "subchat.open", "subchat.finish"],
+    "ui": { "containers": ["preview", "tab", "drawer", "dialog"] },
+    "network": []
+  }
+}

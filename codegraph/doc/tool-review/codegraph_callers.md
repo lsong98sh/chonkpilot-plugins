@@ -78,3 +78,9 @@ status: verified
 - `TestToolCallersPaginationAndTargetIdentity`：total/truncated、target_symbol/target_matches、id 优先（name 指向别的符号）、file 过滤、offset 翻页/越界、no_callers/target_not_indexed/id_not_found、参数校验。
 - 既有 `TestToolCallers`（name 路径、跨语言同名、id not_found）回归。
 - 回归：`go test -count=1 ./server/...` 通过。
+## 8. P2 修复（2026-11-11）
+
+- **file 子串误命中**：`fileHit` 改为**路径段后缀**匹配（`a.go` 命中 `a.go`/`src/a.go`，不再命中 `data.go`）；相对/绝对输入均先归一到 workdir 相对路径。契约同步。
+- **跨语言同名**：新增 `lang` 过滤（go/javascript/typescript/tsx/python/rust/java），非法语言报参数错误；`total`/`truncated` 按过滤后集合计算。
+- 测试：`TestCallersFileSegmentMatch`、`TestCallersLangFilter`。
+- 仍为基线：门禁状态仍 `isError=false`（按 `status` 处理，跨查询工具统一取舍）。

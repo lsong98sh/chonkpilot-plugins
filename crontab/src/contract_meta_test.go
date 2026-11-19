@@ -1,7 +1,7 @@
 package main
 
 // contract_meta_test.go —— crontab 5 个 `.tool.md` 的行为字段必须经 SDK 进入 `_meta`，
-// 供 gateway 裁决同步/异步与超时动作（source=md）。
+// 供 gateway 裁决同步/异步、转异步阈值与执行硬上限（source=md）。
 
 import (
 	"testing"
@@ -42,8 +42,9 @@ func TestCrontabContractsMeta(t *testing.T) {
 		if tool.Timeout <= 0 {
 			t.Errorf("%s: timeout=%d，同步工具不应为 0/负数", tool.Name, tool.Timeout)
 		}
-		if m["on_timeout"] != "background" {
-			t.Errorf("%s: on_timeout=%v，期望 background", tool.Name, m["on_timeout"])
+		// 打点声明：crontab 写调度数据、非项目文件 → touch_files: false（显式声明）。
+		if v, ok := m["touch_files"].(bool); !ok || v {
+			t.Errorf("%s: touch_files=%v（存在=%v），期望 false", tool.Name, m["touch_files"], ok)
 		}
 	}
 }

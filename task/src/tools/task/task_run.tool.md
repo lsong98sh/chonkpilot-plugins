@@ -3,13 +3,14 @@
 name: task_run
 title: 执行命令/脚本
 args: task_run --input={RAW-INPUT-FILE}
-async: never
+async: auto
 category: task
 hot: true
 runtime: plugin
 idempotent: false
 output: stdout
 timeout: 600
+touch_files: true
 ```
 
 # 摘要

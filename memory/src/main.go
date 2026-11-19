@@ -36,21 +36,22 @@ import (
 	"github.com/lsong98sh/chonkpilot-plugin-framework/sdk"
 )
 
-const pluginVersion = "1.0.0"
-
 //go:embed all:webui
 var webuiFS embed.FS
 
 // uiAssetRoot 是 webui 资源根（`plugin/v1/ui.asset.get` 的相对前缀）。
 const uiAssetRoot = "webui"
 
+// embeddedManifest 是插件 manifest（构建期嵌入 exe，随 `plugin.hello` 上报；宿主不再读盘）。
+//
+//go:embed manifest.json
+var embeddedManifest []byte
+
 func main() {
 	p, err := pluginsdk.New(pluginsdk.Options{
-		ID:      "memory",
-		Name:    "记忆沉淀",
-		Version: pluginVersion,
 		// 单次宿主调用上限：覆盖插件侧 llmTimeout（60s）；data-* 等短调用由 bridgebus 另行收敛到 5s。
 		Timeout:  120 * time.Second,
+		Manifest: embeddedManifest,
 		Features: map[string]any{"mq": true, "ui": true},
 	})
 	if err != nil {

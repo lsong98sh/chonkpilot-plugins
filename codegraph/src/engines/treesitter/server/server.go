@@ -56,6 +56,7 @@ var toolSpecs = []toolSpec{
 			"workdir": map[string]any{"type": "string", "description": "项目根目录"},
 		},
 		Required: []string{"workdir"},
+		Hot:      true,
 		Fn:       toolStatus,
 	},
 	{
@@ -105,7 +106,8 @@ var toolSpecs = []toolSpec{
 			"workdir": map[string]any{"type": "string", "description": "项目根目录"},
 			"name":    map[string]any{"type": "string", "description": "被调名（如 Foo 或 pkg.Foo）；id 非空时忽略"},
 			"id":      map[string]any{"type": "string", "description": "目标符号 id（file:line:name:kind）；与 name 二选一，id 优先"},
-			"file":    map[string]any{"type": "string", "description": "只保留该文件内的调用方（路径子串，大小写不敏感）"},
+			"file":    map[string]any{"type": "string", "description": "只保留该文件内的调用方（相对/绝对路径，大小写不敏感；路径段后缀匹配）"},
+			"lang":    map[string]any{"type": "string", "description": "只保留该语言的调用方（go/javascript/typescript/tsx/python/rust/java）"},
 			"limit":   map[string]any{"type": "integer", "minimum": 1, "maximum": 500, "description": "返回上限（默认 50，上限 500）"},
 			"offset":  map[string]any{"type": "integer", "minimum": 0, "description": "排序后跳过条数（翻页）"},
 		},
@@ -120,6 +122,7 @@ var toolSpecs = []toolSpec{
 			"workdir": map[string]any{"type": "string", "description": "项目根目录"},
 			"id":      map[string]any{"type": "string", "description": "符号 id（file:line:name:kind）；提供时忽略 file/name"},
 			"file":    map[string]any{"type": "string", "description": "符号所在文件（精确匹配，大小写不敏感；配 name 定位）"},
+			"lang":    map[string]any{"type": "string", "description": "候选定义语言过滤（go/javascript/typescript/tsx/python/rust/java）"},
 			"name":    map[string]any{"type": "string", "description": "符号名（大小写不敏感全名；配 file 定位）"},
 			"limit":   map[string]any{"type": "integer", "minimum": 1, "maximum": 500, "description": "返回上限（默认 50，上限 500）"},
 			"offset":  map[string]any{"type": "integer", "minimum": 0, "description": "排序后跳过条数（翻页）"},
@@ -146,10 +149,12 @@ var toolSpecs = []toolSpec{
 		Name:        "codegraph_find_circular_deps",
 		Description: "在可解析为仓库内文件的导入边上枚举简单环（JS/TS 相对、Go module 前缀、Py/Java 包路径、Rust crate 尽力）；路径为 workdir 相对路径，支持 limit/offset 分页与 include_self（默认含自环）。解析是启发式，0 环不代表绝对无循环。",
 		Props: map[string]any{
-			"workdir":      map[string]any{"type": "string", "description": "项目根目录"},
-			"limit":        map[string]any{"type": "integer", "minimum": 1, "maximum": 500, "description": "本页最多返回环数（默认 50，上限 500）"},
-			"offset":       map[string]any{"type": "integer", "minimum": 0, "description": "按确定性枚举顺序跳过条数（翻页）"},
-			"include_self": map[string]any{"type": "boolean", "description": "是否包含自环（默认 true）"},
+			"workdir":          map[string]any{"type": "string", "description": "项目根目录"},
+			"limit":            map[string]any{"type": "integer", "minimum": 1, "maximum": 500, "description": "本页最多返回环数（默认 50，上限 500）"},
+			"offset":           map[string]any{"type": "integer", "minimum": 0, "description": "按确定性枚举顺序跳过条数（翻页）"},
+			"include_self":     map[string]any{"type": "boolean", "description": "是否包含自环（默认 true）"},
+			"max_cycle_length": map[string]any{"type": "integer", "minimum": 0, "description": "只枚举节点数不超过该值的环（0 = 不限；更长环被剪枝、不计数）"},
+			"path":             map[string]any{"type": "string", "description": "只在该目录/文件前缀子图内枚举（workdir 相对路径）"},
 		},
 		Required: []string{"workdir"},
 		Hot:      true,
@@ -751,7 +756,7 @@ func validateGetSymbolInfoArgs(args map[string]any) (id, file, name string, err 
 
 // toolCallers 查「谁调用了它」：目标由 name 或 id 指定（id 优先）；file 过滤调用方文件。
 func toolCallers(_ context.Context, args map[string]any) (any, error) {
-	id, name, file, limit, offset, err := validateCallersArgs(args)
+	id, name, file, lang, limit, offset, err := validateCallersArgs(args)
 	if err != nil {
 		return nil, err
 	}
@@ -775,7 +780,7 @@ func toolCallers(_ context.Context, args map[string]any) (any, error) {
 		target = name
 		targetSyms = w.FindByName(name)
 	}
-	callers, total := w.CallersPage(target, file, limit, offset)
+	callers, total := w.CallersPageLang(target, file, lang, limit, offset)
 	out := map[string]any{
 		"workdir": w.Dir, "target": target,
 		"target_defined": len(targetSyms) > 0, "target_matches": len(targetSyms),
@@ -783,6 +788,9 @@ func toolCallers(_ context.Context, args map[string]any) (any, error) {
 		"limit": limit, "offset": offset,
 		"truncated": total > offset+len(callers),
 		"callers":   callers,
+	}
+	if lang != "" {
+		out["lang"] = lang
 	}
 	if len(targetSyms) > 0 {
 		out["target_symbol"] = targetSyms[0]
@@ -803,35 +811,39 @@ func toolCallers(_ context.Context, args map[string]any) (any, error) {
 
 // validateCallersArgs 严格校验 callers 参数：
 // 未知键/类型错误显式失败；id 非空时优先于 name；limit 1..500（超出截到 500）、offset>=0。
-func validateCallersArgs(args map[string]any) (id, name, file string, limit, offset int, err error) {
+func validateCallersArgs(args map[string]any) (id, name, file, lang string, limit, offset int, err error) {
 	allowed := map[string]bool{
 		"workdir": true, "id": true, "name": true,
-		"file": true, "limit": true, "offset": true,
+		"file": true, "lang": true, "limit": true, "offset": true,
 	}
 	for k := range args {
 		if !allowed[k] {
-			return "", "", "", 0, 0, fmt.Errorf("不支持的参数: %s", k)
+			return "", "", "", "", 0, 0, fmt.Errorf("不支持的参数: %s", k)
 		}
 	}
-	for _, k := range []string{"workdir", "id", "name", "file"} {
+	for _, k := range []string{"workdir", "id", "name", "file", "lang"} {
 		if v, ok := args[k]; ok && v != nil {
 			if _, ok := v.(string); !ok {
-				return "", "", "", 0, 0, fmt.Errorf("%s 必须是字符串", k)
+				return "", "", "", "", 0, 0, fmt.Errorf("%s 必须是字符串", k)
 			}
 		}
 	}
 	id = strings.TrimSpace(getString(args, "id"))
 	name = strings.TrimSpace(getString(args, "name"))
 	file = strings.TrimSpace(getString(args, "file"))
+	lang = strings.ToLower(strings.TrimSpace(getString(args, "lang")))
+	if lang != "" && !supportedLangName(lang) {
+		return "", "", "", "", 0, 0, fmt.Errorf("lang 非法: %q（可选 %s）", getString(args, "lang"), strings.Join(supportedLangNames(), "/"))
+	}
 	if id == "" && name == "" {
-		return "", "", "", 0, 0, fmt.Errorf("需要 name 或 id（id 优先）")
+		return "", "", "", "", 0, 0, fmt.Errorf("需要 name 或 id（id 优先）")
 	}
 	limit = 50
 	if v, ok, verr := symbolSearchIntArg(args, "limit"); verr != nil {
-		return "", "", "", 0, 0, verr
+		return "", "", "", "", 0, 0, verr
 	} else if ok {
 		if v < 1 {
-			return "", "", "", 0, 0, fmt.Errorf("limit 必须 >= 1")
+			return "", "", "", "", 0, 0, fmt.Errorf("limit 必须 >= 1")
 		}
 		limit = v
 		if limit > 500 {
@@ -839,19 +851,37 @@ func validateCallersArgs(args map[string]any) (id, name, file string, limit, off
 		}
 	}
 	if v, ok, verr := symbolSearchIntArg(args, "offset"); verr != nil {
-		return "", "", "", 0, 0, verr
+		return "", "", "", "", 0, 0, verr
 	} else if ok {
 		if v < 0 {
-			return "", "", "", 0, 0, fmt.Errorf("offset 必须 >= 0")
+			return "", "", "", "", 0, 0, fmt.Errorf("offset 必须 >= 0")
 		}
 		offset = v
 	}
-	return id, name, file, limit, offset, nil
+	return id, name, file, lang, limit, offset, nil
+}
+
+// supportedLangName / supportedLangNames：索引实际产出的逻辑语言名。
+func supportedLangName(name string) bool {
+	for _, l := range langs {
+		if l.name == name {
+			return true
+		}
+	}
+	return false
+}
+
+func supportedLangNames() []string {
+	out := make([]string, 0, len(langs))
+	for _, l := range langs {
+		out = append(out, l.name)
+	}
+	return out
 }
 
 // toolCallees 查「它调用了谁」：由 id（优先）或 file+name 定位符号。
 func toolCallees(_ context.Context, args map[string]any) (any, error) {
-	id, file, name, limit, offset, err := validateCalleesArgs(args)
+	id, file, name, lang, limit, offset, err := validateCalleesArgs(args)
 	if err != nil {
 		return nil, err
 	}
@@ -882,7 +912,7 @@ func toolCallees(_ context.Context, args map[string]any) (any, error) {
 		return out, nil
 	}
 	target := hits[0]
-	refs, total := w.CalleesOf(target, limit, offset)
+	refs, total := w.CalleesOfLang(target, lang, limit, offset)
 	out := map[string]any{
 		"workdir": w.Dir, "matches": len(hits),
 		"symbol": target, "symbols": hits, "ambiguous": len(hits) > 1,
@@ -890,6 +920,9 @@ func toolCallees(_ context.Context, args map[string]any) (any, error) {
 		"limit": limit, "offset": offset,
 		"truncated": total > offset+len(refs),
 		"callees":   refs,
+	}
+	if lang != "" {
+		out["lang"] = lang
 	}
 	switch {
 	case !callableKind(target.Kind):
@@ -909,35 +942,39 @@ func callableKind(kind string) bool {
 
 // validateCalleesArgs 严格校验 callees 参数：
 // 未知键/类型错误显式失败；id 非空时优先于 file+name；limit 1..500（超出截到 500）、offset>=0。
-func validateCalleesArgs(args map[string]any) (id, file, name string, limit, offset int, err error) {
+func validateCalleesArgs(args map[string]any) (id, file, name, lang string, limit, offset int, err error) {
 	allowed := map[string]bool{
 		"workdir": true, "id": true, "file": true, "name": true,
-		"limit": true, "offset": true,
+		"lang": true, "limit": true, "offset": true,
 	}
 	for k := range args {
 		if !allowed[k] {
-			return "", "", "", 0, 0, fmt.Errorf("不支持的参数: %s", k)
+			return "", "", "", "", 0, 0, fmt.Errorf("不支持的参数: %s", k)
 		}
 	}
-	for _, k := range []string{"workdir", "id", "file", "name"} {
+	for _, k := range []string{"workdir", "id", "file", "name", "lang"} {
 		if v, ok := args[k]; ok && v != nil {
 			if _, ok := v.(string); !ok {
-				return "", "", "", 0, 0, fmt.Errorf("%s 必须是字符串", k)
+				return "", "", "", "", 0, 0, fmt.Errorf("%s 必须是字符串", k)
 			}
 		}
 	}
 	id = strings.TrimSpace(getString(args, "id"))
 	file = strings.TrimSpace(getString(args, "file"))
 	name = strings.TrimSpace(getString(args, "name"))
+	lang = strings.ToLower(strings.TrimSpace(getString(args, "lang")))
+	if lang != "" && !supportedLangName(lang) {
+		return "", "", "", "", 0, 0, fmt.Errorf("lang 非法: %q（可选 %s）", getString(args, "lang"), strings.Join(supportedLangNames(), "/"))
+	}
 	if id == "" && (file == "" || name == "") {
-		return "", "", "", 0, 0, fmt.Errorf("需要 id 或 file+name（id 优先）")
+		return "", "", "", "", 0, 0, fmt.Errorf("需要 id 或 file+name（id 优先）")
 	}
 	limit = 50
 	if v, ok, verr := symbolSearchIntArg(args, "limit"); verr != nil {
-		return "", "", "", 0, 0, verr
+		return "", "", "", "", 0, 0, verr
 	} else if ok {
 		if v < 1 {
-			return "", "", "", 0, 0, fmt.Errorf("limit 必须 >= 1")
+			return "", "", "", "", 0, 0, fmt.Errorf("limit 必须 >= 1")
 		}
 		limit = v
 		if limit > 500 {
@@ -945,14 +982,14 @@ func validateCalleesArgs(args map[string]any) (id, file, name string, limit, off
 		}
 	}
 	if v, ok, verr := symbolSearchIntArg(args, "offset"); verr != nil {
-		return "", "", "", 0, 0, verr
+		return "", "", "", "", 0, 0, verr
 	} else if ok {
 		if v < 0 {
-			return "", "", "", 0, 0, fmt.Errorf("offset 必须 >= 0")
+			return "", "", "", "", 0, 0, fmt.Errorf("offset 必须 >= 0")
 		}
 		offset = v
 	}
-	return id, file, name, limit, offset, nil
+	return id, file, name, lang, limit, offset, nil
 }
 
 func toolDependencyGraph(_ context.Context, args map[string]any) (any, error) {
@@ -969,6 +1006,7 @@ func toolDependencyGraph(_ context.Context, args map[string]any) (any, error) {
 	for _, imps := range deps {
 		edges += len(imps)
 	}
+	indexed, parseErrors := w.IndexCoverage()
 	out := map[string]any{
 		"workdir": w.Dir,
 		"total":   total, "returned": len(deps), "files": len(deps),
@@ -976,6 +1014,11 @@ func toolDependencyGraph(_ context.Context, args map[string]any) (any, error) {
 		"truncated": total > offset+len(deps),
 		"edges":     edges, "totalEdges": totalEdges,
 		"deps": deps,
+		"coverage": map[string]any{
+			"indexed_files":     indexed,
+			"parse_error_files": parseErrors,
+			"note":              "只统计已索引文件；>8MB、被排除或不支持语言的文件未计入",
+		},
 	}
 	if file != "" {
 		out["file"] = file
@@ -1048,8 +1091,8 @@ func validateDependencyGraphArgs(args map[string]any) (file string, limit, offse
 	return file, limit, offset, includeEmpty, nil
 }
 
-func toolCircularDeps(_ context.Context, args map[string]any) (any, error) {
-	limit, offset, includeSelf, err := validateCircularDepsArgs(args)
+func toolCircularDeps(ctx context.Context, args map[string]any) (any, error) {
+	limit, offset, includeSelf, maxCycleLength, pathPrefix, err := validateCircularDepsArgs(args)
 	if err != nil {
 		return nil, err
 	}
@@ -1057,18 +1100,30 @@ func toolCircularDeps(_ context.Context, args map[string]any) (any, error) {
 	if !ok {
 		return resp, nil
 	}
-	cycles, truncated := w.FindCyclesPage(limit, offset, includeSelf)
+	cycles, truncated, err := w.FindCyclesPageFiltered(ctx, limit, offset, CycleFilter{
+		IncludeSelf: includeSelf, MaxCycleLength: maxCycleLength, PathPrefix: pathPrefix,
+	})
+	if err != nil {
+		return nil, err
+	}
 	out := map[string]any{
 		"workdir":    w.Dir,
 		"cycleCount": len(cycles), "returned": len(cycles),
 		"limit": limit, "offset": offset, "truncated": truncated,
-		"cycles": cycles,
-		"hint":   "路径为 workdir 相对路径；只含可解析为仓库内文件的导入边（解析为启发式，0 环不代表绝对没有循环依赖）；原始导入见 codegraph_get_dependency_graph。环数潜在指数级，用 limit/offset 翻页。",
+		"max_cycle_length": maxCycleLength,
+		"cycles":           cycles,
+		"hint":             "路径为 workdir 相对路径；只含可解析为仓库内文件的导入边（解析为启发式，0 环不代表绝对没有循环依赖）；原始导入见 codegraph_get_dependency_graph。环数潜在指数级，用 limit/offset 翻页。max_cycle_length>0 时只枚举不超过该长度的环（更长环被剪枝、不计数）；path 限定子图。",
+	}
+	if pathPrefix != "" {
+		out["path"] = pathPrefix
 	}
 	if len(cycles) == 0 {
-		if offset > 0 {
+		switch {
+		case pathPrefix != "" && !w.HasIndexedFile(pathPrefix):
+			out["note"] = "path_not_indexed"
+		case offset > 0:
 			out["note"] = "offset_beyond_total"
-		} else {
+		default:
 			out["note"] = "no_cycles"
 		}
 	}
@@ -1077,34 +1132,46 @@ func toolCircularDeps(_ context.Context, args map[string]any) (any, error) {
 
 // validateCircularDepsArgs 严格校验环检测参数：
 // 未知键/类型错误显式失败；limit 1..500（超出截到 500）、offset>=0、include_self 布尔。
-func validateCircularDepsArgs(args map[string]any) (limit, offset int, includeSelf bool, err error) {
+func validateCircularDepsArgs(args map[string]any) (limit, offset int, includeSelf bool, maxCycleLength int, pathPrefix string, err error) {
 	allowed := map[string]bool{
 		"workdir": true, "limit": true, "offset": true, "include_self": true,
+		"max_cycle_length": true, "path": true,
 	}
 	for k := range args {
 		if !allowed[k] {
-			return 0, 0, false, fmt.Errorf("不支持的参数: %s", k)
+			return 0, 0, false, 0, "", fmt.Errorf("不支持的参数: %s", k)
 		}
 	}
-	if v, ok := args["workdir"]; ok && v != nil {
-		if _, ok := v.(string); !ok {
-			return 0, 0, false, fmt.Errorf("workdir 必须是字符串")
+	for _, k := range []string{"workdir", "path"} {
+		if v, ok := args[k]; ok && v != nil {
+			if _, ok := v.(string); !ok {
+				return 0, 0, false, 0, "", fmt.Errorf("%s 必须是字符串", k)
+			}
 		}
 	}
+	pathPrefix = strings.TrimSpace(getString(args, "path"))
 	includeSelf = true
 	if v, ok := args["include_self"]; ok && v != nil {
 		b, isBool := v.(bool)
 		if !isBool {
-			return 0, 0, false, fmt.Errorf("include_self 必须是布尔值")
+			return 0, 0, false, 0, "", fmt.Errorf("include_self 必须是布尔值")
 		}
 		includeSelf = b
 	}
+	if v, ok, verr := symbolSearchIntArg(args, "max_cycle_length"); verr != nil {
+		return 0, 0, false, 0, "", verr
+	} else if ok {
+		if v < 0 {
+			return 0, 0, false, 0, "", fmt.Errorf("max_cycle_length 必须 >= 0")
+		}
+		maxCycleLength = v
+	}
 	limit = 50
 	if v, ok, verr := symbolSearchIntArg(args, "limit"); verr != nil {
-		return 0, 0, false, verr
+		return 0, 0, false, 0, "", verr
 	} else if ok {
 		if v < 1 {
-			return 0, 0, false, fmt.Errorf("limit 必须 >= 1")
+			return 0, 0, false, 0, "", fmt.Errorf("limit 必须 >= 1")
 		}
 		limit = v
 		if limit > 500 {
@@ -1112,14 +1179,14 @@ func validateCircularDepsArgs(args map[string]any) (limit, offset int, includeSe
 		}
 	}
 	if v, ok, verr := symbolSearchIntArg(args, "offset"); verr != nil {
-		return 0, 0, false, verr
+		return 0, 0, false, 0, "", verr
 	} else if ok {
 		if v < 0 {
-			return 0, 0, false, fmt.Errorf("offset 必须 >= 0")
+			return 0, 0, false, 0, "", fmt.Errorf("offset 必须 >= 0")
 		}
 		offset = v
 	}
-	return limit, offset, includeSelf, nil
+	return limit, offset, includeSelf, maxCycleLength, pathPrefix, nil
 }
 
 func toolComplexity(_ context.Context, args map[string]any) (any, error) {
@@ -1143,6 +1210,7 @@ func toolComplexity(_ context.Context, args map[string]any) (any, error) {
 		"coverage": map[string]any{
 			"indexed_files":     indexed,
 			"parse_error_files": parseErrors,
+			"note":              "只统计已索引文件；>8MB、被排除或不支持语言的文件未计入",
 		},
 	}
 	if total == 0 {
@@ -1218,6 +1286,7 @@ func toolModuleSummary(_ context.Context, args map[string]any) (any, error) {
 	}
 	sum := w.ModuleSummary(path)
 	sum["workdir"] = w.Dir
+	sum["coverageNote"] = "files 只统计已索引文件；>8MB、被排除或不支持语言的文件未计入"
 	if sum["files"] == 0 && path != "" {
 		sum["note"] = "path_not_indexed"
 	}

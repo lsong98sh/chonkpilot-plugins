@@ -3,13 +3,14 @@
 name: task_llm
 title: 委派子代理
 args: task_llm --input={RAW-INPUT-FILE}
-async: never
+async: auto
 category: task
 hot: true
 runtime: plugin
 idempotent: false
 output: stdout
 timeout: 600
+touch_files: true
 ```
 
 # 摘要
@@ -72,4 +73,9 @@ timeout: 600
 
 `state=error` 且 `code=LLM_INCOMPLETE` 表示子代理输出不完整（截断）；`partial` 仅为已产出的
 非终态内容，**不得当作最终回复**。子代理被取消时为 `state=cancelled`。只有 `state=done`
-且带 `text` 才是完整结果。
+且带 `text` 才是完整结果。传输/执行失败时也会尽量带 `partial`（子代理已产出的内容）。
+
+`agent` 必须能在当前场景或 app 级 agent 注册表中解析；拼错/不存在 → 工具报错
+`agent_not_found`（**不会**静默退化为全能力子代理）。同一 `session_id` 已有在跑子轮次 →
+报错 `session_busy`（请等待或改用新的 session_id）。`waitSec` 必须是 0..600 的整数，
+越界/非整数报参数错误；`waitSec=0` 的实际等待上限仍为 600s。

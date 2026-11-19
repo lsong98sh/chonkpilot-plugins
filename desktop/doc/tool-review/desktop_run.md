@@ -145,3 +145,10 @@ LLM → gateway `doCall`（剥离 `tool_call_display_name`；manifest `timeout_s
 - 基线 §4 路径规则不适用：`screenshot.path` 无绝对/相对校验，相对路径按引擎 cwd 解析。
 - 基线 §3 沙箱：本插件写工具 = `screenshot`，但实现完全不读 `sandbox`（`src/main.go` 无 `cx.Sandbox`）。
 - 基线 §5“不要假设运行时强校验”成立：`args` 自由对象，全部校验在引擎；`start(meta)` 这条引擎能力没有暴露到工具面。
+## 10. 修复记录（2026-11-08 / 2026-11-11）
+
+- **2026-11-08（P0 清零 + 契约化）**：契约迁到 `src/tools/desktop/desktop_run.tool.md`（schema/描述/策略单源）；引擎 `Do` 加 `recoverAsError`，screenshot 无目标窗口不再崩进程（无目标=主屏整屏）；`start` 支持 `meta` 预绑定 `hwnd/title/class`，绑定失败立即报错；10 个需目标窗口的动作在 schema/描述中写清；`screenshot.path` 走插件配置默认目录 + 沙箱 `writable_dirs`（`sandbox.go`，越界不落盘）；`move`/`size` 的 `SetWindowPos` 分别补 `SWP_NOSIZE`/`SWP_NOMOVE`；`list_windows`/`find_window`/`window_info` 统一返回 `hwnd/title/class/visible/client_screen_rect`，并支持 `visible_only`/`limit`/`duplicate_title`。
+- **2026-11-11（归属与自愈）**：`start/stop/operation` 均下发 `instance_id/session`，引擎 `enginehost` 拒绝跨实例/跨会话操作（修复顺序 `ctx-N` 可猜中越权）；隐式 context 失效（引擎 janitor/重启）→ 清理映射、自动重建（复用 start 时绑定的目标窗口 meta）并**重试一次**；显式 `context_id` 失效返回可操作错误；失效 `stop` 返回 `stopped:false` 并清映射/绑定；`start` 先回收同实例旧 context。
+- **2026-11-11（错误面）**：`click` 的 `SetCursorPos` 失败不再静默成功（返回 `click failed`）；`screenshot` 缺 `path` 且未配置默认目录时在**开会话前**返回明确错误。
+- 测试：`TestStartPassesOwnerAndBinding`、`TestImplicitContextExpiredRecovers`、`TestExplicitContextExpiredNoRetry`、`TestStopExpiredContextIsIdempotent`、`TestStartRecyclesOldContext`、`TestScreenshotMissingPathNoStart`。
+- 仍为基线（未改）：同 context 串行、跨 context 对同一窗口无互斥（输入注入是全局状态）；每次 `EnumWindows` 的 `NewCallback` 未释放；`stop`/`ping` 仍先 `Ensure`；引擎错误文案未统一。

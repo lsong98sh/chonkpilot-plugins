@@ -5,7 +5,7 @@ name: codegraph_analyze_complexity
 title: 圈复杂度分析
 async: auto
 timeout: 30
-on_timeout: background
+touch_files: false
 category: codegraph
 hot: true
 ```
@@ -19,7 +19,7 @@ hot: true
 - `file` 为**大小写不敏感的子串匹配**（不是精确路径），例如 `a.go` 也会命中 `a_test.go`。
 - `topN` 缺省 20、硬上限 200；`minCc` 为复杂度下限（`>=`，缺省 1）。
 - 结果按复杂度降序，并以文件/行号/名称/kind 稳定排序；`total` 是过滤后的真实匹配数，`truncated=true` 表示 `topN` 截断。
-- `coverage.indexed_files`/`parse_error_files` 说明本次结果基于多少已索引文件、其中多少有语法解析错误；>8MB/不支持/被排除的文件不在索引中，仍无法从结果判断。
+- `coverage.indexed_files`/`parse_error_files` 说明本次结果基于多少已索引文件、其中多少有语法解析错误；`coverage.note` 明确“>8MB/不支持/被排除的文件未计入”，这些文件仍无法从结果逐项判断。
 - 仅覆盖已索引文件；不支持的语言/被排除的文件不在结果中。
 - workdir 缺省取调用上下文的 `_meta.chonkpilot.work_dir`；显式传入时必须是当前项目内的绝对路径。
 
@@ -54,7 +54,7 @@ hot: true
   "symbols": [
     { "id": "E:/proj/a.go:10:Run:func", "file": "E:/proj/a.go", "kind": "func", "lang": "go", "name": "Run", "line": 10, "endLine": 40, "complexity": 9, "signature": "func Run()", "calls": ["Helper"] }
   ],
-  "coverage": {"indexed_files": 42, "parse_error_files": 0}
+  "coverage": {"indexed_files": 42, "parse_error_files": 0, "note": "只统计已索引文件；>8MB、被排除或不支持语言的文件未计入"}
 }
 ```
 

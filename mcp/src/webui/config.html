@@ -108,7 +108,7 @@
       try {
         const v = await rpc('status');
         document.getElementById('dims').textContent =
-          '默认条数 ' + v.defaultLimit + ' · 含非 hot：' + (v.includeNonHot ? '是' : '否') + ' · 调用超时 ' + v.invokeTimeoutSec + 's';
+          '默认条数 ' + v.defaultLimit + ' · 含非 hot：' + (v.includeNonHot ? '是' : '否') + ';
         out.hidden = false; out.textContent = JSON.stringify(v, null, 2);
       } catch (e) { show('读取失败: ' + e.message, true); }
     }

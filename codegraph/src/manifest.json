@@ -1,0 +1,97 @@
+{
+  "schema": "chonkpilot.plugin/v1",
+  "id": "codegraph",
+  "name": "代码知识库",
+  "version": "1.0.0",
+  "description": "代码符号图谱（codegraph）+ 全文检索（vfts）合一的代码知识库插件",
+  "icon": "code",
+  "publisher": "chonkpilot",
+  "product": true,
+  "runtime": {
+    "exe": "chonkpilot-plugin-codegraph.exe",
+    "args": [],
+    "autostart": true,
+    "restart": { "backoff_ms": 1000, "max_backoff_ms": 30000, "max_fails": 3 },
+    "health": { "interval_ms": 15000, "timeout_ms": 3000, "fail_threshold": 3 },
+    "stop": { "grace_ms": 5000 }
+  },
+  "mcp": {
+    "mode": "http",
+    "namespace": "-",
+    "hot_tools": [
+      "codegraph_status",
+      "codegraph_symbol_search",
+      "codegraph_get_symbol_info",
+      "codegraph_callers",
+      "codegraph_callees",
+      "codegraph_get_dependency_graph",
+      "codegraph_find_circular_deps",
+      "codegraph_analyze_complexity",
+      "codegraph_get_module_summary",
+      "vfts_query"
+    ],
+    "timeout_sec": 300,
+    "category": "codegraph",
+    "origin": "builtin"
+  },
+  "config": { "scope": "prjusr" },
+  "ui": {
+    "selfServe": true,
+    "views": [
+      {
+        "id": "config",
+        "title": "代码知识库",
+        "icon": "code",
+        "entry": "webui/config.html",
+        "containers": ["preview", "tab", "drawer", "dialog"],
+        "default_size": { "width": 860, "height": 640 }
+      },
+      {
+        "id": "status",
+        "title": "知识库状态",
+        "icon": "pulse",
+        "entry": "webui/status.html",
+        "containers": ["preview", "tab", "drawer"]
+      },
+      {
+        "id": "badge",
+        "title": "索引进度",
+        "icon": "pulse",
+        "entry": "webui/badge.html",
+        "containers": ["statusbar"],
+        "default_size": { "width": 200, "height": 20 }
+      }
+    ],
+    "menus": [
+      { "location": "plugin", "label": "代码知识库", "icon": "code", "view": "config" }
+    ],
+    "statusbar": [
+      {
+        "id": "codegraph",
+        "zone": "right",
+        "view": "badge",
+        "tooltip": "代码知识库索引进度（点击查看详情）"
+      }
+    ],
+    "actions": [
+      {
+        "id": "index-status",
+        "label": "索引进度",
+        "icon": "<svg viewBox=\"0 0 16 16\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.5\" stroke-linecap=\"round\"><path d=\"M2 13V9\"/><path d=\"M6 13V6\"/><path d=\"M10 13V8\"/><path d=\"M14 13V3\"/></svg>",
+        "tooltip": "打开代码索引（codegraph / vfts）进度与最近一次索引结果",
+        "style": "icon-text",
+        "view": "status",
+        "container": "drawer"
+      }
+    ],
+    "rpc": ["ping", "status", "badge", "engine-status", "tool.call", "load", "save", "clear", "vfts.session.query", "vfts.session.reindex"]
+  },
+  "permissions": {
+    "data": [],
+    "hooks": [],
+    "llm": {},
+    "session": [],
+    "ui": { "containers": ["preview", "tab", "drawer", "dialog", "statusbar"] },
+    "network": []
+  }
+}

@@ -34,6 +34,7 @@ const (
 	methodSessionEnsure       = "plugin/v1/session.ensure"
 	methodSessionEnsureTurn   = "plugin/v1/session.ensure-turn"
 	methodSessionCompleteTurn = "plugin/v1/session.complete-turn"
+	methodSessionAppendNotice = "plugin/v1/session.append-notice"
 	methodSessionHistory      = "plugin/v1/session.history"
 	methodSessionGet          = "plugin/v1/session.get"
 	methodInstanceResolve     = "plugin/v1/instance.resolve"
@@ -46,6 +47,9 @@ const (
 	sessionOriginScheduler = "scheduler"
 	sessionKindCrontab     = "crontab"
 	sessionKindCrontabTask = "crontab_task"
+	// sessionKindCrontabOwn 是 session_mode=own 的任务顶层会话（独立 dialog，进会话列表；
+	// 非 crontab 保留类型，故不被 IsHiddenDialogKind 排除）。
+	sessionKindCrontabOwn = "crontab_own"
 )
 
 // sessionTitleMax 是会话标题上限（data 侧校验 ≤128 字符；此处留余量）。
@@ -86,6 +90,27 @@ type sessionHost interface {
 	EnsureSession(ctx context.Context, req sessionEnsureReq) (dialogID string, err error)
 	EnsureTurn(ctx context.Context, workDir string, ref sessionRef) error
 	CompleteTurn(ctx context.Context, workDir string, ref sessionRef, status, finishReason string) error
+}
+
+// noticeHost 是「向既有会话追加通知」的可选能力。宿主未提供（旧宿主 / 单测 fake）→
+// 仅系统通知 + 任务页结果，不阻断任务。
+type noticeHost interface {
+	AppendNotice(ctx context.Context, req noticeReq) (noticeResult, error)
+}
+
+type noticeReq struct {
+	InstanceID string
+	WorkDir    string
+	SessionID  string
+	TaskID     string
+	Message    string
+}
+
+type noticeResult struct {
+	SessionID string
+	TurnID    string
+	MessageID string
+	DialogID  string
 }
 
 // ── 宿主桥实现 ────────────────────────────────────────────────
@@ -187,7 +212,7 @@ func (b *bridgeSessions) RunAgent(ctx context.Context, req agentRunReq) (agentRu
 	}, nil
 }
 
-// CompleteTurn 收本轮终态（done / error）。
+// CompleteTurn 收本轮终态（complete / error）。
 func (b *bridgeSessions) CompleteTurn(ctx context.Context, workDir string, ref sessionRef, status, finishReason string) error {
 	var out struct {
 		OK bool `json:"ok"`
@@ -201,6 +226,66 @@ func (b *bridgeSessions) CompleteTurn(ctx context.Context, workDir string, ref s
 	}, &out)
 }
 
+// AppendNotice 向既有会话追加一条 kind=notify 通知消息，并让宿主广播
+// tool-notify{notice=cron-complete}（前端即时显示；历史从 DB 回填）。
+func (b *bridgeSessions) AppendNotice(ctx context.Context, req noticeReq) (noticeResult, error) {
+	var out struct {
+		OK        bool   `json:"ok"`
+		SessionID string `json:"session_id"`
+		TurnID    string `json:"turn_id"`
+		MessageID string `json:"message_id"`
+		DialogID  string `json:"dialog_id"`
+	}
+	err := b.p.CallInto(ctx, methodSessionAppendNotice, map[string]any{
+		"instance_id": req.InstanceID,
+		"work_dir":    req.WorkDir,
+		"session_id":  req.SessionID,
+		"task_id":     req.TaskID,
+		"message":     req.Message,
+	}, &out)
+	return noticeResult{SessionID: out.SessionID, TurnID: out.TurnID,
+		MessageID: out.MessageID, DialogID: out.DialogID}, err
+}
+
+// notifyCreator 把任务完成摘要写回**主会话**（失败只留痕，不阻断任务）。
+//
+// 目标 = `created_by.top_session`（gateway 注入的顶层会话）→ 回退 `created_by.session_id`
+// （旧任务 / 无 gateway 上下文）。session_mode=own 的任务自带结果会话，**不通知**。
+func (r *runner) notifyCreator(ctx context.Context, t Task, rec RunRecord, body string) {
+	if r.sessions == nil || sessionModeOf(t) == SessionModeOwn {
+		return
+	}
+	target := strings.TrimSpace(t.CreatedBy.TopSession)
+	if target == "" {
+		target = strings.TrimSpace(t.CreatedBy.SessionID)
+	}
+	if target == "" {
+		return
+	}
+	msg := strings.TrimSpace(body)
+	if msg == "" {
+		msg = "定时任务已完成：" + t.Description
+	}
+	msg += "\n任务 ID：" + t.ID
+	if rec.SessionID != "" {
+		msg += "\n任务会话：" + rec.SessionID
+	}
+	nh, ok := r.sessions.(noticeHost)
+	if !ok {
+		return
+	}
+	_, err := nh.AppendNotice(ctx, noticeReq{
+		InstanceID: t.CreatedBy.InstanceID,
+		WorkDir:    strings.TrimSpace(t.CreatedBy.WorkDir),
+		SessionID:  target,
+		TaskID:     t.ID,
+		Message:    msg,
+	})
+	if err != nil && r.logf != nil {
+		r.logf("crontab: 主会话通知失败（task=%s session=%s）: %v", t.ID, target, err)
+	}
+}
+
 // ── 执行前 / 执行后 ──────────────────────────────────────────
 
 // beginCronSession 确保「项目根会话 → 任务子会话」存在（P4 / C11），不建轮次。
@@ -212,6 +297,19 @@ func (r *runner) beginCronSession(ctx context.Context, t Task) (sessionRef, stri
 	wd := strings.TrimSpace(t.CreatedBy.WorkDir)
 	if wd == "" {
 		return sessionRef{}, "session_bind_skipped: work_dir 为空"
+	}
+	if sessionModeOf(t) == SessionModeOwn {
+		// own：任务自己就是**顶层会话**（无父、独立 dialog；宿主自举目录行 → 进会话列表）。
+		// 不发完成通知（结果就在该会话里，用户从会话一览直接打开）。
+		sessionID := taskSessionID(t.ID)
+		dialogID, err := r.sessions.EnsureSession(ctx, sessionEnsureReq{
+			WorkDir: wd, SessionID: sessionID, Kind: sessionKindCrontabOwn,
+			Title: taskSessionTitle(t),
+		})
+		if err != nil {
+			return sessionRef{}, "session_bind_failed: " + err.Error()
+		}
+		return sessionRef{DialogID: dialogID, SessionID: sessionID}, ""
 	}
 	root := rootSessionID(wd)
 	dialogID, err := r.sessions.EnsureSession(ctx, sessionEnsureReq{
@@ -254,7 +352,7 @@ func (r *runner) finishCronRound(ctx context.Context, workDir string, ref sessio
 	if r.sessions == nil || ref.TurnID == "" {
 		return
 	}
-	status, reason := "done", ""
+	status, reason := "complete", ""
 	if !rec.OK {
 		status = "error"
 		reason = strx.TruncRunes(rec.Error, 200)

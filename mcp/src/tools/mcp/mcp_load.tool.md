@@ -9,14 +9,14 @@ runtime: plugin
 idempotent: true
 output: stdout
 timeout: 60
-on_timeout: fail
+touch_files: true
 ```
 
 # 摘要
 按名称加载一个条目的完整定义（只读、实时读取）。
 
 - 工具（`kind=tool`）：返回 `input_schema`，可直接作为 `mcp_invoke` 的 `arguments` 依据。
-- 技能/提示（`kind=skill|prompt`）：返回正文 `content`（同时保留 `text` 兼容字段）。
+- 技能/提示（`kind=skill|prompt`）：返回正文 `content`。
 - 资源（`kind=resource`）：按 `uri`（缺失时用名称）读取，返回 `content`，可选 `mimeType`。
 - 同名时**工具优先**，其次是提示/技能，最后是资源。
 - 名称大小写敏感、精确匹配；未找到时返回错误。
@@ -46,7 +46,6 @@ on_timeout: fail
   "type": "skill",
   "name": "代码审查",
   "description": "按清单审查变更",
-  "content": "……正文……",
-  "text": "……正文……"
+  "content": "……正文……"
 }
 ```

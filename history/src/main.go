@@ -17,6 +17,7 @@ package main
 
 import (
 	"context"
+	_ "embed"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -32,14 +33,15 @@ import (
 	"github.com/lsong98sh/chonkpilot-plugin-framework/sdk"
 )
 
-const pluginVersion = "1.0.0"
+// embeddedManifest 是插件 manifest（构建期嵌入 exe，随 `plugin.hello` 上报；宿主不再读盘）。
+//
+//go:embed manifest.json
+var embeddedManifest []byte
 
 func main() {
 	p, err := pluginsdk.New(pluginsdk.Options{
-		ID:       "history",
-		Name:     "文件历史",
-		Version:  pluginVersion,
 		Timeout:  120 * time.Second,
+		Manifest: embeddedManifest,
 		Features: map[string]any{"mq": true},
 	})
 	if err != nil {

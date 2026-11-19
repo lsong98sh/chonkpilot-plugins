@@ -5,7 +5,7 @@ name: codegraph_callers
 title: 调用方查询
 async: auto
 timeout: 30
-on_timeout: background
+touch_files: false
 category: codegraph
 hot: true
 ```
@@ -14,11 +14,12 @@ hot: true
 
 查「谁调用了它」：在已索引项目内按被调名（精确名或最后一段，忽略大小写，故 pkg.Foo 与 Foo 同目标）找调用方符号。
 
-- 语义为调用点文本的**名字级启发式**：无类型/重载解析，只覆盖已索引文件中的直接调用；**跨语言同名会被一并计入**（可用 file 缩小范围）。
+- 语义为调用点文本的**名字级启发式**：无类型/重载解析，只覆盖已索引文件中的直接调用；**跨语言同名默认会被一并计入**（可用 `lang` 或 `file` 缩小范围）。
 - 目标由 `id` 或 `name` 指定；**id 优先**——同时给出时按 id 定位，name 被忽略。id 未命中返回 `status=not_found`（`note=id_not_found`）。
 - name 路径不要求目标已定义（可能是外部/动态符号）：返回 `target_defined:false`、`target_matches:0`；若同时无调用方，`note=target_not_indexed`。
 - `callers[]` 是**调用方符号定义**；`line` 是定义起始行，不是调用点行。返回 `target_symbol`（首个定义）与 `target_matches/target_ambiguous`，便于确认问的是哪个同名符号。
-- file 只过滤调用方所在文件（路径子串、大小写不敏感）。
+- file 只过滤调用方所在文件（workdir 相对/绝对路径，大小写不敏感；按**路径段后缀**匹配：`a.go` 命中 `src/a.go`，不命中 `data.go`）。
+- lang 只保留该语言的调用方（`go/javascript/typescript/tsx/python/rust/java`）；`total`/`truncated` 按过滤后的集合计算。
 - `limit` 缺省 50、上限 500；`offset` 翻页；`total` 是**未截断的真实调用方总数**，`returned` 是本次返回数，`truncated=true` 表示还有下一页。
 - 空调用方带 `note`：`no_callers`、`target_not_indexed`、`offset_beyond_total`。
 - workdir 缺省取调用上下文的 `_meta.chonkpilot.work_dir`；显式传入时必须是当前项目内的绝对路径。
@@ -33,7 +34,8 @@ hot: true
     "workdir": {"type": "string", "description": "项目根目录（可选；缺省取 _meta.chonkpilot.work_dir）"},
     "name": {"type": "string", "description": "被调名（如 Foo 或 pkg.Foo）；id 非空时忽略"},
     "id": {"type": "string", "description": "目标符号 id（file:line:name:kind）；与 name 二选一，id 优先"},
-    "file": {"type": "string", "description": "只保留该文件内的调用方（路径子串，大小写不敏感）"},
+    "file": {"type": "string", "description": "只保留该文件内的调用方（相对/绝对路径，大小写不敏感；路径段后缀匹配）"},
+    "lang": {"type": "string", "enum": ["go", "javascript", "typescript", "tsx", "python", "rust", "java"], "description": "只保留该语言的调用方"},
     "limit": {"type": "integer", "minimum": 1, "maximum": 500, "default": 50, "description": "返回上限（缺省 50，硬上限 500）"},
     "offset": {"type": "integer", "minimum": 0, "default": 0, "description": "排序后跳过条数（翻页）"}
   }
