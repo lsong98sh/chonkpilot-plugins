@@ -124,6 +124,9 @@ func TestHandleLoadDefaults(t *testing.T) {
 	if values[KeyDefaultLimit] != "20" || values[KeyIncludeNonHot] != "true" {
 		t.Errorf("默认值错误：%v", values)
 	}
+	if values[KeyTwoStepThreshold] != "300" {
+		t.Errorf("two-step-threshold 默认应为 300：%v", values)
+	}
 	if _, ok := values["plugins.mcp.invoke-timeout-sec"]; ok {
 		t.Errorf("invoke-timeout-sec 已下线，不应回显：%v", values)
 	}

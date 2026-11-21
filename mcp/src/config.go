@@ -34,16 +34,23 @@ import (
 const (
 	KeyDefaultLimit  = "plugins.mcp.default-limit"
 	KeyIncludeNonHot = "plugins.mcp.include-non-hot"
+	// KeyTwoStepThreshold 是 mcp_find 语义检索的一步/两步自适应阈值（参与检索总条数）：
+	// ≤ 阈值 → 一步（全候选概述列表交检索 LLM 选 topN）；> 阈值 → 两步（先按域选域再选条目）。
+	KeyTwoStepThreshold = "plugins.mcp.two-step-threshold"
 )
 
 // 校验区间（与旧 manifest 声明一致）。
 const (
 	defaultLimitMin = 1
 	defaultLimitMax = 200
+
+	// twoStep 阈值区间：下限 20（低于此值两步无意义）；上限 5000（再大一步 prompt 装不下）。
+	twoStepMin = 20
+	twoStepMax = 5000
 )
 
 // allKeys 是本插件的用户配置键全集（稳定序；load 恒回显这些键的有效值）。
-var allKeys = []string{KeyDefaultLimit, KeyIncludeNonHot}
+var allKeys = []string{KeyDefaultLimit, KeyIncludeNonHot, KeyTwoStepThreshold}
 
 // legacyKeyMap 旧宿主键 → 新命名空间键（**迁移专用**；除 migrateLocked 外不得读旧键）。
 var legacyKeyMap = []struct{ Old, New string }{
@@ -56,6 +63,7 @@ var legacyKeyMap = []struct{ Old, New string }{
 var configFields = []fieldSpec{
 	{Key: KeyDefaultLimit, Type: "integer", Label: "mcp_find 默认返回条数", Min: configkit.IntPtr(defaultLimitMin), Max: configkit.IntPtr(defaultLimitMax)},
 	{Key: KeyIncludeNonHot, Type: "boolean", Label: "检索包含非 hot 工具"},
+	{Key: KeyTwoStepThreshold, Type: "integer", Label: "语义检索两步阈值（条数，≤ 走一步）", Min: configkit.IntPtr(twoStepMin), Max: configkit.IntPtr(twoStepMax)},
 }
 
 // fieldSpec 是配置页字段（JSON 形状与旧 manifest config.fields 兼容）。
@@ -72,13 +80,14 @@ type fieldSpec struct {
 
 // settings 是本插件配置的内存视图（落盘形态 = allKeys 的字符串 KV）。
 type settings struct {
-	DefaultLimit  int
-	IncludeNonHot bool
+	DefaultLimit     int
+	IncludeNonHot    bool
+	TwoStepThreshold int
 }
 
 // defaultSettings 缺键兜底（与实际生效值一致）。
 func defaultSettings() settings {
-	return settings{DefaultLimit: 20, IncludeNonHot: true}
+	return settings{DefaultLimit: 20, IncludeNonHot: true, TwoStepThreshold: 300}
 }
 
 // settingsOf 由「已存在的 KV 键」构造配置快照（缺失 / 越界按默认）。
@@ -95,14 +104,18 @@ func settingsOf(values map[string]string) settings {
 			s.IncludeNonHot = false
 		}
 	}
+	if n, err := strconv.Atoi(strings.TrimSpace(values[KeyTwoStepThreshold])); err == nil && n >= twoStepMin && n <= twoStepMax {
+		s.TwoStepThreshold = n
+	}
 	return s
 }
 
 // values 把快照展开成 `键 → 字符串` 的有效值（load 回显用）。
 func (s settings) values() map[string]string {
 	return map[string]string{
-		KeyDefaultLimit:  strconv.Itoa(s.DefaultLimit),
-		KeyIncludeNonHot: boolString(s.IncludeNonHot),
+		KeyDefaultLimit:     strconv.Itoa(s.DefaultLimit),
+		KeyIncludeNonHot:    boolString(s.IncludeNonHot),
+		KeyTwoStepThreshold: strconv.Itoa(s.TwoStepThreshold),
 	}
 }
 
@@ -405,6 +418,8 @@ func normalizeValue(key string, raw any) (string, error) {
 	switch key {
 	case KeyDefaultLimit:
 		return normalizeInt(key, raw, defaultLimitMin, defaultLimitMax)
+	case KeyTwoStepThreshold:
+		return normalizeInt(key, raw, twoStepMin, twoStepMax)
 	case KeyIncludeNonHot:
 		s := strings.ToLower(strings.TrimSpace(pluginsdk.Str(raw)))
 		if s == "true" || s == "false" {

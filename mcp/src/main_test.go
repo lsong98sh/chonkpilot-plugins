@@ -224,38 +224,92 @@ func TestFindLimit(t *testing.T) {
 	}
 }
 
-// TestFilterAndRank 验证 query 硬过滤 + match 加权排序（名称优先于描述、同分保持原序）。
-func TestFilterAndRank(t *testing.T) {
+// TestParseExpression 表达式解析：散词 / 引号短语 / - 排除 / -"短语"。
+func TestParseExpression(t *testing.T) {
+	terms := parseExpression(`张三 李四 -"王五" -read "代码 审查"`)
+	if len(terms) != 5 {
+		t.Fatalf("应解析出 5 个条件，实际 %d: %+v", len(terms), terms)
+	}
+	want := []exprTerm{
+		{text: "张三"},
+		{text: "李四"},
+		{text: "王五", negated: true, phrase: true},
+		{text: "read", negated: true},
+		{text: "代码 审查", phrase: true},
+	}
+	for i := range want {
+		if terms[i] != want[i] {
+			t.Errorf("terms[%d] = %+v，want %+v", i, terms[i], want[i])
+		}
+	}
+	if got := parseExpression("   "); len(got) != 0 {
+		t.Errorf("空表达式应为空: %+v", got)
+	}
+	// 未闭合引号：短语取到串尾（不 panic）。
+	if got := parseExpression(`"张`); len(got) != 1 || !got[0].phrase || got[0].text != "张" {
+		t.Errorf("未闭合引号解析异常: %+v", got)
+	}
+}
+
+// TestFilterByExpression 表达式过滤与排序：OR 保留 / 排除剔除 / 名称命中优先 / 短语加权。
+func TestFilterByExpression(t *testing.T) {
 	list := []entry{
 		{Name: "alpha", Description: "无关"},
 		{Name: "beta", Description: "代码审查"},
 		{Name: "gamma", Description: "代码生成"},
 		{Name: "file_read", Description: "读取文件"},
 	}
-	if got := filterEntries(list, "read"); len(got) != 1 || got[0].Name != "file_read" {
-		t.Fatalf("query 过滤失败: %+v", got)
+	// 多词 OR：read / 代码 任一命中。
+	got := filterByExpression(list, parseExpression("read 代码"))
+	names := entryNames(got)
+	if len(got) != 3 || names[0] != "file_read" || names[1] != "beta" || names[2] != "gamma" {
+		t.Fatalf("OR 过滤/排序失败: %v", names)
 	}
-	if got := filterEntries(list, "READ"); len(got) != 1 || got[0].Name != "file_read" {
-		t.Fatalf("query 应忽略大小写: %+v", got)
+	// 排除：-代码 剔除 beta/gamma。
+	got = filterByExpression(list, parseExpression("read 代码 -代码"))
+	if n := entryNames(got); len(n) != 1 || n[0] != "file_read" {
+		t.Fatalf("排除项未生效: %v", n)
 	}
-	if got := filterEntries(list, ""); len(got) != len(list) {
-		t.Fatalf("空 query 不应过滤: %+v", got)
+	// 引号短语：命中描述短语（alpha 不含）。
+	got = filterByExpression(list, parseExpression(`"代码审查"`))
+	if n := entryNames(got); len(n) != 1 || n[0] != "beta" {
+		t.Fatalf("短语精确匹配失败: %v", n)
 	}
+	// 只有排除项：其余全部保留。
+	got = filterByExpression(list, parseExpression("-代码"))
+	if n := entryNames(got); len(n) != 2 {
+		t.Fatalf("仅排除项应保留其余条目: %v", n)
+	}
+	// 空表达式：不过滤不重排。
+	if got := filterByExpression(list, nil); len(got) != len(list) || got[0].Name != "alpha" {
+		t.Fatalf("空表达式不应过滤/重排: %+v", got)
+	}
+	// 大小写不敏感。
+	if got := filterByExpression(list, parseExpression("READ")); len(got) != 1 {
+		t.Fatalf("应忽略大小写: %+v", got)
+	}
+}
 
-	ranked := append([]entry(nil), list...)
-	rankEntries(ranked, splitTerms("代码"))
-	if ranked[0].Name != "beta" || ranked[1].Name != "gamma" {
-		t.Fatalf("match 应按命中排序: %+v", ranked)
+// TestExprScoring 打分：名称命中(2) 优先于描述命中(1)；短语再 ×2。
+func TestExprScoring(t *testing.T) {
+	nameHit := entry{Name: "代码工具", Description: "无"}
+	descHit := entry{Name: "x", Description: "代码"}
+	if exprScore(nameHit, parseExpression("代码")) <= exprScore(descHit, parseExpression("代码")) {
+		t.Fatal("名称命中应高于描述命中")
 	}
-	// 名称命中权重高于描述。
-	ranked = []entry{
-		{Name: "x", Description: "代码"},
-		{Name: "代码工具", Description: "无"},
+	phrase := exprScore(entry{Name: "x", Description: "代码审查"}, parseExpression(`"代码审查"`))
+	word := exprScore(entry{Name: "x", Description: "代码"}, parseExpression("代码"))
+	if phrase <= word {
+		t.Fatalf("短语应额外加权：phrase=%d word=%d", phrase, word)
 	}
-	rankEntries(ranked, splitTerms("代码"))
-	if ranked[0].Name != "代码工具" {
-		t.Fatalf("名称命中应优先: %+v", ranked)
+}
+
+func entryNames(list []entry) []string {
+	out := make([]string, 0, len(list))
+	for _, e := range list {
+		out = append(out, e.Name)
 	}
+	return out
 }
 
 // TestInterleave 验证 type=all 时各组轮转取用，避免工具先占满 limit。
@@ -480,5 +534,114 @@ func TestInvokeOutcomeTruncation(t *testing.T) {
 	out, _ = got.(map[string]any)
 	if _, ok := out["truncated"]; ok {
 		t.Fatalf("未超限不应有 truncated: %+v", out)
+	}
+}
+
+// ─── 语义检索 / 概述（渐进披露）──────────────────────────────────
+
+// TestLLMRefName llmref 折算口径对齐主仓 data.LLMRefName：字符串原样、int 索引、
+// 越界回落下标 0、空 llms → ""。
+func TestLLMRefName(t *testing.T) {
+	llms := []any{
+		map[string]any{"name": "first"},
+		map[string]any{"name": "second"},
+	}
+	cases := []struct {
+		v    any
+		llms any
+		want string
+	}{
+		{"explicit", llms, "explicit"},
+		{"  spaced  ", llms, "spaced"},
+		{"", llms, ""},
+		{float64(1), llms, "second"},
+		{float64(9), llms, "first"}, // 越界 → 下标 0
+		{float64(-1), llms, "first"},
+		{nil, llms, "first"},
+		{"x", []any{}, "x"}, // 显式 name 字符串原样（不校验 llms）
+		{float64(0), nil, ""},
+	}
+	for _, c := range cases {
+		if got := llmRefName(c.v, c.llms); got != c.want {
+			t.Errorf("llmRefName(%v,%v) = %q，want %q", c.v, c.llms, got, c.want)
+		}
+	}
+}
+
+// TestOverviewDoc 概述文档的键/取值语义（kind 前缀避免工具与提示同名冲突）。
+func TestOverviewDoc(t *testing.T) {
+	doc := overviewDoc{}
+	doc[overviewEntryKey("tool", "file_read")] = "读取文件并返回文本；输入 path；输出文件内容"
+	doc[overviewEntryKey("prompt", "file_read")] = "提示正文"
+	if got := doc.overviewOf("tool", "file_read"); got == "" || got == doc.overviewOf("prompt", "file_read") {
+		t.Fatalf("kind 前缀未区分：%+v", doc)
+	}
+	if got := doc.overviewOf("tool", "missing"); got != "" {
+		t.Fatalf("缺失概述应为空: %q", got)
+	}
+}
+
+// TestParsePickedNames 语义检索输出解析：纯 JSON / 围栏 / 前后杂文 / 非法输出。
+func TestParsePickedNames(t *testing.T) {
+	names, ok := parsePickedNames(`{"names":["a"," b ",""]}`)
+	if !ok || len(names) != 2 || names[0] != "a" || names[1] != "b" {
+		t.Fatalf("纯 JSON 解析失败: %v ok=%v", names, ok)
+	}
+	names, ok = parsePickedNames("```json\n{\"names\":[\"x\"]}\n```")
+	if !ok || len(names) != 1 || names[0] != "x" {
+		t.Fatalf("围栏输出解析失败: %v ok=%v", names, ok)
+	}
+	names, ok = parsePickedNames("我认为最相关的是 {\"names\":[\"y\"]} 以上。")
+	if !ok || len(names) != 1 || names[0] != "y" {
+		t.Fatalf("杂文包裹解析失败: %v ok=%v", names, ok)
+	}
+	if _, ok := parsePickedNames("not json"); ok {
+		t.Fatal("非法输出应返回 ok=false（触发本地回退）")
+	}
+	if names, ok := parsePickedNames(`{"names":[]}`); !ok || len(names) != 0 {
+		t.Fatalf("无匹配应返回空列表: %v ok=%v", names, ok)
+	}
+}
+
+// TestGroupDomains 域划分 = 按 server/node；无归属条目入「其他」；稳定序。
+func TestGroupDomains(t *testing.T) {
+	list := []entry{
+		{Name: "t1", Kind: "tool", Server: "zeta"},
+		{Name: "t2", Kind: "tool", Server: "alpha"},
+		{Name: "p1", Kind: "prompt", Server: "alpha"},
+		{Name: "r1", Kind: "resource"},
+	}
+	domains, byDomain := groupDomains(list)
+	if len(domains) != 3 {
+		t.Fatalf("应有 3 个域，实际 %+v", domains)
+	}
+	if domains[0].name != "alpha" || domains[1].name != "zeta" || domains[2].name != "其他" {
+		t.Fatalf("域顺序/命名错误: %+v", domains)
+	}
+	if len(byDomain["alpha"]) != 2 || len(byDomain["其他"]) != 1 {
+		t.Fatalf("域归属错误: %+v", byDomain)
+	}
+	lines := domainSummary(domains, byDomain)
+	if len(lines) != 3 || !strings.Contains(lines[0], "alpha: 2 条") {
+		t.Fatalf("域摘要行错误: %v", lines)
+	}
+}
+
+// TestSplitByGroups type=all 时按组归位（skill/prompt 同组）。
+func TestSplitByGroups(t *testing.T) {
+	list := []entry{
+		{Name: "t", Kind: "tool"},
+		{Name: "s", Kind: "skill"},
+		{Name: "p", Kind: "prompt"},
+		{Name: "r", Kind: "resource"},
+	}
+	groups := splitByGroups(list, []string{"tool", "prompt", "resource"})
+	if len(groups["tool"]) != 1 || len(groups["prompt"]) != 2 || len(groups["resource"]) != 1 {
+		t.Fatalf("分组错误: %+v", groups)
+	}
+	// 只请求 tool 时其余组不出现。
+	only := splitByGroups(list, []string{"tool"})
+	if _, ok := only["prompt"]; ok || len(only["tool"]) != 1 {
+		t.Fatalf("单组请求不应带其它组: %+v", only)
 	}
 }

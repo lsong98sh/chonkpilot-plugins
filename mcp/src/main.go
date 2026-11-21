@@ -1,11 +1,12 @@
 // chonkpilot-mcp —— MCP 工具系列插件（检索 / 加载 / 调用）。
 //
-// 三个工具（全部走宿主能力面，不直连 gateway 内部）：
-//   - mcp_find   在工具 / 技能（提示）/ 资源中检索（query 本地匹配；type=skill 是 prompt 别名）
+// 四个工具（全部走宿主能力面，不直连 gateway 内部）：
+//   - mcp_find   在工具 / 技能（提示）/ 资源中做 LLM 语义检索（llm.toolfind；不可用回退本地表达式）
+//   - mcp_match  本地表达式检索（搜索引擎式：OR / 短语 / 排除；不走 LLM）
 //   - mcp_load   按名称加载一个条目的完整定义（tool = input_schema；skill/prompt = 正文；resource = content）
 //   - mcp_invoke 调用一个工具（plugin/v1/tools.call，参数 {name,arguments}）
 //
-// 配置（插件自身，不分四级）：默认返回条数 / 是否包含非 hot 工具 / 默认调用超时。
+// 配置（插件自身，不分四级）：默认返回条数 / 是否包含非 hot 工具 / 语义检索两步阈值 / 默认调用超时。
 package main
 
 import (
@@ -50,6 +51,10 @@ const invokeResultMaxBytes = 1 << 20
 // metaToolTimeout 是 find/load 这类只读元工具的宿主往返上限（多次列表/详情调用共用）。
 // 与 `.tool.md` 的 timeout 对齐，避免 SDK 放宽后无界等待。
 const metaToolTimeout = 60 * time.Second
+
+// findToolTimeout 是 mcp_find 的往返上限（LLM 语义检索可能两步 = 两次模型调用，
+// 单次最坏 45s → 110s 预算；本地表达式路径远快于此）。
+const findToolTimeout = 110 * time.Second
 
 // 复用层别名：参数取值 / 信封解包统一由 pluginsdk 提供。
 var (
@@ -118,6 +123,11 @@ func main() {
 	// 宿主资源通道（PLUGIN-UI-1）：插件自持 webui（embed），宿主经 UDS 逐文件拉取
 	// （GET /plugins/mcp/<path> → plugin/v1/ui.asset.get）。
 	p.OnRequest("plugin/v1/ui.asset.get", uiAssetGet)
+	// 概述生成动作（EditMCPDialog「加载工具」后 fire-and-forget 调用；注册/保存链路走
+	// data-mcp-refresh 订阅，两入口共用同一生成器，见 overview.go）。
+	p.OnRequest("overview.generate", m.handleOverviewGenerate)
+	// 第三方 MCP 注册/保存/「加载工具」落库 → data-mcp-refresh → 后台补概述。
+	p.Subscribe("data-mcp-refresh", m.handleMCPRefresh)
 
 	// 配置面（PLUGIN-UI-1 第三段）：`load` / `save` / `reset` 动作 + 一次性键迁移。
 	// 配置写入口**只有**动作面（页面不再直调 config.set / 宿主方法）。
@@ -168,6 +178,7 @@ func loadContracts() ([]contract.Tool, error) {
 func registerTools(p *pluginsdk.Plugin, m *mcpPlugin, tools []contract.Tool) []string {
 	handlers := map[string]pluginsdk.ToolFunc{
 		"mcp_find":   m.find,
+		"mcp_match":  m.matchTool,
 		"mcp_load":   m.load,
 		"mcp_invoke": m.invoke,
 	}
@@ -191,9 +202,89 @@ func registerTools(p *pluginsdk.Plugin, m *mcpPlugin, tools []contract.Tool) []s
 	return missing
 }
 
-// ── mcp_find ─────────────────────────
+// ── mcp_find（LLM 语义检索）────────────────────────
 
-func (m *mcpPlugin) find(ctx context.Context, args map[string]any, _ pluginsdk.CallContext) (any, error) {
+// find 检索主体：语义优先（检索 LLM 选 topN），本地表达式兜底（mode 标注）。
+// LLM 模式返回 topN 条**全量定义**（tool 含 input_schema，省掉 mcp_load 二次往返）；
+// 本地模式条目只带概述（不含 schema，定义走 mcp_load）。
+func (m *mcpPlugin) find(ctx context.Context, args map[string]any, cx pluginsdk.CallContext) (any, error) {
+	ctx, cancel := context.WithTimeout(ctx, findToolTimeout)
+	defer cancel()
+
+	cfg := m.cfg.Settings()
+	kind, err := normalizeKind(asString(args["type"]))
+	if err != nil {
+		return nil, err
+	}
+	limit := findLimit(toInt(args["limit"]), cfg.DefaultLimit)
+	query := strings.TrimSpace(asString(args["query"]))
+	match := strings.TrimSpace(asString(args["match"]))
+
+	candidates, err := m.candidates(ctx, kind)
+	if err != nil {
+		return nil, err
+	}
+	// 概述替代原描述（渐进披露：LLM 检索/本地列表都读概述面）。
+	overviews := m.loadOverviews(ctx, cx.InstanceID)
+	for i := range candidates {
+		if o := overviews.overviewOf(candidates[i].Kind, candidates[i].Name); o != "" {
+			candidates[i].Description = o
+		}
+	}
+
+	// 语义检索模型：usr llm.toolfind（空值回落 defaultLLM，数据层读侧完成）。
+	if model := m.modelName(ctx, cx.InstanceID, "llm.toolfind"); model != "" && (query != "" || match != "") {
+		out, ok := m.llmFind(ctx, llmFindInput{
+			instanceID: cx.InstanceID, model: model, kind: kind, limit: limit,
+			query: query, match: match, candidates: candidates,
+			twoStepThreshold: cfg.TwoStepThreshold,
+		})
+		if ok {
+			return out, nil
+		}
+		// LLM 失败（调用失败 / 输出不可解析）→ 回退本地表达式（find 语义：尽力返回结果）。
+	}
+
+	// 表达式输入 = query；query 空而只给了 match 时用 match 原文兜底（避免退化成无序全量）。
+	expr := query
+	if expr == "" {
+		expr = match
+	}
+	return m.localFindResult(kind, limit, expr, candidates), nil
+}
+
+// localFindResult 本地表达式路径（mcp_match 同一逻辑）：过滤 + 排序 + 轮转取用；
+// 条目**不带 input_schema**（渐进披露）。query 空 = 不过滤。
+func (m *mcpPlugin) localFindResult(kind string, limit int, query string, candidates []entry) map[string]any {
+	terms := parseExpression(query)
+	groups := listGroups(kind)
+	byGroup := splitByGroups(candidates, groups)
+	total := 0
+	for _, group := range groups {
+		list := filterByExpression(byGroup[group], terms)
+		byGroup[group] = list
+		total += len(list)
+	}
+	out := interleave(groups, byGroup, limit)
+	entries := make([]entry, 0, len(out))
+	for _, e := range out {
+		e.Schema = nil // 本地列表不带 schema（定义用 mcp_load）
+		entries = append(entries, e)
+	}
+	return map[string]any{
+		"ok":        true,
+		"type":      kind,
+		"mode":      "local",
+		"count":     len(entries),
+		"total":     total,
+		"truncated": total > len(entries),
+		"entries":   entries,
+	}
+}
+
+// ── mcp_match（本地表达式检索，不走 LLM）────────────────────────
+
+func (m *mcpPlugin) matchTool(ctx context.Context, args map[string]any, cx pluginsdk.CallContext) (any, error) {
 	ctx, cancel := context.WithTimeout(ctx, metaToolTimeout)
 	defer cancel()
 
@@ -203,11 +294,25 @@ func (m *mcpPlugin) find(ctx context.Context, args map[string]any, _ pluginsdk.C
 		return nil, err
 	}
 	limit := findLimit(toInt(args["limit"]), cfg.DefaultLimit)
-	query := strings.ToLower(strings.TrimSpace(asString(args["query"])))
-	matchTerms := splitTerms(asString(args["match"]))
+	query := strings.TrimSpace(asString(args["query"]))
 
+	candidates, err := m.candidates(ctx, kind)
+	if err != nil {
+		return nil, err
+	}
+	overviews := m.loadOverviews(ctx, cx.InstanceID)
+	for i := range candidates {
+		if o := overviews.overviewOf(candidates[i].Kind, candidates[i].Name); o != "" {
+			candidates[i].Description = o
+		}
+	}
+	return m.localFindResult(kind, limit, query, candidates), nil
+}
+
+// candidates 读某 type 的全部候选条目（检索共用；含检索配置过滤 include-non-hot）。
+func (m *mcpPlugin) candidates(ctx context.Context, kind string) ([]entry, error) {
 	groups := listGroups(kind)
-	byGroup := make(map[string][]entry, len(groups))
+	out := make([]entry, 0, 32)
 	for _, group := range groups {
 		switch group {
 		case "tool":
@@ -215,38 +320,59 @@ func (m *mcpPlugin) find(ctx context.Context, args map[string]any, _ pluginsdk.C
 			if err != nil {
 				return nil, err
 			}
-			byGroup[group] = tools
+			out = append(out, tools...)
 		case "prompt":
 			list, err := m.promptEntries(ctx, kind)
 			if err != nil {
 				return nil, err
 			}
-			byGroup[group] = list
+			out = append(out, list...)
 		case "resource":
 			list, err := m.resourceEntries(ctx)
 			if err != nil {
 				return nil, err
 			}
-			byGroup[group] = list
+			out = append(out, list...)
 		}
 	}
+	return out, nil
+}
 
-	total := 0
+// splitByGroups 把候选按 kind 归组（prompt 组同时收 skill/prompt 条目）。
+func splitByGroups(candidates []entry, groups []string) map[string][]entry {
+	byGroup := make(map[string][]entry, len(groups))
 	for _, group := range groups {
-		list := filterEntries(byGroup[group], query)
-		rankEntries(list, matchTerms)
-		byGroup[group] = list
-		total += len(list)
+		byGroup[group] = nil
 	}
-	out := interleave(groups, byGroup, limit)
-	return map[string]any{
-		"ok":        true,
-		"type":      kind,
-		"count":     len(out),
-		"total":     total,
-		"truncated": total > len(out),
-		"entries":   out,
-	}, nil
+	for _, e := range candidates {
+		switch {
+		case e.Kind == "tool":
+			if _, ok := byGroup["tool"]; ok {
+				byGroup["tool"] = append(byGroup["tool"], e)
+			}
+		case e.Kind == "skill" || e.Kind == "prompt":
+			if _, ok := byGroup["prompt"]; ok {
+				byGroup["prompt"] = append(byGroup["prompt"], e)
+			}
+		case e.Kind == "resource":
+			if _, ok := byGroup["resource"]; ok {
+				byGroup["resource"] = append(byGroup["resource"], e)
+			}
+		}
+	}
+	return byGroup
+}
+
+// llmFindInput 是语义检索的输入。
+type llmFindInput struct {
+	instanceID       string
+	model            string // provider name（llm.toolfind / 回落 defaultLLM）
+	kind             string
+	limit            int
+	query            string
+	match            string
+	candidates       []entry
+	twoStepThreshold int
 }
 
 // ── mcp_load ─────────────────────────
@@ -461,7 +587,7 @@ const (
 	maxFindLimit     = 200
 )
 
-// findLimit 归一 mcp_find 的 limit：<=0 用配置默认；仍非法 → 20；硬顶 200。
+// findLimit 归一 mcp_find / mcp_match 的 limit：<=0 用配置默认；仍非法 → 20；硬顶 200。
 func findLimit(n, cfgDefault int) int {
 	if n <= 0 {
 		n = cfgDefault
@@ -473,53 +599,6 @@ func findLimit(n, cfgDefault int) int {
 		n = maxFindLimit
 	}
 	return n
-}
-
-// splitTerms 把检索意图拆成小写词（空白分隔；空串 → nil）。
-func splitTerms(raw string) []string {
-	return strings.Fields(strings.ToLower(strings.TrimSpace(raw)))
-}
-
-// filterEntries 按 query 过滤（名称/描述子串，忽略大小写）；query 空 = 不过滤。
-func filterEntries(list []entry, query string) []entry {
-	query = strings.ToLower(strings.TrimSpace(query))
-	out := make([]entry, 0, len(list))
-	for _, e := range list {
-		if query == "" || strings.Contains(strings.ToLower(e.Name), query) ||
-			strings.Contains(strings.ToLower(e.Description), query) {
-			out = append(out, e)
-		}
-	}
-	return out
-}
-
-// matchScore 计算条目与检索意图的匹配分：命中名称 2 分，命中描述 1 分（按词累加）。
-func matchScore(e entry, terms []string) int {
-	if len(terms) == 0 {
-		return 0
-	}
-	name := strings.ToLower(e.Name)
-	desc := strings.ToLower(e.Description)
-	score := 0
-	for _, term := range terms {
-		switch {
-		case strings.Contains(name, term):
-			score += 2
-		case strings.Contains(desc, term):
-			score++
-		}
-	}
-	return score
-}
-
-// rankEntries 按 match 分数稳定降序重排（同分保持宿主顺序；无意图时不重排）。
-func rankEntries(list []entry, terms []string) {
-	if len(terms) == 0 || len(list) < 2 {
-		return
-	}
-	sort.SliceStable(list, func(i, j int) bool {
-		return matchScore(list[i], terms) > matchScore(list[j], terms)
-	})
 }
 
 // interleave 按 order 轮转取各组条目，直到 limit；避免 type=all 时工具先占满额度。
@@ -606,6 +685,7 @@ func entryFromTool(t map[string]any, includeNonHot bool) (entry, bool) {
 
 // entryFromPrompt 归一 prompts/list 条目：宿主 type=skill → skill，type=prompt → prompt；
 // 宿主未给 type（或其他值）时用请求值兜底（skill 请求 → skill，其余 → prompt）。
+// Server 取条目 node（下游节点名 = 语义检索的「域」与第三方归属判定依据）。
 func entryFromPrompt(t map[string]any, requested string) entry {
 	kind := strings.ToLower(strings.TrimSpace(asString(t["type"])))
 	if kind != "skill" && kind != "prompt" {
@@ -619,10 +699,12 @@ func entryFromPrompt(t map[string]any, requested string) entry {
 		Kind:        kind,
 		Type:        kind,
 		Description: asString(t["description"]),
+		Server:      asString(t["node"]),
 	}
 }
 
 // entryFromResource 归一 resources/list 条目（name 缺失时回落 uri；保留 uri 供 read）。
+// Server 取条目 node（域分组依据）。
 func entryFromResource(t map[string]any) entry {
 	uri := asString(t["uri"])
 	name := asString(t["name"])
@@ -634,6 +716,7 @@ func entryFromResource(t map[string]any) entry {
 		Kind:        "resource",
 		Type:        "resource",
 		Description: asString(t["description"]),
+		Server:      asString(t["node"]),
 		URI:         uri,
 		MimeType:    asString(t["mimeType"]),
 	}
@@ -828,10 +911,11 @@ func mergeLoad(e entry, content, mimeType string) map[string]any {
 func (m *mcpPlugin) info(_ context.Context, _ map[string]any) (any, error) {
 	cfg := m.cfg.Settings()
 	return map[string]any{
-		"ok":            true,
-		"version":       m.p.Version(),
-		"defaultLimit":  cfg.DefaultLimit,
-		"includeNonHot": cfg.IncludeNonHot,
+		"ok":               true,
+		"version":          m.p.Version(),
+		"defaultLimit":     cfg.DefaultLimit,
+		"includeNonHot":    cfg.IncludeNonHot,
+		"twoStepThreshold": cfg.TwoStepThreshold,
 	}, nil
 }
 

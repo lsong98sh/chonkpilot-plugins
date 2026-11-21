@@ -3,7 +3,7 @@
   "id": "mcp",
   "name": "MCP 工具",
   "version": "1.0.0",
-  "description": "MCP 系列工具：检索（mcp_find）/ 加载（mcp_load）/ 调用（mcp_invoke）",
+  "description": "MCP 系列工具：语义检索（mcp_find）/ 表达式检索（mcp_match）/ 加载（mcp_load）/ 调用（mcp_invoke）",
   "icon": "plug",
   "publisher": "chonkpilot",
   "product": true,
@@ -18,7 +18,7 @@
   "mcp": {
     "mode": "http",
     "namespace": "-",
-    "hot_tools": ["mcp_find", "mcp_load", "mcp_invoke"],
+    "hot_tools": ["mcp_find", "mcp_match", "mcp_load", "mcp_invoke"],
     "timeout_sec": 600,
     "category": "meta",
     "origin": "builtin"
@@ -40,12 +40,12 @@
       { "location": "plugin", "label": "MCP 工具", "icon": "plug", "view": "config" }
     ],
     "statusbar": [],
-    "rpc": ["status", "ping", "load", "save", "reset"]
+    "rpc": ["status", "ping", "load", "save", "reset", "overview.generate"]
   },
   "permissions": {
-    "data": [],
+    "data": ["config.usr.get", "storage.self.get", "storage.self.set"],
     "hooks": [],
-    "llm": {},
+    "llm": { "step": true },
     "session": [],
     "ui": { "containers": ["preview", "tab", "drawer", "dialog"] },
     "network": []
