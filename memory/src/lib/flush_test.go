@@ -67,6 +67,9 @@ func (s *flushStub) wire(t *testing.T, bus mq.Bus, cfg map[string]any, turns []a
 		return map[string]any{"ok": true}
 	})
 	_, _ = bus.On(llmSimpleSubject, 0, func(_ context.Context, _ string, v *mq.Value) error {
+		if isReply(v) {
+			return nil
+		}
 		atomic.AddInt32(&s.llmCalls, 1)
 		var req struct {
 			Prompt string `json:"prompt"`
@@ -154,15 +157,14 @@ func TestManualFlushQueuedThenDistills(t *testing.T) {
 	}
 	notices := watchNotices(t, bus)
 
-	v := bus.Emit(context.Background(), "memory.flush", map[string]any{
+	res, err := call(t, bus, "memory.flush", map[string]any{
 		"instance_id": "ins-1", "session": "s1", "dialog_id": "d-s1",
-	}).Wait()
-	if err := v.Err(); err != nil {
+	})
+	if err != nil {
 		t.Fatalf("memory.flush 派发错误：%v", err)
 	}
-	res, _ := v.Result.(map[string]any)
 	if res == nil {
-		t.Fatalf("memory.flush 应写回结果，实际 %#v", v.Result)
+		t.Fatalf("memory.flush 应写回结果")
 	}
 	if ok, _ := res["ok"].(bool); !ok {
 		t.Fatalf("手动沉淀应受理：%+v", res)
@@ -235,20 +237,18 @@ func TestManualFlushGuards(t *testing.T) {
 	if err := p.Start(plugin.Deps{Bus: bus, Logf: t.Logf}); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
-	v := bus.Emit(context.Background(), "memory.flush", map[string]any{"instance_id": "ins-1"}).Wait()
-	res, _ := v.Result.(map[string]any)
+	res, _ := call(t, bus, "memory.flush", map[string]any{"instance_id": "ins-1"})
 	if res == nil || res["ok"] != false {
-		t.Fatalf("缺 session 应回 ok:false，实际 %#v", v.Result)
+		t.Fatalf("缺 session 应回 ok:false，实际 %#v", res)
 	}
 	if !strings.Contains(strval(res["reason"]), "instance_id/session required") {
 		t.Fatalf("原因应含 instance_id/session required，实际 %q", res["reason"])
 	}
 
 	// 61 §0.6 补齐：有 instance_id/session 但缺 dialog_id → 明确拒绝（旧布局退场后恒必填）。
-	v2 := bus.Emit(context.Background(), "memory.flush", map[string]any{"instance_id": "ins-1", "session": "s1"}).Wait()
-	res2, _ := v2.Result.(map[string]any)
+	res2, _ := call(t, bus, "memory.flush", map[string]any{"instance_id": "ins-1", "session": "s1"})
 	if res2 == nil || res2["ok"] != false {
-		t.Fatalf("缺 dialog_id 应回 ok:false，实际 %#v", v2.Result)
+		t.Fatalf("缺 dialog_id 应回 ok:false，实际 %#v", res2)
 	}
 	if !strings.Contains(strval(res2["reason"]), "dialog_id required") {
 		t.Fatalf("原因应含 dialog_id required，实际 %q", res2["reason"])
@@ -266,12 +266,11 @@ func TestManualFlushDisabledMemoryNoWrites(t *testing.T) {
 	}
 	notices := watchNotices(t, bus)
 
-	v := bus.Emit(context.Background(), "memory.flush", map[string]any{
+	res, _ := call(t, bus, "memory.flush", map[string]any{
 		"instance_id": "ins-1", "session": "s1", "dialog_id": "d-s1",
-	}).Wait()
-	res, _ := v.Result.(map[string]any)
+	})
 	if res == nil || res["ok"] != true {
-		t.Fatalf("投递即回应为 ok:true：%#v", v.Result)
+		t.Fatalf("投递即回应为 ok:true：%#v", res)
 	}
 	notices.waitNotice(t, "memory-done")
 	if n := atomic.LoadInt32(&st.saves); n != 0 {
@@ -300,11 +299,9 @@ func TestManualFlushLocksOnInstanceWorkDir(t *testing.T) {
 	}
 
 	// 宿主登记实例（instance-register）→ 两路径收敛到同一 work_dir（同一把锁）。
-	if err := bus.Emit(context.Background(), "instance-register", map[string]any{
+	publish(t, bus, "instance-register", map[string]any{
 		"instance_id": "ins-1", "work_dir": `C:\ws`,
-	}).Wait().Err(); err != nil {
-		t.Fatalf("emit instance-register: %v", err)
-	}
+	})
 	wa, wm := p.resolveWorkDir(auto), p.resolveWorkDir(manual)
 	if wa != `C:\ws` || wm != wa {
 		t.Fatalf("登记后两路径应收敛到同一 work_dir：auto=%q manual=%q", wa, wm)

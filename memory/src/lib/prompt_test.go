@@ -70,6 +70,9 @@ func stubDistillReplies(t *testing.T, bus mq.Bus, prjList map[string]any, cats [
 
 	sc := &systemCollector{got: map[string]string{}}
 	_, _ = bus.On(llmSimpleSubject, 0, func(_ context.Context, _ string, v *mq.Value) error {
+		if isReply(v) {
+			return nil
+		}
 		var req struct {
 			Prompt string `json:"prompt"`
 			System string `json:"system"`

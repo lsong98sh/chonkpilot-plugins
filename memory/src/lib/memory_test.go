@@ -10,10 +10,30 @@ import (
 	"time"
 
 	mq "github.com/lsong98sh/chonkpilot-plugin-framework/runtime/bus"
+	"github.com/lsong98sh/chonkpilot-plugin-framework/runtime/buscall"
 	plugin "github.com/lsong98sh/chonkpilot-plugin-framework/runtime/hook"
 )
 
-// reply 模拟 persist 的应答：向请求同主题 Emit {req_id, ok, result}。
+// isReply 判定载荷是否为 req_id 应答信封。
+//
+// 2026-11-19 总线 promise 退场后，handler 写回 v.Result 会由总线自动发布
+// `{req_id, ok, result}` 回**同主题**；订阅同主题的桩 handler 会再次收到自己的应答。
+// 桩必须跳过应答信封，否则会把「应答」当请求再处理一次（计数翻倍 / 采集到错误载荷）。
+func isReply(v *mq.Value) bool {
+	if v == nil || len(v.Payload) == 0 || v.Payload[0] != '{' {
+		return false
+	}
+	var hdr struct {
+		OK *bool `json:"ok"`
+	}
+	if json.Unmarshal(v.Payload, &hdr) != nil {
+		return false
+	}
+	return hdr.OK != nil
+}
+
+// reply 模拟 persist 的应答：向请求同主题 Publish {req_id, ok, result}
+// （总线 promise 退场，2026-11-19：Emit → Publish）。
 func reply(t *testing.T, bus mq.Bus, subject string, result func(req map[string]any) map[string]any) {
 	t.Helper()
 	_, err := bus.On(subject, 0, func(_ context.Context, _ string, v *mq.Value) error {
@@ -29,7 +49,7 @@ func reply(t *testing.T, bus mq.Bus, subject string, result func(req map[string]
 		body, _ := json.Marshal(map[string]any{
 			"req_id": req.ReqID, "ok": true, "result": result(req.Data),
 		})
-		_ = bus.Emit(context.Background(), subject, body)
+		_ = bus.Publish(subject, body)
 		return nil
 	})
 	if err != nil {
@@ -88,6 +108,34 @@ func stubSessionHistory(t *testing.T, bus mq.Bus, turns []any) {
 
 // epKey 测试用进度键：<会话>\x00<类别>（对齐专用表 memory_extract 主键）。
 func epKey(session, category string) string { return session + "\x00" + category }
+
+// publish 发布事件/应答载荷（总线 promise 退场：Emit → Publish；[]byte 原样，其余 JSON 序列化）。
+func publish(t *testing.T, bus mq.Bus, subject string, payload any) {
+	t.Helper()
+	var raw []byte
+	switch x := payload.(type) {
+	case []byte:
+		raw = x
+	default:
+		raw, _ = json.Marshal(x)
+	}
+	if err := bus.Publish(subject, raw); err != nil {
+		t.Fatalf("Publish(%s): %v", subject, err)
+	}
+}
+
+// call 发一次请求-应答（buscall：req_id 信封；超时 = dataTimeout）。
+func call(t *testing.T, bus mq.Bus, subject string, payload map[string]any) (map[string]any, error) {
+	t.Helper()
+	c := buscall.New(bus)
+	defer c.Close()
+	res, err := c.CallWithTimeout(context.Background(), dataTimeout, subject, payload)
+	if err != nil {
+		return nil, err
+	}
+	m, _ := res.(map[string]any)
+	return m, nil
+}
 
 // stubProgress 桩 data-memory-extract-load（提取进度专用表）：按 (session, category) 返回
 // vals[epKey(session,category)]（缺省空串 = 无进度）。Category 空 → 返回该会话全部类别。
@@ -151,6 +199,9 @@ func TestThresholdGateSkipsLLM(t *testing.T) {
 	stubExtractFaces(t, bus, []any{map[string]any{"turn_id": "t1"}})
 	var llmCalls, readCalls, saveCalls int32
 	_, _ = bus.On(llmSimpleSubject, 0, func(_ context.Context, _ string, v *mq.Value) error {
+		if isReply(v) {
+			return nil
+		}
 		atomic.AddInt32(&llmCalls, 1)
 		v.Result = map[string]any{"text": "x"}
 		return nil
@@ -216,6 +267,9 @@ func TestExtractRewritesEnabledCategories(t *testing.T) {
 	var calledMu sync.Mutex
 	called := map[string]bool{}
 	_, _ = bus.On(llmSimpleSubject, 0, func(_ context.Context, _ string, v *mq.Value) error {
+		if isReply(v) {
+			return nil
+		}
 		atomic.AddInt32(&llmCalls, 1)
 		var req struct {
 			Prompt     string `json:"prompt"`
@@ -308,6 +362,9 @@ func TestUserPrefCategoryToggle(t *testing.T) {
 	var llmCalls int32
 	called := map[string]bool{}
 	_, _ = bus.On(llmSimpleSubject, 0, func(_ context.Context, _ string, v *mq.Value) error {
+		if isReply(v) {
+			return nil
+		}
 		atomic.AddInt32(&llmCalls, 1)
 		var req struct {
 			Prompt string `json:"prompt"`
@@ -387,6 +444,9 @@ func TestDistillCarriesSubsystemLLM(t *testing.T) {
 
 	got := make(chan map[string]any, 1)
 	_, _ = bus.On(llmSimpleSubject, 0, func(_ context.Context, _ string, v *mq.Value) error {
+		if isReply(v) {
+			return nil
+		}
 		var req map[string]any
 		_ = json.Unmarshal(v.Payload, &req)
 		select {
@@ -437,6 +497,9 @@ func TestDistillWithoutSubsystemLLMByteEquivalent(t *testing.T) {
 
 	var raw []byte
 	_, _ = bus.On(llmSimpleSubject, 0, func(_ context.Context, _ string, v *mq.Value) error {
+		if isReply(v) {
+			return nil
+		}
 		raw = append([]byte(nil), v.Payload...)
 		v.Result = map[string]any{"text": "重写后的全文"}
 		return nil
@@ -456,8 +519,16 @@ func TestDistillWithoutSubsystemLLMByteEquivalent(t *testing.T) {
 	want, _ := json.Marshal(map[string]any{
 		"prompt": m["prompt"], "system": "提示词-项目概要", "instance_id": "ins-1",
 	})
-	if string(raw) != string(want) {
-		t.Fatalf("未指定子系统 LLM 时载荷须逐字节等价：\n got=%s\nwant=%s", raw, want)
+	// 2026-11-19 总线 promise 退场：`req_id` / `deadline_ms` 由 buscall 注入（协议层信封，
+	// 不属业务载荷）。业务字段仍须与改前等价（且不得带 `llm`）。
+	if _, has := m["llm"]; has {
+		t.Fatalf("未指定子系统 LLM 时载荷不得带 llm：%s", raw)
+	}
+	for _, k := range []string{"req_id", "deadline_ms"} {
+		delete(m, k)
+	}
+	if got, _ := json.Marshal(m); string(got) != string(want) {
+		t.Fatalf("未指定子系统 LLM 时业务载荷须与改前等价：\n got=%s\nwant=%s", got, want)
 	}
 }
 

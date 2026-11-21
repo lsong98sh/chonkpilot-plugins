@@ -84,6 +84,9 @@ func TestCategoryMaxTokensWarnsNotTruncates(t *testing.T) {
 		return map[string]any{"ok": true}
 	})
 	_, _ = bus.On(llmSimpleSubject, 0, func(_ context.Context, _ string, v *mq.Value) error {
+		if isReply(v) {
+			return nil
+		}
 		v.Result = map[string]any{"text": long}
 		return nil
 	})

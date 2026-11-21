@@ -149,7 +149,7 @@ func (n *notifier) Notify(v plugin.Notice) {
 	if reason == "" {
 		reason = "原因未知（详见日志文件）"
 	}
-	n.bus.Emit(context.Background(), "tool-notify", map[string]any{
+	body, merr := json.Marshal(map[string]any{
 		"instance_id": v.InstanceID,
 		"session_id":  v.Session,
 		"turn_id":     v.Turn,
@@ -160,6 +160,11 @@ func (n *notifier) Notify(v plugin.Notice) {
 		"message":     "⚠️ " + what + "失败：" + reason + "（本轮对话未受影响；详情见日志文件）",
 		"message_id":  "msg-pnotice-" + noticeKeyID(key),
 	})
+	if merr != nil {
+		return
+	}
+	// 总线 promise 退场（2026-11-19）：通知类只发布不等应答。
+	_ = n.bus.Publish("tool-notify", body)
 }
 
 // mark 登记键：首次出现返回 true（应提示），重复返回 false。

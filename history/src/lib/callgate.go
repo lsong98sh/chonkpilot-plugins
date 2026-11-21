@@ -14,6 +14,7 @@ import (
 	"strings"
 
 	mq "github.com/lsong98sh/chonkpilot-plugin-framework/runtime/bus"
+	"github.com/lsong98sh/chonkpilot-plugin-framework/runtime/buscall"
 )
 
 // gatewayTool 注册到 gateway 的文件历史工具定义。
@@ -76,11 +77,13 @@ var historyTools = []gatewayTool{
 	},
 }
 
-// registerAll 逐个向 gateway 注册 4 个工具（同主题 promise：await v.Result/v.Err）。
-// 每个工具声明 pre_hook_subject → gateway 在执行任意工具前先同步打点。
+// registerAll 逐个向 gateway 注册 4 个工具（buscall：req_id 信封回执；总线 promise 已退场，
+// 2026-11-19）。每个工具声明 pre_hook_subject → gateway 在执行任意工具前先同步打点。
 func (h *History) registerAll() error {
 	ctx, cancel := context.WithTimeout(context.Background(), dataTimeout)
 	defer cancel()
+	c := buscall.New(h.deps.Bus)
+	defer c.Close()
 	var errs []string
 	for _, t := range historyTools {
 		payload := map[string]any{
@@ -93,12 +96,12 @@ func (h *History) registerAll() error {
 			"category":         "self",
 			"pre_hook_subject": preHookSubject,
 		}
-		v := h.deps.Bus.Emit(ctx, subjectToolRegister, payload).Wait()
-		if e := v.Err(); e != nil {
-			errs = append(errs, fmt.Sprintf("%s: %v", t.name, e))
+		res, err := c.CallWithTimeout(ctx, dataTimeout, subjectToolRegister, payload)
+		if err != nil {
+			errs = append(errs, fmt.Sprintf("%s: %v", t.name, err))
 			continue
 		}
-		if v.Result == nil {
+		if res == nil {
 			errs = append(errs, t.name+": gateway 未应答（未就绪？）")
 		}
 	}
@@ -112,12 +115,13 @@ func (h *History) registerAll() error {
 func (h *History) unregisterAll() error {
 	ctx, cancel := context.WithTimeout(context.Background(), dataTimeout)
 	defer cancel()
+	c := buscall.New(h.deps.Bus)
+	defer c.Close()
 	var errs []string
 	for _, t := range historyTools {
 		payload := map[string]any{"name": t.name, "kind": "tool"}
-		v := h.deps.Bus.Emit(ctx, subjectToolUnregister, payload).Wait()
-		if e := v.Err(); e != nil {
-			errs = append(errs, fmt.Sprintf("%s: %v", t.name, e))
+		if _, err := c.CallWithTimeout(ctx, dataTimeout, subjectToolUnregister, payload); err != nil {
+			errs = append(errs, fmt.Sprintf("%s: %v", t.name, err))
 		}
 	}
 	if len(errs) > 0 {

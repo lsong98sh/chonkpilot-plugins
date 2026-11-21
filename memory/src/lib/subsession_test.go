@@ -49,6 +49,9 @@ func stubSubsessionDistill(t *testing.T, bus mq.Bus, prjList map[string]any, par
 		return map[string]any{"ok": true}
 	})
 	_, _ = bus.On(llmSimpleSubject, 0, func(_ context.Context, _ string, v *mq.Value) error {
+		if isReply(v) {
+			return nil
+		}
 		v.Result = map[string]any{"text": "重写后的全文"}
 		return nil
 	})
@@ -124,7 +127,7 @@ func TestWorkerSkipsSubsessionNotice(t *testing.T) {
 	body, _ := json.Marshal(map[string]any{
 		"instance_id": "ins", "work_dir": `C:\ws`, "session": "s-sub", "turn": "t1",
 	})
-	bus.Emit(context.Background(), turnEndSubject, body).Wait()
+	bus.Publish(turnEndSubject, body)
 
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {

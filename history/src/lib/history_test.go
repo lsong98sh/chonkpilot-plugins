@@ -60,7 +60,7 @@ func stubLoad(t *testing.T, bus mq.Bus, val *string, mu *sync.Mutex) {
 			"req_id": reqID, "ok": true,
 			"result": map[string]any{"data": cur},
 		})
-		go func() { bus.Emit(context.Background(), "data-prj-config-load", b) }()
+		go func() { bus.Publish("data-prj-config-load", b) }()
 		return nil
 	})
 	if err != nil {
@@ -86,7 +86,7 @@ func newHistory(t *testing.T, val *string) (mq.Bus, *History) {
 	}
 	pub := func(subject string, v any) {
 		b, _ := json.Marshal(v)
-		bus.Emit(context.Background(), subject, b)
+		bus.Publish(subject, b)
 	}
 	pub("instance-register", map[string]any{
 		"instance_id": "ins-gate", "client_type": "unittest", "work_dir": t.TempDir(),
@@ -159,7 +159,7 @@ func TestGateRefreshRealtime(t *testing.T) {
 		b, _ := json.Marshal(map[string]any{
 			"id": "history.enabled", "op": "save", "list": list,
 		})
-		bus.Emit(context.Background(), "data-prj-config-refresh", b)
+		bus.Publish("data-prj-config-refresh", b)
 	}
 	// 显式 "true" → 开
 	push(map[string]any{"history.enabled": "true"})
@@ -184,7 +184,7 @@ func TestGateRefreshRealtime(t *testing.T) {
 	// 非本键的刷新 → 不改动
 	push(map[string]any{"history.enabled": "true"})
 	b, _ := json.Marshal(map[string]any{"id": "other.key", "op": "save", "list": map[string]any{}})
-	bus.Emit(context.Background(), "data-prj-config-refresh", b)
+	bus.Publish("data-prj-config-refresh", b)
 	if !h.gateEnabled("ins-gate") {
 		t.Fatalf("非 history.enabled 的刷新不应改动门控")
 	}
@@ -205,7 +205,7 @@ func TestRetentionRefreshBatch(t *testing.T) {
 			"history.checkpoint_ttl_days": "9",
 		},
 	})
-	bus.Emit(context.Background(), "data-prj-config-refresh", b)
+	bus.Publish("data-prj-config-refresh", b)
 	if got := h.keepVal(); got != 123 {
 		t.Fatalf("批量广播应应用 keep：got %d，期望 123", got)
 	}
@@ -227,7 +227,7 @@ func TestInstanceExitClearsMappings(t *testing.T) {
 	h.rememberSession("sess-other", "root-2", "/wd", "ins-other")
 
 	b, _ := json.Marshal(map[string]any{"instance_id": "ins-gate"})
-	bus.Emit(context.Background(), "instance-exit", b).Wait()
+	bus.Publish("instance-exit", b)
 
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {

@@ -47,7 +47,7 @@ func failReply(t *testing.T, bus mq.Bus, subject string) {
 			return nil // 非请求载荷 / 应答回环 忽略
 		}
 		body, _ := json.Marshal(map[string]any{"req_id": req.ReqID, "ok": false})
-		_ = bus.Emit(context.Background(), subject, body)
+		_ = bus.Publish(subject, body)
 		return nil
 	})
 	if err != nil {
@@ -78,6 +78,9 @@ func TestNotifyOnSaveFailure(t *testing.T) {
 		return map[string]any{"data": map[string]any{"content": "旧全文"}}
 	})
 	_, _ = bus.On(llmSimpleSubject, 0, func(_ context.Context, _ string, v *mq.Value) error {
+		if isReply(v) {
+			return nil
+		}
 		v.Result = map[string]any{"text": "重写后的全文"}
 		return nil
 	})

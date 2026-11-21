@@ -138,7 +138,7 @@ func stubData(t *testing.T, bus mq.Bus, vals map[string]string, reg *regLog) {
 		b, _ := json.Marshal(map[string]any{
 			"req_id": reqID, "ok": true, "result": map[string]any{"data": vals[id]},
 		})
-		go bus.Emit(context.Background(), prjConfigLoadSubject, b)
+		go bus.Publish(prjConfigLoadSubject, b)
 		return nil
 	}); err != nil {
 		t.Fatal(err)
@@ -155,7 +155,7 @@ func stubData(t *testing.T, bus mq.Bus, vals map[string]string, reg *regLog) {
 		}
 		reqID, _ := m["req_id"].(string)
 		b, _ := json.Marshal(map[string]any{"req_id": reqID, "ok": true, "result": map[string]any{}})
-		go bus.Emit(context.Background(), prjConfigSaveSubject, b)
+		go bus.Publish(prjConfigSaveSubject, b)
 		return nil
 	}); err != nil {
 		t.Fatal(err)
@@ -163,6 +163,9 @@ func stubData(t *testing.T, bus mq.Bus, vals map[string]string, reg *regLog) {
 	if _, err := bus.On(subjectToolRegister, 0, func(_ context.Context, _ string, v *mq.Value) error {
 		var p map[string]any
 		_ = json.Unmarshal(v.Payload, &p)
+		if p["ok"] != nil {
+			return nil // 2026-11-19 起 v.Result 写回会以 {req_id,ok,result} 回派发 → 跳过应答信封
+		}
 		reg.recordReg(p)
 		v.Result = map[string]any{"registered": true, "name": p["name"]}
 		return nil
@@ -170,6 +173,11 @@ func stubData(t *testing.T, bus mq.Bus, vals map[string]string, reg *regLog) {
 		t.Fatal(err)
 	}
 	if _, err := bus.On(subjectToolUnregister, 0, func(_ context.Context, _ string, v *mq.Value) error {
+		var p map[string]any
+		_ = json.Unmarshal(v.Payload, &p)
+		if p["ok"] != nil {
+			return nil // 同上：跳过自动回执信封（否则注销计数翻倍）
+		}
 		reg.mu.Lock()
 		reg.uns++
 		reg.mu.Unlock()
@@ -232,7 +240,7 @@ func emitJSON(t *testing.T, bus mq.Bus, subject string, v any) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	bus.Emit(context.Background(), subject, b)
+	bus.Publish(subject, b)
 }
 
 func (x *harness) ws(t *testing.T) *workState {

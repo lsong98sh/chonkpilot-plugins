@@ -62,6 +62,7 @@ import (
 	"time"
 
 	mq "github.com/lsong98sh/chonkpilot-plugin-framework/runtime/bus"
+	"github.com/lsong98sh/chonkpilot-plugin-framework/runtime/buscall"
 	data "github.com/lsong98sh/chonkpilot-plugin-framework/runtime/datafmt"
 	plugin "github.com/lsong98sh/chonkpilot-plugin-framework/runtime/hook"
 	"github.com/lsong98sh/chonkpilot-plugin-framework/runtime/instance"
@@ -373,7 +374,8 @@ func (p *Plugin) emitMemoryNotice(instanceID, session, lastTurn, notice, message
 	if p.deps.Bus == nil || instanceID == "" {
 		return
 	}
-	p.deps.Bus.Emit(context.Background(), topics.TopicToolNotify, map[string]any{
+	// 总线 promise 退场（2026-11-19）：通知类是纯发布 → 序列化后 Publish（不等待）。
+	raw, err := json.Marshal(map[string]any{
 		"instance_id": instanceID,
 		"session_id":  session,
 		"turn_id":     lastTurn,
@@ -382,6 +384,10 @@ func (p *Plugin) emitMemoryNotice(instanceID, session, lastTurn, notice, message
 		"message_id":  "msg-memory-" + notice + "-" + session + "-" + lastTurn,
 		"plugin":      "memory",
 	})
+	if err != nil {
+		return
+	}
+	_ = p.deps.Bus.Publish(topics.TopicToolNotify, raw)
 }
 
 // safeProcessResolved 包裹 processResolved 并兜住 panic —— worker 是裸 goroutine（已脱离
@@ -1150,11 +1156,15 @@ func (p *Plugin) rewrite(instanceID, llm, system, category, oldText, newInfo str
 	if llm != "" {
 		req["llm"] = llm // SL-2 可选字段：子系统默认 LLM
 	}
-	v := p.deps.Bus.Emit(ctx, llmSimpleSubject, req).Wait()
-	if err := v.Err(); err != nil {
+	// 总线 promise 退场（2026-11-19）：请求-应答改走 buscall（req_id 信封按主题回执）。
+	// 每类并行重写 → 各自 req_id 独立收敛（I-78 串味的根治点：不再共用主题级 promise）。
+	c := buscall.New(p.deps.Bus)
+	defer c.Close()
+	res, err := c.CallWithTimeout(ctx, llmTimeout, llmSimpleSubject, req)
+	if err != nil {
 		return "", err
 	}
-	if m, ok := v.Result.(map[string]any); ok {
+	if m, ok := res.(map[string]any); ok {
 		if text, ok := m["text"].(string); ok && text != "" {
 			return text, nil
 		}
@@ -1223,9 +1233,13 @@ func (p *Plugin) request(subject string, req map[string]any) (map[string]any, er
 		return nil, err
 	}
 	defer sub.Unsubscribe()
-	f := p.deps.Bus.Emit(context.Background(), subject, req)
-	v := f.Wait()
-	if err := v.Err(); err != nil {
+	// 总线 promise 退场（2026-11-19）：请求序列化后 Publish（req_id 随载荷；桥把宿主应答
+	// 合成同形信封回派发，本订阅按 req_id 收敛）。
+	raw, merr := json.Marshal(req)
+	if merr != nil {
+		return nil, merr
+	}
+	if err := p.deps.Bus.Publish(subject, raw); err != nil {
 		return nil, err
 	}
 	select {

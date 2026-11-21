@@ -63,6 +63,9 @@ func stubRewriteReplies(t *testing.T, bus mq.Bus) (*llmPromptCollector, *int32) 
 	})
 	col := &llmPromptCollector{}
 	_, _ = bus.On(llmSimpleSubject, 0, func(_ context.Context, _ string, v *mq.Value) error {
+		if isReply(v) {
+			return nil
+		}
 		var req struct {
 			Prompt string `json:"prompt"`
 		}
@@ -283,6 +286,9 @@ func TestConcurrentRewriteSerializedPerCategory(t *testing.T) {
 
 	var inflight, maxInflight int32
 	_, _ = bus.On(llmSimpleSubject, 0, func(_ context.Context, _ string, v *mq.Value) error {
+		if isReply(v) {
+			return nil
+		}
 		n := atomic.AddInt32(&inflight, 1)
 		for {
 			cur := atomic.LoadInt32(&maxInflight)

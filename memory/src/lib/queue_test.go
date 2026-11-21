@@ -77,7 +77,7 @@ func TestQueueMergesSameSession(t *testing.T) {
 		payload, _ := json.Marshal(map[string]any{
 			"instance_id": "ins-1", "work_dir": `C:\ws`, "session": "s1", "turn": "t1",
 		})
-		_ = bus.Emit(context.Background(), turnEndSubject, payload)
+		_ = bus.Publish(turnEndSubject, payload)
 	}
 	emit()
 	select {
@@ -132,6 +132,9 @@ func TestNoNewTurnSkips(t *testing.T) {
 	})
 	var llmCalls, saves int32
 	_, _ = bus.On(llmSimpleSubject, 0, func(_ context.Context, _ string, v *mq.Value) error {
+		if isReply(v) {
+			return nil
+		}
 		atomic.AddInt32(&llmCalls, 1)
 		v.Result = map[string]any{"text": "x"}
 		return nil
@@ -181,6 +184,9 @@ func TestProgressNotAdvancedOnSaveFailure(t *testing.T) {
 		return map[string]any{"data": map[string]any{"content": "旧全文"}}
 	})
 	_, _ = bus.On(llmSimpleSubject, 0, func(_ context.Context, _ string, v *mq.Value) error {
+		if isReply(v) {
+			return nil
+		}
 		v.Result = map[string]any{"text": "重写后的全文"}
 		return nil
 	})
